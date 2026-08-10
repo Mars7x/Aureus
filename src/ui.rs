@@ -4311,7 +4311,10 @@ fn install_window_actions(
                 .build();
             dialog.add_credit_section(
                 Some("Data"),
-                &["Market data: Yahoo Finance"],
+                &[
+    "Market data: Yahoo Finance",
+    "Exchange rates: Bank of Canada",
+],
             );
             dialog.present(Some(&window));
         });
