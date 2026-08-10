@@ -11,12 +11,11 @@ repository = "https://github.com/Mars7x/Aureus"
 [dependencies]
 adw = { package = "libadwaita", version = "0.9.2", features = ["v1_9"] }
 gtk = { package = "gtk4", version = "0.11.4", features = ["gnome_50"] }
-gdk-pixbuf = "0.22.0"
+glycin = { version = "3.1", features = ["gdk4"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "3.4", features = ["json", "cookies"] }
 urlencoding = "2.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "ico", "gif", "bmp", "tiff", "qoi"] }
-jxl-oxide = { version = "0.12.6", default-features = false, features = ["image"] }
 cairo-rs = { version = "0.22.0", features = ["pdf"] }
