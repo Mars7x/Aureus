@@ -1499,10 +1499,12 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         // into kinetic scrolling after the refresh UI collapses.
         gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
         let can_pull = Rc::new(Cell::new(false));
+        let pulling = Rc::new(Cell::new(false));
         let armed = Rc::new(Cell::new(false));
         {
             let refs = refs.clone();
             let can_pull = can_pull.clone();
+            let pulling = pulling.clone();
             let armed = armed.clone();
             let pull_refresh_revealer = pull_refresh_revealer.clone();
             let pull_refresh_spinner = pull_refresh_spinner.clone();
@@ -1513,6 +1515,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                 position_pull_refresh_visual(&content_header, &pull_refresh_visual_revealer);
                 if refs.pull_refresh_active.get() || refs.shortcut_refresh_active.get() {
                     can_pull.set(false);
+                    pulling.set(false);
                     armed.set(false);
                     return;
                 }
@@ -1524,6 +1527,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                     .map(|adjustment| adjustment.value() <= adjustment.lower() + 0.5)
                     .unwrap_or(true);
                 can_pull.set(at_top);
+                pulling.set(false);
                 armed.set(false);
                 pull_refresh_spinner.stop();
                 pull_refresh_spinner.set_visible(false);
@@ -1535,6 +1539,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         }
         {
             let can_pull = can_pull.clone();
+            let pulling = pulling.clone();
             let armed = armed.clone();
             let refs = refs.clone();
             let pull_refresh_revealer = pull_refresh_revealer.clone();
@@ -1546,22 +1551,28 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                 if !can_pull.get() {
                     return;
                 }
-                // Horizontal swipes (for example the Upcoming card strip) must
-                // not accidentally arm a refresh. If a vertical pull retreats
-                // back above the activation area, disarm it immediately too.
-                if offset_y <= 8.0 || offset_y <= offset_x.abs() {
-                    armed.set(false);
-                    pull_refresh_icon.set_opacity(0.28);
-                    pull_refresh_revealer.set_reveal_child(false);
-                    pull_refresh_visual_revealer.set_reveal_child(false);
-                    return;
+
+                // Decide once whether this sequence is a vertical pull. After it
+                // is claimed, keep it claimed until release instead of repeatedly
+                // entering/leaving pull mode as the pointer jitters near the
+                // activation boundary.
+                if !pulling.get() {
+                    if offset_y <= 8.0 || offset_y <= offset_x.abs() {
+                        armed.set(false);
+                        pull_refresh_icon.set_opacity(0.28);
+                        pull_refresh_visual_revealer.set_reveal_child(false);
+                        return;
+                    }
+                    let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+                    pulling.set(true);
+                    // Open the pull spacer once, while the drag is active, so the
+                    // page keeps the original pull-down motion. Because `pulling`
+                    // is latched for the rest of this gesture, layout movement can
+                    // no longer make us immediately hide/reveal it again.
+                    pull_refresh_revealer.set_reveal_child(true);
+                    pull_refresh_visual_revealer.set_reveal_child(true);
                 }
 
-                // This is now unambiguously a pull-to-refresh gesture. Claim it
-                // before the ScrolledWindow can build kinetic momentum from the
-                // same pointer/touch sequence, and keep the active adjustment at
-                // its true lower bound for the whole pull.
-                let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
                 let page = refs.current_page.borrow().clone();
                 if let Some(adjustment) = refs.page_scroll_adjustments.borrow().get(&page) {
                     reset_adjustment_to_top(adjustment);
@@ -1569,13 +1580,12 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
 
                 let progress = (offset_y / 84.0).clamp(0.0, 1.0);
                 pull_refresh_icon.set_opacity(0.28 + progress * 0.72);
-                pull_refresh_revealer.set_reveal_child(true);
-                pull_refresh_visual_revealer.set_reveal_child(true);
                 armed.set(offset_y >= 84.0);
             });
         }
         {
             let can_pull = can_pull.clone();
+            let pulling = pulling.clone();
             let armed = armed.clone();
             let window = window.clone();
             let refs = refs.clone();
@@ -1584,6 +1594,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
             let pull_refresh_icon = pull_refresh_icon.clone();
             let pull_refresh_visual_revealer = pull_refresh_visual_revealer.clone();
             gesture.connect_drag_end(move |_, _, _| {
+                pulling.set(false);
                 if !can_pull.replace(false) {
                     armed.set(false);
                     return;
@@ -1594,6 +1605,8 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                     pull_refresh_icon.set_visible(false);
                     pull_refresh_spinner.set_visible(true);
                     pull_refresh_spinner.start();
+                    // The spacer is already open from the pull gesture; keep it
+                    // open while the refresh spinner is active.
                     pull_refresh_revealer.set_reveal_child(true);
                     pull_refresh_visual_revealer.set_reveal_child(true);
                     let _ = gtk::prelude::WidgetExt::activate_action(
@@ -3267,10 +3280,12 @@ fn install_detail_pull_to_refresh(
     // the detail ScrolledWindow from receiving the same gesture as momentum.
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
     let can_pull = Rc::new(Cell::new(false));
+    let pulling = Rc::new(Cell::new(false));
     let armed = Rc::new(Cell::new(false));
 
     {
         let can_pull = can_pull.clone();
+        let pulling = pulling.clone();
         let armed = armed.clone();
         let pull = pull.clone();
         let header: HeaderBar = (*header).clone();
@@ -3278,11 +3293,13 @@ fn install_detail_pull_to_refresh(
             position_pull_refresh_visual(&header, &pull.visual_revealer);
             if pull.pending.get() > 0 {
                 can_pull.set(false);
+                pulling.set(false);
                 armed.set(false);
                 return;
             }
             let at_top = pull.adjustment.value() <= pull.adjustment.lower() + 0.5;
             can_pull.set(at_top);
+            pulling.set(false);
             armed.set(false);
             pull.spinner.stop();
             pull.spinner.set_visible(false);
@@ -3294,6 +3311,7 @@ fn install_detail_pull_to_refresh(
     }
     {
         let can_pull = can_pull.clone();
+        let pulling = pulling.clone();
         let armed = armed.clone();
         let pull = pull.clone();
         let header: HeaderBar = (*header).clone();
@@ -3302,27 +3320,33 @@ fn install_detail_pull_to_refresh(
             if !can_pull.get() {
                 return;
             }
-            if offset_y <= 8.0 || offset_y <= offset_x.abs() {
-                armed.set(false);
-                pull.icon.set_opacity(0.28);
-                pull.revealer.set_reveal_child(false);
-                pull.visual_revealer.set_reveal_child(false);
-                return;
+            if !pulling.get() {
+                if offset_y <= 8.0 || offset_y <= offset_x.abs() {
+                    armed.set(false);
+                    pull.icon.set_opacity(0.28);
+                    pull.visual_revealer.set_reveal_child(false);
+                    return;
+                }
+                let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
+                pulling.set(true);
+                // Match the main pages: reveal the spacer once during the live
+                // pull, then keep it stable until the sequence ends.
+                pull.revealer.set_reveal_child(true);
+                pull.visual_revealer.set_reveal_child(true);
             }
-            let _ = gesture.set_state(gtk::EventSequenceState::Claimed);
             reset_adjustment_to_top(&pull.adjustment);
             let progress = (offset_y / 84.0).clamp(0.0, 1.0);
             pull.icon.set_opacity(0.28 + progress * 0.72);
-            pull.revealer.set_reveal_child(true);
-            pull.visual_revealer.set_reveal_child(true);
             armed.set(offset_y >= 84.0);
         });
     }
     {
         let can_pull = can_pull.clone();
+        let pulling = pulling.clone();
         let armed = armed.clone();
         let pull = pull.clone();
         gesture.connect_drag_end(move |_, _, _| {
+            pulling.set(false);
             if !can_pull.replace(false) {
                 armed.set(false);
                 return;
