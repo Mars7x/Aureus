@@ -17,7 +17,7 @@ use adw::Application;
 use gtk::gio;
 
 pub const APP_ID: &str = "io.github.Mars7x.Aureus";
-pub const APP_VERSION: &str = "1.0.1";
+pub const APP_VERSION: &str = "1.0.2";
 
 fn main() -> adw::glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
