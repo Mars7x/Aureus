@@ -411,20 +411,29 @@ fn draw_center_content(
     }
 }
 
-fn fitted_font_size(text: &str, max_width: f64, preferred: f64, minimum: f64, factor: f64) -> f64 {
+fn fitted_font_size(
+    context: &gtk::cairo::Context,
+    text: &str,
+    max_width: f64,
+    preferred: f64,
+    minimum: f64,
+    weight: gtk::cairo::FontWeight,
+) -> f64 {
     if text.is_empty() {
         return preferred;
     }
-    let estimated = text.chars().count() as f64 * preferred * factor;
-    if estimated <= max_width || estimated <= f64::EPSILON {
+
+    context.select_font_face("Sans", gtk::cairo::FontSlant::Normal, weight);
+    context.set_font_size(preferred);
+    let Ok(extents) = context.text_extents(text) else {
+        return preferred;
+    };
+    let width = extents.x_advance().max(extents.width());
+    if width <= max_width || width <= f64::EPSILON {
         preferred
     } else {
-        (preferred * max_width / estimated).clamp(minimum, preferred)
+        (preferred * max_width / width).clamp(minimum, preferred)
     }
-}
-
-fn estimated_text_width(text: &str, font_size: f64, factor: f64) -> f64 {
-    text.chars().count() as f64 * font_size * factor
 }
 
 fn draw_center_line(
@@ -435,7 +444,7 @@ fn draw_center_line(
     text: &str,
     preferred_size: f64,
     minimum_size: f64,
-    width_factor: f64,
+    _width_factor: f64,
     weight: gtk::cairo::FontWeight,
     tone: f64,
     alpha: f64,
@@ -443,12 +452,28 @@ fn draw_center_line(
     if text.is_empty() {
         return;
     }
-    let font_size = fitted_font_size(text, max_width, preferred_size, minimum_size, width_factor);
+
+    let font_size = fitted_font_size(
+        context,
+        text,
+        max_width,
+        preferred_size,
+        minimum_size,
+        weight,
+    );
     context.select_font_face("Sans", gtk::cairo::FontSlant::Normal, weight);
     context.set_font_size(font_size);
     context.set_source_rgba(tone, tone, tone, alpha);
-    let estimated = estimated_text_width(text, font_size, width_factor);
-    context.move_to(center_x - estimated / 2.0, baseline_y);
+
+    // Keep the original vertical baselines and typography, but center using the
+    // actual painted glyph bounds. The previous character-count estimate could
+    // put short labels, percentages and currency strings on different visual
+    // centerlines even though they shared the same nominal center point.
+    let x = context
+        .text_extents(text)
+        .map(|extents| center_x - extents.width() / 2.0 - extents.x_bearing())
+        .unwrap_or(center_x);
+    context.move_to(x, baseline_y);
     let _ = context.show_text(text);
 }
 
