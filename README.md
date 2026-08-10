@@ -32,7 +32,7 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 - Bank of Canada for CAD/USD exchange rates
 - SQLite for local portfolio storage
 - GPT 5.6 Sol for logic
-
+- Used [Planify](https://flathub.org/apps/io.github.alainm23.planify) colour scheme for libadwaita colours 
 ## Disclaimers
 - Aureus is for personal portfolio tracking and does not provide financial, investment, tax, or legal advice.
 - AI was used as a tool during the development of Aureus. The app's design, direction, feature set, UX decisions, testing, debugging, refinement, and release decisions were made by me. AI-assisted code was reviewed, tested, and iterated on.
