@@ -4312,9 +4312,9 @@ fn install_window_actions(
             dialog.add_credit_section(
                 Some("Data"),
                 &[
-    "Market data: Yahoo Finance",
-    "Exchange rates: Bank of Canada",
-],
+                    "Market data: Yahoo Finance",
+                    "Exchange rates: Bank of Canada",
+                ],
             );
             dialog.present(Some(&window));
         });
@@ -10813,9 +10813,25 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
     } else {
         None
     };
+    // Activity dates in Aureus are date-only. For a 1D chart, keep the opening
+    // portfolio snapshot as the baseline, then apply activity recorded for that
+    // trading date immediately after it. That lets today's buys and sells use
+    // their entered transaction values in the range P&L instead of pretending
+    // the resulting holdings existed before the session began.
+    let (history_transactions, history_cash_entries) = if range == HistoryRange::OneDay {
+        normalize_one_day_activity_to_session_start(
+            &transactions,
+            &cash_entries,
+            visible_minimum,
+            visible_maximum,
+        )
+    } else {
+        (transactions.clone(), cash_entries.clone())
+    };
+
     let points = build_portfolio_value_points(
-        &transactions,
-        &cash_entries,
+        &history_transactions,
+        &history_cash_entries,
         &split_events,
         &histories,
         fx_points.as_deref(),
@@ -10825,13 +10841,28 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
     );
 
     if points.len() >= 2 {
-        let investment_return = portfolio_range_investment_return(
-            &points,
-            &transactions,
-            &cash_entries,
-            fx_points.as_deref(),
-            &base,
-        );
+        let investment_return = if range == HistoryRange::OneDay {
+            visible_maximum.and_then(|session_end| {
+                portfolio_one_day_investment_return(
+                    &transactions,
+                    &cash_entries,
+                    &split_events,
+                    &histories,
+                    fx_points.as_deref(),
+                    &base,
+                    visible_minimum,
+                    session_end,
+                )
+            })
+        } else {
+            portfolio_range_investment_return(
+                &points,
+                &history_transactions,
+                &history_cash_entries,
+                fx_points.as_deref(),
+                &base,
+            )
+        };
         refs.portfolio_history_chart
             .set_points_with_trend(points, &base, range, investment_return);
         update_portfolio_range_return_label(refs, investment_return, &base, range);
@@ -10845,6 +10876,245 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         update_portfolio_range_return_label(refs, None, &base, range);
     }
 
+}
+
+fn normalize_one_day_activity_to_session_start(
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+    session_start: i64,
+    session_end: Option<i64>,
+) -> (Vec<Transaction>, Vec<CashEntry>) {
+    let mut transactions = transactions.to_vec();
+    let mut cash_entries = cash_entries.to_vec();
+    let Some(session_end) = session_end.filter(|timestamp| *timestamp > session_start) else {
+        return (transactions, cash_entries);
+    };
+
+    let session_day = session_start.div_euclid(86_400);
+    let session_end_day = session_end.div_euclid(86_400);
+    if session_day != session_end_day {
+        return (transactions, cash_entries);
+    }
+    let (year, month, day) = civil_from_days(session_day);
+    let session_date = format!("{year:04}-{month:02}-{day:02}");
+
+    // Keep the opening market point as the baseline, then apply all date-only
+    // activity for that trading date immediately after it. This is important for
+    // 1D P&L: a buy entered for today must contribute at its entered purchase
+    // price instead of being treated as if those shares were already held at the
+    // opening market price. One second is enough to preserve the before/after
+    // snapshots without extending the chart beyond the real trading session.
+    let activity_timestamp = session_start.saturating_add(1).min(session_end);
+
+    for transaction in &mut transactions {
+        if transaction.trade_date.as_str() == session_date.as_str() {
+            transaction.timestamp = activity_timestamp;
+        }
+    }
+    for entry in &mut cash_entries {
+        if entry.occurred_at.div_euclid(86_400) == session_day {
+            entry.occurred_at = activity_timestamp;
+        }
+    }
+
+    (transactions, cash_entries)
+}
+
+fn portfolio_one_day_investment_return(
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+    split_events: &[SplitEvent],
+    histories: &HashMap<String, Vec<PricePoint>>,
+    fx_points: Option<&[PricePoint]>,
+    base: &str,
+    session_start: i64,
+    session_end: i64,
+) -> Option<f64> {
+    if session_end <= session_start {
+        return None;
+    }
+
+    let (year, month, day) = civil_from_days(session_start.div_euclid(86_400));
+    let session_date = format!("{year:04}-{month:02}-{day:02}");
+    let session_day = session_start.div_euclid(86_400);
+
+    let convert_at = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
+        if currency.eq_ignore_ascii_case(base) {
+            return Some(amount);
+        }
+        let rate = historical_fx_at(fx_points, timestamp)?;
+        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
+            Some(amount * rate)
+        } else if currency.eq_ignore_ascii_case("CAD")
+            && base.eq_ignore_ascii_case("USD")
+            && rate > 0.0
+        {
+            Some(amount / rate)
+        } else {
+            None
+        }
+    };
+
+    #[derive(Clone)]
+    enum OpeningEvent {
+        Transaction(Transaction),
+        Split(SplitEvent),
+    }
+
+    // Build the holdings that actually existed when the visible trading session
+    // opened. trade_date is authoritative here because Aureus activity is
+    // date-only; a transaction recorded for this session must not leak into the
+    // opening snapshot just because its stored timestamp happens to be midnight.
+    let mut opening_events = transactions
+        .iter()
+        .filter(|transaction| transaction.trade_date.as_str() < session_date.as_str())
+        .cloned()
+        .map(OpeningEvent::Transaction)
+        .chain(
+            split_events
+                .iter()
+                .filter(|split| split.timestamp < session_start)
+                .cloned()
+                .map(OpeningEvent::Split),
+        )
+        .collect::<Vec<_>>();
+    opening_events.sort_by_key(|event| match event {
+        OpeningEvent::Split(split) => (split.timestamp, activity_sort_priority("SPLIT"), i64::MIN),
+        OpeningEvent::Transaction(transaction) => (
+            transaction.timestamp,
+            activity_sort_priority(&transaction.transaction_type),
+            transaction.id,
+        ),
+    });
+
+    let mut opening_shares = HashMap::<String, f64>::new();
+    let mut currencies = HashMap::<String, String>::new();
+    for event in opening_events {
+        match event {
+            OpeningEvent::Split(split) => {
+                let symbol = split.provider_symbol.to_ascii_uppercase();
+                if let Some(shares) = opening_shares.get_mut(&symbol) {
+                    *shares *= split.ratio;
+                }
+            }
+            OpeningEvent::Transaction(transaction) => {
+                let symbol = transaction.provider_symbol.to_ascii_uppercase();
+                let shares = opening_shares.entry(symbol.clone()).or_insert(0.0);
+                match transaction.transaction_type.as_str() {
+                    "SELL" | "TRANSFER_OUT" => *shares -= transaction.shares,
+                    "BUY" | "OPEN" | "TRANSFER_IN" => *shares += transaction.shares,
+                    _ => {}
+                }
+                currencies.insert(symbol, transaction.currency.clone());
+            }
+        }
+    }
+
+    let mut closing_shares = opening_shares.clone();
+
+    // A split on the visible session is effective before date-only user activity
+    // for that date. This keeps the opening pre-split holdings and closing
+    // post-split holdings internally consistent without inventing a trade time.
+    for split in split_events.iter().filter(|split| {
+        split.timestamp.div_euclid(86_400) == session_day && split.timestamp <= session_end
+    }) {
+        let symbol = split.provider_symbol.to_ascii_uppercase();
+        if let Some(shares) = closing_shares.get_mut(&symbol) {
+            *shares *= split.ratio;
+        }
+    }
+
+    let mut same_day_transactions = transactions
+        .iter()
+        .filter(|transaction| transaction.trade_date.as_str() == session_date.as_str())
+        .collect::<Vec<_>>();
+    same_day_transactions.sort_by_key(|transaction| transaction.id);
+    for transaction in &same_day_transactions {
+        let symbol = transaction.provider_symbol.to_ascii_uppercase();
+        let shares = closing_shares.entry(symbol.clone()).or_insert(0.0);
+        match transaction.transaction_type.as_str() {
+            "SELL" | "TRANSFER_OUT" => *shares -= transaction.shares,
+            "BUY" | "OPEN" | "TRANSFER_IN" => *shares += transaction.shares,
+            _ => {}
+        }
+        currencies.insert(symbol, transaction.currency.clone());
+    }
+
+    let mut symbols = HashSet::<String>::new();
+    symbols.extend(opening_shares.keys().cloned());
+    symbols.extend(closing_shares.keys().cloned());
+
+    let mut opening_market = 0.0;
+    let mut closing_market = 0.0;
+    for symbol in symbols {
+        let opening_count = opening_shares.get(&symbol).copied().unwrap_or(0.0);
+        let closing_count = closing_shares.get(&symbol).copied().unwrap_or(0.0);
+        if opening_count.abs() < 0.0000001 && closing_count.abs() < 0.0000001 {
+            continue;
+        }
+
+        let history = histories.get(&symbol)?;
+        let opening_price = historical_close_at(Some(history.as_slice()), session_start)?;
+        let closing_price = historical_close_at(Some(history.as_slice()), session_end)?;
+        let currency = currencies.get(&symbol).map(String::as_str).unwrap_or(base);
+
+        opening_market += convert_at(opening_count * opening_price, currency, session_start)?;
+        closing_market += convert_at(closing_count * closing_price, currency, session_end)?;
+    }
+
+    // Cash is part of portfolio value. Reconstruct the opening and closing cash
+    // balances from the ledger so settled trades, dividends, FX movement on cash,
+    // deposits, and withdrawals are handled consistently with the security side.
+    let mut opening_cash = HashMap::<(i64, String), f64>::new();
+    let mut closing_cash = HashMap::<(i64, String), f64>::new();
+    let mut external_flow = 0.0;
+    for entry in cash_entries {
+        let entry_day = entry.occurred_at.div_euclid(86_400);
+        let key = (entry.account_id, entry.currency.to_ascii_uppercase());
+        if entry_day < session_day {
+            *opening_cash.entry(key.clone()).or_insert(0.0) += entry.amount;
+            *closing_cash.entry(key).or_insert(0.0) += entry.amount;
+        } else if entry_day == session_day {
+            *closing_cash.entry(key).or_insert(0.0) += entry.amount;
+            // Manual cash deposits/withdrawals are external portfolio flows and
+            // must not be reported as investment performance.
+            if entry.kind == "DEPOSIT" {
+                external_flow += convert_at(entry.amount, &entry.currency, session_start)?;
+            }
+        }
+    }
+
+    let mut opening_cash_value = 0.0;
+    for ((_, currency), amount) in &opening_cash {
+        opening_cash_value += convert_at(*amount, currency, session_start)?;
+    }
+    let mut closing_cash_value = 0.0;
+    for ((_, currency), amount) in &closing_cash {
+        closing_cash_value += convert_at(*amount, currency, session_end)?;
+    }
+
+    // Trades that do not settle against tracked account cash bring money/assets
+    // into or out of Aureus from outside the portfolio. Use the user's actual
+    // transaction price, not the market quote, for that external flow. This is
+    // what makes a same-day 100-share buy at $2 correctly recognize the gap from
+    // $2 to the session's market price as investment return.
+    for transaction in same_day_transactions {
+        if transaction.settle_cash {
+            continue;
+        }
+        let native_flow = match transaction.transaction_type.as_str() {
+            "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
+            "SELL" => -(transaction.shares * transaction.price - transaction.fees),
+            "TRANSFER_IN" | "TRANSFER_OUT" => continue,
+            _ => continue,
+        };
+        external_flow += convert_at(native_flow, &transaction.currency, session_start)?;
+    }
+
+    let gain = (closing_market + closing_cash_value)
+        - (opening_market + opening_cash_value)
+        - external_flow;
+    gain.is_finite().then_some(gain)
 }
 
 fn portfolio_range_investment_return(
@@ -12123,12 +12393,11 @@ fn parse_trade_date(value: &str) -> Result<i64, ()> {
 }
 
 fn activity_timestamp(value: &str) -> Result<i64, ()> {
-    let timestamp = parse_trade_date(value)?;
-    if value.trim() == current_date_string() {
-        Ok(current_unix_timestamp())
-    } else {
-        Ok(timestamp)
-    }
+    // Activity uses a date picker without a time field, so persist the selected
+    // date consistently at the start of that date. Using the current clock time
+    // for today's activity made identical date-only entries behave differently
+    // depending on when they were entered.
+    parse_trade_date(value)
 }
 
 fn date_is_future(value: &str) -> bool {
