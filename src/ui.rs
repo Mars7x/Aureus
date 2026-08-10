@@ -927,7 +927,7 @@ fn main_header_content(
             .icon_name("list-add-symbolic")
             .tooltip_text(tooltip)
             .build();
-        add.set_action_name(Some("win.add-current"));
+        add.set_action_name(Some("win.add-account"));
         start.append(&add);
     }
 
@@ -1402,7 +1402,6 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         .build();
 
     install_window_actions(&window, &state, &refs, &pages);
-    app.set_accels_for_action("win.add-current", &["<Primary>n"]);
     app.set_accels_for_action("win.refresh-current", &["<Primary>r"]);
     app.set_accels_for_action("win.search", &["<Primary>f"]);
     app.set_accels_for_action("win.close", &["<Primary>w"]);
@@ -4614,25 +4613,18 @@ fn install_window_actions(
     }
     window.add_action(&remove_watchlist);
 
-    let add_current = gio::SimpleAction::new("add-current", None);
+    let add_account = gio::SimpleAction::new("add-account", None);
     {
         let window_weak = window.downgrade();
         let refs = refs.clone();
-        let pages = pages.clone();
-        add_current.connect_activate(move |_, _| {
+        add_account.connect_activate(move |_, _| {
             let Some(window) = window_weak.upgrade() else {
                 return;
             };
-            match pages.visible_child_name().as_deref() {
-                Some("accounts") => present_add_account_dialog(&window, refs.clone()),
-                Some("watchlist") => pages.set_visible_child_name("search"),
-                Some("search") => {},
-                Some("dividends") => present_add_activity_dialog(&window, refs.clone()),
-                _ => present_add_activity_dialog(&window, refs.clone()),
-            }
+            present_add_account_dialog(&window, refs.clone());
         });
     }
-    window.add_action(&add_current);
+    window.add_action(&add_account);
 
     let refresh_current = gio::SimpleAction::new("refresh-current", None);
     {
