@@ -17,7 +17,7 @@ Run:
 ```
 git clone https://github.com/Mars7x/Aureus.git && cd Aureus && flatpak-builder build-dir io.github.Mars7x.Aureus.yml
 ```
-Or just use [Builder](https://apps.gnome.org/Builder/)
+Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 
 ## Built with
 - GTK4 and libadwaita for UI
