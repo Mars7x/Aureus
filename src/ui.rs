@@ -190,49 +190,62 @@ fn present_choose_stock_picture(
     refs: UiRefs,
     provider_symbol: String,
 ) {
-    let dialog = FileDialog::new();
-    dialog.set_title("Choose Stock Picture");
-    dialog.set_accept_label(Some("Choose"));
-    let parent_weak = parent.downgrade();
-    let refs_for_callback = refs.clone();
-    dialog.open(
-        Some(parent),
-        None::<&gio::Cancellable>,
-        move |result| {
-            let Ok(file) = result else {
-                return;
-            };
-            let Some(path) = file.path() else {
-                refs_for_callback
-                    .toast_overlay
-                    .add_toast(Toast::new("The selected picture could not be opened"));
-                return;
-            };
-            match crate::stock_image::save_stock_image(&provider_symbol, &path) {
-                Ok(data) => {
-                    let bytes = glib::Bytes::from_owned(data.bytes);
-                    match gtk::gdk::Texture::from_bytes(&bytes) {
-                        Ok(_) => {
-                            if let Some(parent) = parent_weak.upgrade() {
-                                let root: gtk::Widget = parent.upcast();
-                                refresh_stock_picture_widgets(&root, &provider_symbol);
-                            }
-                            refs_for_callback.refresh();
-                            refs_for_callback
-                                .toast_overlay
-                                .add_toast(Toast::new("Stock picture updated"));
-                        }
-                        Err(error) => refs_for_callback.toast_overlay.add_toast(Toast::new(
-                            &format!("Could not display stock picture: {error}"),
-                        )),
+    let parent = parent.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let dialog = FileDialog::new();
+        dialog.set_title("Choose Stock Picture");
+        dialog.set_accept_label(Some("Choose"));
+
+        // Build the chooser filter from the image loaders that are actually
+        // configured in Glycin at runtime. Unsupported file types therefore
+        // never appear as selectable stock pictures.
+        let supported_mime_types = glycin::Loader::supported_mime_types().await;
+        if supported_mime_types.is_empty() {
+            refs.toast_overlay
+                .add_toast(Toast::new("No supported image loaders are available"));
+            return;
+        }
+
+        let image_filter = gtk::FileFilter::new();
+        image_filter.set_name(Some("Supported Images"));
+        for mime_type in supported_mime_types {
+            image_filter.add_mime_type(mime_type.as_str());
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&image_filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&image_filter));
+
+        let Ok(file) = dialog.open_future(Some(&parent)).await else {
+            return;
+        };
+        let Some(path) = file.path() else {
+            refs.toast_overlay
+                .add_toast(Toast::new("The selected picture could not be opened"));
+            return;
+        };
+
+        match crate::stock_image::save_stock_image(&provider_symbol, &path).await {
+            Ok(data) => {
+                let bytes = glib::Bytes::from_owned(data.bytes);
+                match gtk::gdk::Texture::from_bytes(&bytes) {
+                    Ok(_) => {
+                        let root: gtk::Widget = parent.clone().upcast();
+                        refresh_stock_picture_widgets(&root, &provider_symbol);
+                        refs.refresh();
+                        refs.toast_overlay
+                            .add_toast(Toast::new("Stock picture updated"));
                     }
+                    Err(error) => refs.toast_overlay.add_toast(Toast::new(
+                        &format!("Could not display stock picture: {error}"),
+                    )),
                 }
-                Err(error) => refs_for_callback.toast_overlay.add_toast(Toast::new(&format!(
-                    "Could not use stock picture: {error}"
-                ))),
             }
-        },
-    );
+            Err(error) => refs.toast_overlay.add_toast(Toast::new(&format!(
+                "Could not use stock picture: {error}"
+            ))),
+        }
+    });
 }
 
 fn present_stock_picture_actions(
@@ -4239,6 +4252,7 @@ fn main_menu_button() -> MenuButton {
     menu.append(Some("Transactions"), Some("win.activity"));
     menu.append(Some("Reports"), Some("win.reports"));
     menu.append(Some("Preferences"), Some("win.preferences"));
+    menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
     menu.append(Some("About Aureus"), Some("win.about"));
 
     MenuButton::builder()
@@ -4315,6 +4329,30 @@ fn install_window_actions(
         });
     }
     window.add_action(&preferences);
+
+    let shortcuts = gio::SimpleAction::new("shortcuts", None);
+    {
+        let window_weak = window.downgrade();
+        shortcuts.connect_activate(move |_, _| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+
+            let section = adw::ShortcutsSection::new(Some("General"));
+            section.add(adw::ShortcutsItem::from_action(
+                "Refresh",
+                "win.refresh-current",
+            ));
+            section.add(adw::ShortcutsItem::from_action("Search", "win.search"));
+            section.add(adw::ShortcutsItem::from_action("Close Window", "win.close"));
+            section.add(adw::ShortcutsItem::from_action("Quit", "app.quit"));
+
+            let dialog = adw::ShortcutsDialog::new();
+            dialog.add(section);
+            dialog.present(Some(&window));
+        });
+    }
+    window.add_action(&shortcuts);
 
     let activity = gio::SimpleAction::new("activity", None);
     {

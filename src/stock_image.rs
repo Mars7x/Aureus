@@ -4,12 +4,13 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
+use gtk::gdk::prelude::TextureExt;
 
 use crate::storage;
 
 const MAX_STOCK_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_STOCK_IMAGE_DIMENSION: i32 = 4096;
-const MAX_STOCK_IMAGE_PIXELS: i64 = 16_777_216;
+const MAX_STOCK_IMAGE_DIMENSION: u32 = 4096;
+const MAX_STOCK_IMAGE_PIXELS: u64 = 16_777_216;
 const MAX_STOCK_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const STORED_STOCK_IMAGE_DIMENSION: u32 = 512;
 
@@ -29,19 +30,63 @@ pub fn load_stock_image(provider_symbol: &str) -> Result<Option<StockImageData>,
     stock_image_from_bytes(bytes).map(Some)
 }
 
-pub fn save_stock_image(provider_symbol: &str, source: &Path) -> Result<StockImageData, String> {
-    let bytes = fs::read(source).map_err(|error| format!("Could not read selected picture: {error}"))?;
-    if bytes.len() > MAX_STOCK_IMAGE_BYTES {
+pub async fn save_stock_image(
+    provider_symbol: &str,
+    source: &Path,
+) -> Result<StockImageData, String> {
+    let metadata = fs::metadata(source)
+        .map_err(|error| format!("Could not read selected picture: {error}"))?;
+    if metadata.len() > MAX_STOCK_IMAGE_BYTES as u64 {
         return Err("The selected picture is larger than 8 MB".into());
     }
 
-    // Decode the actual file contents rather than trusting the extension. The
-    // image crate handles common raster formats, jxl-oxide supplies JPEG XL,
-    // and GdkPixbuf/librsvg provides the GNOME image-loading path used for SVG.
-// Normalize the
-    // stored copy to PNG so every GTK/libadwaita surface can display it
-    // consistently after selection.
-    let decoded = decode_selected_image(&bytes, source)?;
+    // Glycin is the GNOME image-loading path. It detects the real file type,
+    // decodes it in its loader sandbox, and handles raster and vector formats
+    // (including SVG) through the configured runtime loaders.
+    let file = gtk::gio::File::for_path(source);
+
+    // Prefer Glycin's normal sandbox selection. In installed Flatpaks this
+    // normally uses flatpak-spawn for an additional image-loader sandbox.
+    // Local Builder/flatpak-builder development runs are not always installed
+    // under the final app ID, so that nested sandbox can fail to launch even
+    // though the configured image loader itself is available. If that happens,
+    // retry Glycin without the nested sandbox; Aureus is still contained by its
+    // surrounding Flatpak sandbox.
+    let glycin_image = match glycin::Loader::new(file.clone()).load().await {
+        Ok(image) => image,
+        Err(sandbox_error) => {
+            let mut fallback_loader = glycin::Loader::new(file);
+            fallback_loader.sandbox_selector(glycin::SandboxSelector::NotSandboxed);
+            fallback_loader.load().await.map_err(|loader_error| {
+                format!(
+                    "Glycin could not load this image (sandboxed: {sandbox_error}; fallback: {loader_error})"
+                )
+            })?
+        }
+    };
+
+    let details = glycin_image.details();
+    validate_dimensions(details.width(), details.height())?;
+    let (target_width, target_height) = fitted_dimensions(
+        details.width(),
+        details.height(),
+        STORED_STOCK_IMAGE_DIMENSION,
+    );
+
+    let frame = glycin_image
+        .specific_frame(glycin::FrameRequest::new().scale(target_width, target_height))
+        .await
+        .map_err(|_| "Could not decode the selected picture".to_string())?;
+    validate_dimensions(frame.width(), frame.height())?;
+
+    // FrameRequest scaling is advisory, so normalize once more after converting
+    // the Glycin frame to PNG. This guarantees stored pictures remain bounded.
+    let texture = frame.texture();
+    let png = texture.save_to_png_bytes();
+    let decoded = decode_raster_with_limits(png.as_ref())
+        .ok_or_else(|| "Could not prepare the selected picture".to_string())?;
+    validate_image_dimensions(&decoded)?;
+
     let normalized_image = if decoded.width() > STORED_STOCK_IMAGE_DIMENSION
         || decoded.height() > STORED_STOCK_IMAGE_DIMENSION
     {
@@ -97,46 +142,26 @@ fn stock_image_from_bytes(bytes: Vec<u8>) -> Result<StockImageData, String> {
     Ok(StockImageData { bytes, colors })
 }
 
-fn decode_selected_image(bytes: &[u8], source: &Path) -> Result<image::DynamicImage, String> {
-    if let Some(image) = decode_raster_with_limits(bytes) {
-        validate_image_dimensions(&image)?;
-        return Ok(image);
+fn fitted_dimensions(width: u32, height: u32, maximum: u32) -> (u32, u32) {
+    if width <= maximum && height <= maximum {
+        return (width.max(1), height.max(1));
     }
 
-    if let Ok(decoder) = jxl_oxide::integration::JxlDecoder::new(Cursor::new(bytes)) {
-        if let Ok(image) = image::DynamicImage::from_decoder(decoder) {
-            validate_image_dimensions(&image)?;
-            return Ok(image);
-        }
+    if width >= height {
+        let scaled_height = ((u64::from(height) * u64::from(maximum)) / u64::from(width))
+            .max(1) as u32;
+        (maximum, scaled_height)
+    } else {
+        let scaled_width = ((u64::from(width) * u64::from(maximum)) / u64::from(height))
+            .max(1) as u32;
+        (scaled_width, maximum)
     }
-
-    // SVG is not decoded by the image crate. Use GdkPixbuf here instead of
-    // GdkTexture: the GNOME runtime's librsvg pixbuf loader rasterizes SVGs,
-    // and requesting a bounded size avoids ever materializing a huge vector
-    // canvas. The resulting pixels are immediately normalized to PNG like
-    // every other custom stock picture.
-    let pixbuf = gdk_pixbuf::Pixbuf::from_file_at_scale(
-        source,
-        STORED_STOCK_IMAGE_DIMENSION as i32,
-        STORED_STOCK_IMAGE_DIMENSION as i32,
-        true,
-    )
-    .map_err(|_| "The selected file is not a supported image".to_string())?;
-    validate_dimensions(pixbuf.width(), pixbuf.height())?;
-
-    let png = pixbuf
-        .save_to_bufferv("png", &[])
-        .map_err(|_| "Could not prepare the selected picture".to_string())?;
-    let image = decode_raster_with_limits(&png)
-        .ok_or_else(|| "Could not prepare the selected picture".to_string())?;
-    validate_image_dimensions(&image)?;
-    Ok(image)
 }
 
 fn stock_image_limits() -> image::Limits {
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_STOCK_IMAGE_DIMENSION as u32);
-    limits.max_image_height = Some(MAX_STOCK_IMAGE_DIMENSION as u32);
+    limits.max_image_width = Some(MAX_STOCK_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_STOCK_IMAGE_DIMENSION);
     limits.max_alloc = Some(MAX_STOCK_IMAGE_DECODE_BYTES);
     limits
 }
@@ -151,13 +176,13 @@ fn decode_raster_with_limits(bytes: &[u8]) -> Option<image::DynamicImage> {
 
 fn validate_image_dimensions(image: &image::DynamicImage) -> Result<(), String> {
     let (width, height) = image.dimensions();
-    validate_dimensions(width as i32, height as i32)
+    validate_dimensions(width, height)
 }
 
-fn validate_dimensions(width: i32, height: i32) -> Result<(), String> {
-    let pixels = i64::from(width).saturating_mul(i64::from(height));
-    if width <= 0
-        || height <= 0
+fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0
+        || height == 0
         || width > MAX_STOCK_IMAGE_DIMENSION
         || height > MAX_STOCK_IMAGE_DIMENSION
         || pixels > MAX_STOCK_IMAGE_PIXELS
