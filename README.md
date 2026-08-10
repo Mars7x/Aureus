@@ -10,12 +10,12 @@ Aureus is a GTK4 and libadwaita portfolio tracker built for Linux desktop and mo
 - Stock search and watchlist
 - Reports available as a PDF export
 
-## Build and Install
+## Build
 
 Run:
 
 ```
-git clone https://github.com/Mars7x/Aureus.git && cd Aureus && flatpak-builder --user --install build-dir io.github.Mars7x.Aureus.yml
+git clone https://github.com/Mars7x/Aureus.git && cd Aureus && flatpak-builder build-dir io.github.Mars7x.Aureus.yml
 ```
 Or just use [Builder](https://apps.gnome.org/Builder/)
 
