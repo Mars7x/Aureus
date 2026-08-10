@@ -1,0 +1,39 @@
+id: io.github.Mars7x.Aureus
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: aureus
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=network
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+
+modules:
+  - name: aureus
+    buildsystem: simple
+    build-options:
+      build-args:
+        # Cargo needs network access for this source build. Distribution
+        # packaging should replace this with generated offline Cargo sources.
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/aureus/cargo
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/aureus /app/bin/aureus
+      - install -Dm644 data/io.github.Mars7x.Aureus.desktop /app/share/applications/io.github.Mars7x.Aureus.desktop
+      - install -Dm644 data/io.github.Mars7x.Aureus.metainfo.xml /app/share/metainfo/io.github.Mars7x.Aureus.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.Mars7x.Aureus.svg /app/share/icons/hicolor/scalable/apps/io.github.Mars7x.Aureus.svg
+      - install -Dm644 data/icons/hicolor/scalable/actions/aureus-trend-symbolic.svg /app/share/icons/hicolor/scalable/actions/aureus-trend-symbolic.svg
+      - install -Dm644 data/icons/hicolor/scalable/actions/aureus-credit-card-symbolic.svg /app/share/icons/hicolor/scalable/actions/aureus-credit-card-symbolic.svg
+    sources:
+      - type: dir
+        path: ..

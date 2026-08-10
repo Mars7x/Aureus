@@ -1,0 +1,32 @@
+@define-color window_bg_color #181818;
+@define-color view_bg_color #181818;
+@define-color popover_bg_color #202020;
+@define-color dialog_bg_color #202020;
+
+@define-color sidebar_bg_color #1f1f1f;
+@define-color secondary_sidebar_bg_color #1f1f1f;
+
+/* Keep inactive sidebars neutral instead of Adwaita's purple-gray backdrop. */
+@define-color sidebar_backdrop_color #1f1f1f;
+@define-color secondary_sidebar_backdrop_color #1f1f1f;
+
+@define-color card_bg_color #222222;
+
+@define-color headerbar_bg_color #181818;
+
+:root {
+    --window-bg-color: #181818;
+    --view-bg-color: #181818;
+    --popover-bg-color: #202020;
+    --dialog-bg-color: #202020;
+
+    --sidebar-bg-color: #1f1f1f;
+    --secondary-sidebar-bg-color: #1f1f1f;
+
+    /* Same inactive-sidebar fix for newer libadwaita CSS variables. */
+    --sidebar-backdrop-color: #1f1f1f;
+    --secondary-sidebar-backdrop-color: #1f1f1f;
+
+    --card-bg-color: #222222;
+    --headerbar-bg-color: #181818;
+}

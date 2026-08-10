@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Aureus
+Comment=Track your investment portfolio
+Exec=aureus
+Icon=io.github.Mars7x.Aureus
+Terminal=false
+Type=Application
+Categories=Office;Finance;
+Keywords=stocks;portfolio;investments;dividends;finance;
+StartupNotify=true
+DBusActivatable=false

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Mars7x.Aureus</id>
+  <name>Aureus</name>
+  <summary>A native stock portfolio tracker</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.Mars7x">
+    <name>Mars7x</name>
+  </developer>
+  <description>
+    <p>Aureus is a GTK4 and libadwaita portfolio tracker with activity-based holdings, account cash, dividends, portfolio history, stock search, a watchlist, reports, backups, and an adaptive interface.</p>
+  </description>
+  <url type="homepage">https://github.com/Mars7x/Aureus</url>
+  <url type="bugtracker">https://github.com/Mars7x/Aureus/issues</url>
+  <launchable type="desktop-id">io.github.Mars7x.Aureus.desktop</launchable>
+  <provides>
+    <binary>aureus</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.0" date="2026-08-10">
+      <description>
+        <p>Initial Aureus 1.0 release with portfolio tracking, account cash and transfers, dividends, interactive history charts, reporting, backups, and adaptive GTK4/libadwaita navigation.</p>
+      </description>
+    </release>
+  </releases>
+</component>

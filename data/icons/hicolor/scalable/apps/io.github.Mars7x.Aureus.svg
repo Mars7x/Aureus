@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="64" height="64" viewBox="0 0 64 64">
+
+  <!-- Subtle lower edge: GNOME-style depth without a drop shadow -->
+  <path
+    d="M9 47
+       L23 28
+       L34 39
+       L53 16"
+    fill="none"
+    stroke="#26a269"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <path
+    d="M42 17
+       L53 16
+       L52 27"
+    fill="none"
+    stroke="#26a269"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <!-- Main flat face -->
+  <path
+    d="M9 45
+       L23 26
+       L34 37
+       L53 14"
+    fill="none"
+    stroke="#33d17a"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+  <path
+    d="M42 15
+       L53 14
+       L52 25"
+    fill="none"
+    stroke="#33d17a"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"/>
+
+</svg>
