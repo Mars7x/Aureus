@@ -50,7 +50,12 @@ pub struct DividendCalendar {
 #[derive(Clone, Debug)]
 pub struct DividendHistory {
     pub events: Vec<DividendEvent>,
+    /// Split events already present in Yahoo chart history.
     pub splits: Vec<SplitEvent>,
+    /// Announced future splits from Yahoo's dedicated splits calendar. None
+    /// means the optional calendar lookup failed, so callers should preserve
+    /// any previously cached future announcements rather than clearing them.
+    pub upcoming_splits: Option<Vec<SplitEvent>>,
     pub currency: Option<String>,
     pub calendar: Option<DividendCalendar>,
 }
@@ -618,6 +623,36 @@ fn sanitize_dividend_history(
     }
     history.splits.dedup_by_key(|event| event.timestamp);
 
+    if let Some(mut upcoming) = history.upcoming_splits.take() {
+        if upcoming.iter().any(|event| {
+            !event.provider_symbol.eq_ignore_ascii_case(provider_symbol)
+                || !event.ratio.is_finite()
+                || event.ratio <= 0.0
+                || (event.ratio - 1.0).abs() <= 0.0000001
+                || event.timestamp <= now
+                || !valid_event_timestamp(event.timestamp, now)
+        }) {
+            return Err(MarketError(format!(
+                "{} returned malformed upcoming split data for {provider_symbol}",
+                provider_name()
+            )));
+        }
+        upcoming.sort_by_key(|event| event.timestamp);
+        for pair in upcoming.windows(2) {
+            if pair[0].timestamp == pair[1].timestamp {
+                let tolerance = pair[0].ratio.abs().max(pair[1].ratio.abs()).max(1.0) * 1e-9;
+                if (pair[0].ratio - pair[1].ratio).abs() > tolerance {
+                    return Err(MarketError(format!(
+                        "{} returned conflicting upcoming split data for {provider_symbol}",
+                        provider_name()
+                    )));
+                }
+            }
+        }
+        upcoming.dedup_by_key(|event| event.timestamp);
+        history.upcoming_splits = Some(upcoming);
+    }
+
     history.currency = history
         .currency
         .filter(|value| !value.trim().is_empty());
@@ -936,6 +971,7 @@ mod tests {
                 currency: "USD".into(),
             }],
             splits: Vec::new(),
+            upcoming_splits: None,
             currency: Some("USD".into()),
             calendar: None,
         };

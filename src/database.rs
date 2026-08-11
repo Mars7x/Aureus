@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::storage;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 pub struct Database {
     connection: Connection,
@@ -92,6 +92,10 @@ impl Database {
         if version == 15 {
             self.migrate_v15_to_v16()?;
             version = 16;
+        }
+        if version == 16 {
+            self.migrate_v16_to_v17()?;
+            version = 17;
         }
         if version != 0 && version != SCHEMA_VERSION {
             // Never destroy a portfolio just because a database version is not
@@ -212,11 +216,18 @@ impl Database {
                  ratio REAL NOT NULL CHECK (ratio > 0),\n\
                  PRIMARY KEY(provider_symbol, timestamp)\n\
              );\n\
+             CREATE TABLE IF NOT EXISTS dividend_payments (\n\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE,\n\
+                 ex_dividend_timestamp INTEGER NOT NULL CHECK (ex_dividend_timestamp > 0),\n\
+                 payment_timestamp INTEGER NOT NULL CHECK (payment_timestamp > 0),\n\
+                 PRIMARY KEY(provider_symbol, ex_dividend_timestamp)\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS dividend_payments_due_idx ON dividend_payments(payment_timestamp);\n\
              CREATE TABLE IF NOT EXISTS dividend_fetches (\n\
                  provider_symbol TEXT PRIMARY KEY COLLATE NOCASE,\n\
                  fetched_at INTEGER NOT NULL\n\
              );\n\
-             PRAGMA user_version = 16;\n\
+             PRAGMA user_version = 17;\n\
              COMMIT;",
         )?;
 
@@ -338,6 +349,36 @@ impl Database {
         Ok(())
     }
 
+    fn migrate_v16_to_v17(&self) -> Result<()> {
+        // Store declared payment dates separately from ex-dividend history so
+        // entitlement can be calculated on the ex-date while cash is posted on
+        // the actual payment date. Existing accounts keep the old forward-only
+        // cutoff and default to automatic dividend cash enabled.
+        self.connection.execute_batch(
+            "BEGIN IMMEDIATE;\n\
+             CREATE TABLE IF NOT EXISTS settings (\n\
+                 key TEXT PRIMARY KEY,\n\
+                 value TEXT NOT NULL\n\
+             );\n\
+             CREATE TABLE IF NOT EXISTS dividend_payments (\n\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE,\n\
+                 ex_dividend_timestamp INTEGER NOT NULL CHECK (ex_dividend_timestamp > 0),\n\
+                 payment_timestamp INTEGER NOT NULL CHECK (payment_timestamp > 0),\n\
+                 PRIMARY KEY(provider_symbol, ex_dividend_timestamp)\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS dividend_payments_due_idx ON dividend_payments(payment_timestamp);\n\
+             INSERT OR IGNORE INTO settings (key, value)\n\
+             SELECT 'dividend-cash-enabled:' || id, '1' FROM accounts;\n\
+             INSERT OR IGNORE INTO settings (key, value)\n\
+             SELECT 'dividend-cash-start-at:' || id,\n\
+                    COALESCE((SELECT value FROM settings WHERE key = 'dividend-cash-start-at'), CAST(unixepoch() AS TEXT))\n\
+             FROM accounts;\n\
+             PRAGMA user_version = 17;\n\
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
         let mut statement = self.connection.prepare(
             "SELECT a.id, a.name, a.currency, COALESCE(SUM(c.amount), 0)\n\
@@ -365,7 +406,13 @@ impl Database {
                 account.currency.trim().to_uppercase(),
             ],
         )?;
-        Ok(self.connection.last_insert_rowid())
+        let account_id = self.connection.last_insert_rowid();
+        self.set_setting(&format!("dividend-cash-enabled:{account_id}"), "1")?;
+        self.set_setting(
+            &format!("dividend-cash-start-at:{account_id}"),
+            &unix_timestamp().to_string(),
+        )?;
+        Ok(account_id)
     }
 
     pub fn update_account(
@@ -413,6 +460,15 @@ impl Database {
         let changed = self
             .connection
             .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+        if changed > 0 {
+            let _ = self.connection.execute(
+                "DELETE FROM settings WHERE key IN (?1, ?2)",
+                params![
+                    format!("dividend-cash-enabled:{account_id}"),
+                    format!("dividend-cash-start-at:{account_id}"),
+                ],
+            );
+        }
         Ok(changed > 0)
     }
 
@@ -703,10 +759,26 @@ impl Database {
     }
 
     pub fn replace_split_events(&self, provider_symbol: &str, events: &[SplitEvent]) -> Result<()> {
+        // Chart corporate actions are authoritative for established history. A
+        // newly effective split announcement can take a short time to appear in
+        // Yahoo's chart events, though, so retain an unconfirmed cached split
+        // for a small grace window. Once the chart reports a split on the same
+        // date, the calendar copy is replaced to avoid applying it twice.
+        const RECENT_SPLIT_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
+        const SAME_SPLIT_WINDOW_SECONDS: i64 = 2 * 24 * 60 * 60;
+
+        let now = unix_timestamp();
+        let recent_minimum = now.saturating_sub(RECENT_SPLIT_GRACE_SECONDS);
+        let recent_cached = self
+            .split_events(provider_symbol)?
+            .into_iter()
+            .filter(|event| event.timestamp > recent_minimum && event.timestamp <= now)
+            .collect::<Vec<_>>();
+
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
-            "DELETE FROM split_history WHERE provider_symbol = ?1 COLLATE NOCASE",
-            params![provider_symbol],
+            "DELETE FROM split_history WHERE provider_symbol = ?1 COLLATE NOCASE AND timestamp <= ?2",
+            params![provider_symbol, now],
         )?;
         {
             let mut statement = transaction.prepare_cached(
@@ -714,7 +786,55 @@ impl Database {
                  ON CONFLICT(provider_symbol, timestamp) DO UPDATE SET ratio = excluded.ratio",
             )?;
             for event in events {
-                if event.timestamp > 0 && event.ratio.is_finite() && event.ratio > 0.0 {
+                if event.timestamp > 0
+                    && event.timestamp <= now
+                    && event.ratio.is_finite()
+                    && event.ratio > 0.0
+                {
+                    statement.execute(params![provider_symbol, event.timestamp, event.ratio])?;
+                }
+            }
+
+            for cached in recent_cached {
+                let confirmed = events.iter().any(|event| {
+                    event.timestamp > 0
+                        && event.timestamp <= now
+                        && (event.timestamp - cached.timestamp).abs() <= SAME_SPLIT_WINDOW_SECONDS
+                });
+                if !confirmed
+                    && cached.ratio.is_finite()
+                    && cached.ratio > 0.0
+                    && (cached.ratio - 1.0).abs() > 0.0000001
+                {
+                    statement.execute(params![provider_symbol, cached.timestamp, cached.ratio])?;
+                }
+            }
+        }
+        transaction.commit()
+    }
+
+    pub fn replace_upcoming_split_events(
+        &self,
+        provider_symbol: &str,
+        events: &[SplitEvent],
+    ) -> Result<()> {
+        let now = unix_timestamp();
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM split_history WHERE provider_symbol = ?1 COLLATE NOCASE AND timestamp > ?2",
+            params![provider_symbol, now],
+        )?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO split_history (provider_symbol, timestamp, ratio) VALUES (?1, ?2, ?3)\n\
+                 ON CONFLICT(provider_symbol, timestamp) DO UPDATE SET ratio = excluded.ratio",
+            )?;
+            for event in events {
+                if event.timestamp > now
+                    && event.ratio.is_finite()
+                    && event.ratio > 0.0
+                    && (event.ratio - 1.0).abs() > 0.0000001
+                {
                     statement.execute(params![provider_symbol, event.timestamp, event.ratio])?;
                 }
             }
@@ -1455,67 +1575,162 @@ impl Database {
         Ok(())
     }
 
-    pub fn sync_paid_dividends_to_cash(&self) -> Result<()> {
-        const START_SETTING: &str = "dividend-cash-start-at";
+    pub fn dividend_cash_enabled(&self, account_id: i64) -> Result<bool> {
+        let key = format!("dividend-cash-enabled:{account_id}");
+        Ok(!matches!(self.setting(&key)?.as_deref(), Some("0")))
+    }
 
-        let now = unix_timestamp();
-        let start_at = match self
-            .setting(START_SETTING)?
+    fn dividend_cash_start_at(&self, account_id: i64) -> Result<i64> {
+        let key = format!("dividend-cash-start-at:{account_id}");
+        if let Some(timestamp) = self
+            .setting(&key)?
             .and_then(|value| value.parse::<i64>().ok())
+            .filter(|timestamp| *timestamp > 0)
         {
-            Some(timestamp) => timestamp,
-            None => {
-                // Dividend cash is forward-only: establish the starting point once
-                // and never reconstruct payouts from historical events.
-                self.set_setting(START_SETTING, &now.to_string())?;
-                now
+            return Ok(timestamp);
+        }
+
+        let fallback = self
+            .setting("dividend-cash-start-at")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|timestamp| *timestamp > 0)
+            .unwrap_or_else(unix_timestamp);
+        self.set_setting(&key, &fallback.to_string())?;
+        Ok(fallback)
+    }
+
+    pub fn set_dividend_cash_enabled(&self, account_id: i64, enabled: bool) -> Result<()> {
+        let key = format!("dividend-cash-enabled:{account_id}");
+        let was_enabled = self.dividend_cash_enabled(account_id)?;
+        if enabled && !was_enabled {
+            // Re-enabling is forward-only: payouts missed while this switch was
+            // disabled are not silently backfilled into the account wallet.
+            self.set_setting(
+                &format!("dividend-cash-start-at:{account_id}"),
+                &unix_timestamp().to_string(),
+            )?;
+        }
+        self.set_setting(&key, if enabled { "1" } else { "0" })
+    }
+
+    fn matching_dividend_for_ex_date(
+        &self,
+        provider_symbol: &str,
+        ex_dividend_timestamp: i64,
+    ) -> Result<Option<(i64, f64, String)>> {
+        self.connection
+            .query_row(
+                "SELECT timestamp, amount, currency FROM dividend_history\n\
+                 WHERE provider_symbol = ?1 COLLATE NOCASE\n\
+                   AND ABS(timestamp - ?2) <= ?3\n\
+                 ORDER BY ABS(timestamp - ?2) ASC LIMIT 1",
+                params![provider_symbol, ex_dividend_timestamp, 2 * 24 * 60 * 60],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+    }
+
+    fn reconcile_legacy_dividend_cash(
+        &self,
+        provider_symbol: &str,
+        ex_dividend_timestamp: i64,
+        payment_timestamp: i64,
+    ) -> Result<()> {
+        let now = unix_timestamp();
+        for account in self.load_accounts()? {
+            let legacy_key = format!(
+                "dividend:{}:{}:{}",
+                account.id,
+                provider_symbol.trim().to_ascii_uppercase(),
+                ex_dividend_timestamp
+            );
+            let payment_key = format!(
+                "dividend-payment:{}:{}:{}",
+                account.id,
+                provider_symbol.trim().to_ascii_uppercase(),
+                ex_dividend_timestamp
+            );
+            if payment_timestamp > now {
+                // Older versions credited generated dividend cash on the ex-date.
+                // Remove only that generated entry until the declared pay date.
+                self.connection.execute(
+                    "DELETE FROM cash_entries WHERE source_key = ?1",
+                    params![legacy_key],
+                )?;
+            } else {
+                self.connection.execute(
+                    "UPDATE cash_entries SET source_key = ?2, occurred_at = ?3\n\
+                     WHERE source_key = ?1\n\
+                       AND NOT EXISTS (SELECT 1 FROM cash_entries WHERE source_key = ?2)",
+                    params![legacy_key, payment_key, payment_timestamp],
+                )?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn sync_paid_dividends_to_cash(&self) -> Result<()> {
+        let now = unix_timestamp();
+        let accounts = self.load_accounts()?;
+        if accounts.is_empty() {
+            return Ok(());
+        }
+
+        let mut enabled_accounts = Vec::new();
+        for account in accounts {
+            if self.dividend_cash_enabled(account.id)? {
+                let start_at = self.dividend_cash_start_at(account.id)?;
+                enabled_accounts.push((account, start_at));
+            }
+        }
+        let Some(earliest_start) = enabled_accounts.iter().map(|(_, start)| *start).min() else {
+            return Ok(());
         };
 
-        let dividend_count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM dividend_history WHERE timestamp > ?1 AND timestamp <= ?2",
-            params![start_at, now],
-            |row| row.get(0),
+        let mut schedule_statement = self.connection.prepare(
+            "SELECT provider_symbol, ex_dividend_timestamp, payment_timestamp\n\
+             FROM dividend_payments\n\
+             WHERE payment_timestamp > ?1 AND payment_timestamp <= ?2\n\
+             ORDER BY payment_timestamp ASC",
         )?;
-        if dividend_count == 0 {
+        let schedules = schedule_statement
+            .query_map(params![earliest_start, now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        drop(schedule_statement);
+        if schedules.is_empty() {
             return Ok(());
         }
 
         self.connection.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<()> {
-            let accounts = self.load_accounts()?;
             let transactions = self.load_transactions()?;
             let usd_cad = self.fx_rate("USDCAD")?.map(|rate| rate.rate);
-            let mut statement = self.connection.prepare(
-                "SELECT provider_symbol, timestamp, amount, currency\n\
-                 FROM dividend_history\n\
-                 WHERE timestamp > ?1 AND timestamp <= ?2\n\
-                 ORDER BY timestamp ASC",
-            )?;
-            let dividends = statement
-                .query_map(params![start_at, now], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>>>()?;
 
-            for (symbol, timestamp, per_share, currency) in dividends {
-                for account in &accounts {
-                    let code = transactions
-                        .iter()
-                        .rev()
-                        .find(|transaction| {
-                            transaction.account_id == account.id
-                                && transaction.provider_symbol.eq_ignore_ascii_case(&symbol)
-                                && transaction.timestamp <= timestamp
-                        })
-                        .map(|transaction| transaction.code.clone())
-                        .unwrap_or_else(|| symbol.clone());
-                    let shares = self.shares_held_at(account.id, &symbol, timestamp)?;
+            for (symbol, ex_date, payment_date) in schedules {
+                let Some((_event_timestamp, per_share, currency)) =
+                    self.matching_dividend_for_ex_date(&symbol, ex_date)?
+                else {
+                    // Never turn an estimated/announced date into cash without a
+                    // corresponding exact per-share dividend event.
+                    continue;
+                };
+                if !per_share.is_finite() || per_share <= 0.0 {
+                    continue;
+                }
+
+                for (account, start_at) in &enabled_accounts {
+                    if payment_date <= *start_at || payment_date > now {
+                        continue;
+                    }
+                    // Entitlement is based on shares held on the ex-dividend date;
+                    // the wallet entry itself is posted on the payment date.
+                    let shares = self.shares_held_at(account.id, &symbol, ex_date)?;
                     if shares <= 0.0000001 {
                         continue;
                     }
@@ -1529,12 +1744,25 @@ impl Database {
                     } else {
                         None
                     };
-                    let Some(amount) = amount else { continue };
+                    let Some(amount) = amount.filter(|amount| amount.is_finite() && *amount > 0.0) else {
+                        continue;
+                    };
+
+                    let code = transactions
+                        .iter()
+                        .rev()
+                        .find(|transaction| {
+                            transaction.account_id == account.id
+                                && transaction.provider_symbol.eq_ignore_ascii_case(&symbol)
+                                && transaction.timestamp <= ex_date
+                        })
+                        .map(|transaction| transaction.code.clone())
+                        .unwrap_or_else(|| symbol.clone());
                     let source_key = format!(
-                        "dividend:{}:{}:{}",
+                        "dividend-payment:{}:{}:{}",
                         account.id,
                         symbol.to_ascii_uppercase(),
-                        timestamp
+                        ex_date
                     );
                     self.connection.execute(
                         "INSERT INTO cash_entries (account_id, kind, amount, currency, occurred_at, description, source_key)\n\
@@ -1542,12 +1770,13 @@ impl Database {
                          ON CONFLICT(source_key) DO UPDATE SET\n\
                              amount = excluded.amount,\n\
                              currency = excluded.currency,\n\
+                             occurred_at = excluded.occurred_at,\n\
                              description = excluded.description",
                         params![
                             account.id,
                             amount,
                             account.currency,
-                            timestamp,
+                            payment_date,
                             format!("{code} dividend"),
                             source_key,
                         ],
@@ -1821,13 +2050,32 @@ impl Database {
         ex_dividend_date: Option<i64>,
         payment_date: Option<i64>,
     ) -> Result<()> {
-        let key = format!("dividend-calendar:{}", provider_symbol.trim().to_ascii_uppercase());
+        let symbol = provider_symbol.trim().to_ascii_uppercase();
+        let key = format!("dividend-calendar:{symbol}");
         let value = format!(
             "{},{}",
             ex_dividend_date.unwrap_or(0),
             payment_date.unwrap_or(0)
         );
-        self.set_setting(&key, &value)
+        self.set_setting(&key, &value)?;
+
+        if let (Some(ex_date), Some(payment_date)) = (ex_dividend_date, payment_date) {
+            let lag = payment_date.saturating_sub(ex_date);
+            if ex_date > 0
+                && payment_date >= ex_date
+                && lag <= 180 * 24 * 60 * 60
+            {
+                self.connection.execute(
+                    "INSERT INTO dividend_payments (provider_symbol, ex_dividend_timestamp, payment_timestamp)\n\
+                     VALUES (?1, ?2, ?3)\n\
+                     ON CONFLICT(provider_symbol, ex_dividend_timestamp) DO UPDATE SET\n\
+                         payment_timestamp = excluded.payment_timestamp",
+                    params![symbol, ex_date, payment_date],
+                )?;
+                self.reconcile_legacy_dividend_cash(&symbol, ex_date, payment_date)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn replace_dividend_events(
@@ -1939,6 +2187,7 @@ impl Database {
                     id: account.id,
                     name: account.name,
                     currency: account.currency,
+                    dividend_cash_enabled: self.dividend_cash_enabled(account.id).unwrap_or(true),
                 })
                 .collect(),
             watchlist: watchlist
@@ -2048,8 +2297,13 @@ impl Database {
             self.connection.execute("DELETE FROM history_fetches", [])?;
             self.connection.execute("DELETE FROM dividend_history", [])?;
             self.connection.execute("DELETE FROM split_history", [])?;
+            self.connection.execute("DELETE FROM dividend_payments", [])?;
             self.connection.execute("DELETE FROM dividend_fetches", [])?;
             self.connection.execute("DELETE FROM fx_rates", [])?;
+            self.connection.execute(
+                "DELETE FROM settings WHERE key LIKE 'dividend-cash-enabled:%' OR key LIKE 'dividend-cash-start-at:%'",
+                [],
+            )?;
 
             let mut id_map = HashMap::<i64, i64>::new();
             for account in &backup.accounts {
@@ -2057,7 +2311,16 @@ impl Database {
                     "INSERT INTO accounts (name, currency) VALUES (?1, ?2)",
                     params![account.name.trim(), account.currency.trim().to_uppercase()],
                 )?;
-                id_map.insert(account.id, self.connection.last_insert_rowid());
+                let new_id = self.connection.last_insert_rowid();
+                id_map.insert(account.id, new_id);
+                self.set_setting(
+                    &format!("dividend-cash-enabled:{new_id}"),
+                    if account.dividend_cash_enabled { "1" } else { "0" },
+                )?;
+                self.set_setting(
+                    &format!("dividend-cash-start-at:{new_id}"),
+                    &unix_timestamp().to_string(),
+                )?;
             }
 
             for entry in &backup.cash_entries {
@@ -2183,11 +2446,17 @@ struct PortfolioBackup {
     cash_entries: Vec<BackupCashEntry>,
 }
 
+fn backup_default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BackupAccount {
     id: i64,
     name: String,
     currency: String,
+    #[serde(default = "backup_default_true")]
+    dividend_cash_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2238,7 +2507,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{Database, SCHEMA_VERSION};
-    use crate::model::{NewAccount, NewTransaction};
+    use crate::model::{NewAccount, NewTransaction, SplitEvent};
 
     #[test]
     fn initialized_schema_reports_the_current_version() {
@@ -2303,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn dividend_cash_only_credits_events_after_the_start_cutoff() {
+    fn dividend_cash_posts_on_payment_date_after_the_start_cutoff() {
         let database = Database::open_in_memory().expect("database");
         let account_id = database
             .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
@@ -2326,7 +2595,7 @@ mod tests {
             })
             .expect("activity");
         database
-            .set_setting("dividend-cash-start-at", "100")
+            .set_setting(&format!("dividend-cash-start-at:{account_id}"), "100")
             .expect("cutoff");
         database
             .connection
@@ -2342,6 +2611,20 @@ mod tests {
                 rusqlite::params!["CCO.TO", 150_i64, 0.50_f64, "CAD"],
             )
             .expect("new dividend");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_payments (provider_symbol, ex_dividend_timestamp, payment_timestamp) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["CCO.TO", 50_i64, 80_i64],
+            )
+            .expect("old payment");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_payments (provider_symbol, ex_dividend_timestamp, payment_timestamp) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["CCO.TO", 150_i64, 200_i64],
+            )
+            .expect("new payment");
 
         database.sync_paid_dividends_to_cash().expect("sync");
         let dividends = database
@@ -2351,8 +2634,226 @@ mod tests {
             .filter(|entry| entry.kind == "DIVIDEND")
             .collect::<Vec<_>>();
         assert_eq!(dividends.len(), 1);
-        assert_eq!(dividends[0].occurred_at, 150);
+        assert_eq!(dividends[0].occurred_at, 200);
         assert_eq!(dividends[0].amount, 5.0);
+    }
+
+    #[test]
+    fn dividend_entitlement_uses_ex_date_shares_even_if_sold_before_payment() {
+        let database = Database::open_in_memory().expect("database");
+        let account_id = database
+            .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
+            .expect("account");
+        database
+            .set_setting(&format!("dividend-cash-start-at:{account_id}"), "100")
+            .expect("cutoff");
+        database
+            .add_transaction(&NewTransaction {
+                account_id,
+                code: "CCO".into(),
+                exchange: "TOR".into(),
+                provider_symbol: "CCO.TO".into(),
+                name: "Cameco".into(),
+                transaction_type: "OPEN".into(),
+                trade_date: "1970-01-01".into(),
+                timestamp: 110,
+                shares: 10.0,
+                price: 10.0,
+                fees: 0.0,
+                settle_cash: false,
+                currency: "CAD".into(),
+            })
+            .expect("open");
+        database
+            .add_transaction(&NewTransaction {
+                account_id,
+                code: "CCO".into(),
+                exchange: "TOR".into(),
+                provider_symbol: "CCO.TO".into(),
+                name: "Cameco".into(),
+                transaction_type: "SELL".into(),
+                trade_date: "1970-01-01".into(),
+                timestamp: 175,
+                shares: 10.0,
+                price: 12.0,
+                fees: 0.0,
+                settle_cash: false,
+                currency: "CAD".into(),
+            })
+            .expect("sell");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_history (provider_symbol, timestamp, amount, currency) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["CCO.TO", 150_i64, 0.50_f64, "CAD"],
+            )
+            .expect("dividend");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_payments (provider_symbol, ex_dividend_timestamp, payment_timestamp) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["CCO.TO", 150_i64, 200_i64],
+            )
+            .expect("payment");
+
+        database.sync_paid_dividends_to_cash().expect("sync");
+        let dividend = database
+            .load_cash_entries()
+            .expect("cash")
+            .into_iter()
+            .find(|entry| entry.kind == "DIVIDEND")
+            .expect("dividend cash");
+        assert_eq!(dividend.occurred_at, 200);
+        assert!((dividend.amount - 5.0).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn disabled_dividend_cash_setting_prevents_automatic_wallet_credit() {
+        let database = Database::open_in_memory().expect("database");
+        let account_id = database
+            .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
+            .expect("account");
+        database
+            .set_setting(&format!("dividend-cash-start-at:{account_id}"), "100")
+            .expect("cutoff");
+        database
+            .set_dividend_cash_enabled(account_id, false)
+            .expect("disable");
+        database
+            .add_transaction(&NewTransaction {
+                account_id,
+                code: "CCO".into(),
+                exchange: "TOR".into(),
+                provider_symbol: "CCO.TO".into(),
+                name: "Cameco".into(),
+                transaction_type: "OPEN".into(),
+                trade_date: "1970-01-01".into(),
+                timestamp: 110,
+                shares: 10.0,
+                price: 10.0,
+                fees: 0.0,
+                settle_cash: false,
+                currency: "CAD".into(),
+            })
+            .expect("open");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_history (provider_symbol, timestamp, amount, currency) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["CCO.TO", 150_i64, 0.50_f64, "CAD"],
+            )
+            .expect("dividend");
+        database
+            .connection
+            .execute(
+                "INSERT INTO dividend_payments (provider_symbol, ex_dividend_timestamp, payment_timestamp) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["CCO.TO", 150_i64, 200_i64],
+            )
+            .expect("payment");
+
+        database.sync_paid_dividends_to_cash().expect("sync");
+        assert!(database
+            .load_cash_entries()
+            .expect("cash")
+            .into_iter()
+            .all(|entry| entry.kind != "DIVIDEND"));
+    }
+
+    #[test]
+    fn historical_split_refresh_preserves_cached_future_announcements() {
+        let database = Database::open_in_memory().expect("database");
+        let now = super::unix_timestamp();
+        let future = SplitEvent {
+            provider_symbol: "TEST".into(),
+            timestamp: now + 7 * 24 * 60 * 60,
+            ratio: 3.0,
+        };
+        database
+            .replace_upcoming_split_events("TEST", &[future.clone()])
+            .expect("future split");
+        database
+            .replace_split_events(
+                "TEST",
+                &[SplitEvent {
+                    provider_symbol: "TEST".into(),
+                    timestamp: now - 7 * 24 * 60 * 60,
+                    ratio: 2.0,
+                }],
+            )
+            .expect("historical refresh");
+
+        let events = database.split_events("TEST").expect("splits");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| event.timestamp == future.timestamp && (event.ratio - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn newly_effective_split_survives_a_short_chart_propagation_delay() {
+        let database = Database::open_in_memory().expect("database");
+        let now = super::unix_timestamp();
+        database
+            .connection
+            .execute(
+                "INSERT INTO split_history (provider_symbol, timestamp, ratio) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["TEST", now - 60 * 60, 2.0_f64],
+            )
+            .expect("cached effective split");
+
+        database
+            .replace_split_events("TEST", &[])
+            .expect("delayed chart refresh");
+        let events = database.split_events("TEST").expect("splits");
+        assert_eq!(events.len(), 1);
+        assert!((events[0].ratio - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn historical_chart_split_replaces_same_date_calendar_copy() {
+        let database = Database::open_in_memory().expect("database");
+        let now = super::unix_timestamp();
+        let calendar_timestamp = now - 6 * 60 * 60;
+        let chart_timestamp = now - 2 * 60 * 60;
+        database
+            .connection
+            .execute(
+                "INSERT INTO split_history (provider_symbol, timestamp, ratio) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["TEST", calendar_timestamp, 3.0_f64],
+            )
+            .expect("calendar split");
+
+        database
+            .replace_split_events(
+                "TEST",
+                &[SplitEvent {
+                    provider_symbol: "TEST".into(),
+                    timestamp: chart_timestamp,
+                    ratio: 3.0,
+                }],
+            )
+            .expect("confirmed split");
+        let events = database.split_events("TEST").expect("splits");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp, chart_timestamp);
+        assert!((events[0].ratio - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn backup_roundtrip_preserves_dividend_cash_preference() {
+        let source = Database::open_in_memory().expect("source database");
+        let account_id = source
+            .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
+            .expect("account");
+        source
+            .set_dividend_cash_enabled(account_id, false)
+            .expect("disable dividend cash");
+        let backup = source.export_backup_json().expect("backup");
+
+        let restored = Database::open_in_memory().expect("restored database");
+        restored.import_backup_json(&backup).expect("restore");
+        let account = restored.load_accounts().expect("accounts").remove(0);
+        assert!(!restored
+            .dividend_cash_enabled(account.id)
+            .expect("restored setting"));
     }
 
     #[test]

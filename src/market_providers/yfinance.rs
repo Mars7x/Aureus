@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::market_data::{
     display_symbol, infer_currency, now_unix, DividendCalendar, DividendHistory, History,
@@ -14,6 +15,7 @@ const SEARCH_URL: &str = "https://query1.finance.yahoo.com/v1/finance/search";
 const CHART_URL: &str = "https://query2.finance.yahoo.com/v8/finance/chart";
 const QUOTE_URL: &str = "https://query1.finance.yahoo.com/v7/finance/quote";
 const QUOTE_SUMMARY_URL: &str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary";
+const CALENDAR_URL: &str = "https://query1.finance.yahoo.com/v1/finance/visualization";
 const YAHOO_COOKIE_URL: &str = "https://fc.yahoo.com";
 const YAHOO_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
 const MAX_CLOCK_SKEW_SECONDS: i64 = 10 * 60;
@@ -679,6 +681,323 @@ fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, MarketError> {
         .map_err(|error| MarketError(format!("Could not read Yahoo Finance response: {error}")))
 }
 
+fn post_json_value(url: &str, body: &Value) -> Result<Value, MarketError> {
+    let mut response = agent()
+        .post(url)
+        .header("Accept", "application/json")
+        .send_json(body)
+        .map_err(|error| {
+            if matches!(&error, ureq::Error::StatusCode(429)) {
+                rate_limit_error()
+            } else {
+                MarketError(format!("Yahoo Finance request failed: {error}"))
+            }
+        })?;
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| MarketError(format!("Could not read Yahoo Finance response: {error}")))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(MarketError("Yahoo Finance returned an empty response".into()));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("too many requests") || lower.contains("rate limit") {
+        return Err(rate_limit_error());
+    }
+    if trimmed.starts_with('<') || lower.contains("will be right back") {
+        return Err(MarketError(
+            "Yahoo Finance returned a non-data response; cached values are still available".into(),
+        ));
+    }
+    serde_json::from_str(trimmed)
+        .map_err(|error| MarketError(format!("Could not read Yahoo Finance response: {error}")))
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn yahoo_date_string(timestamp: i64) -> String {
+    let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn parse_calendar_timestamp(value: &Value) -> Option<i64> {
+    if let Some(timestamp) = value.as_i64() {
+        return (timestamp > 0).then_some(timestamp);
+    }
+    if let Some(timestamp) = value.as_f64() {
+        if timestamp.is_finite() && timestamp > 0.0 && timestamp <= i64::MAX as f64 {
+            return Some(timestamp.round() as i64);
+        }
+    }
+    let text = value.as_str()?.trim();
+    let date = text.get(..10)?;
+    let mut parts = date.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+
+    let mut timestamp = days.saturating_mul(86_400);
+    if text.len() < 19 {
+        return Some(timestamp);
+    }
+    if !matches!(text.as_bytes().get(10), Some(b'T') | Some(b' ')) {
+        return Some(timestamp);
+    }
+    let hour = text.get(11..13)?.parse::<i64>().ok()?;
+    let minute = text.get(14..16)?.parse::<i64>().ok()?;
+    let second = text.get(17..19)?.parse::<i64>().ok()?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    timestamp = timestamp
+        .saturating_add(hour * 3_600)
+        .saturating_add(minute * 60)
+        .saturating_add(second);
+
+    // Yahoo currently emits UTC (`Z`) calendar timestamps. Support explicit
+    // numeric offsets as well so a provider-side formatting change cannot shift
+    // a split onto the previous/next trading date.
+    if !text.ends_with('Z') {
+        let suffix = text.get(19..).unwrap_or_default();
+        let offset_position = suffix
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| *ch == '+' || *ch == '-')
+            .map(|(index, _)| index);
+        if let Some(index) = offset_position {
+            let offset = suffix.get(index..)?;
+            let sign = if offset.starts_with('-') { -1_i64 } else { 1_i64 };
+            let hour = offset.get(1..3)?.parse::<i64>().ok()?;
+            let minute = offset.get(4..6)?.parse::<i64>().ok()?;
+            if offset.as_bytes().get(3) != Some(&b':')
+                || !(0..=23).contains(&hour)
+                || !(0..=59).contains(&minute)
+            {
+                return None;
+            }
+            timestamp = timestamp.saturating_sub(sign * (hour * 3_600 + minute * 60));
+        }
+    }
+
+    Some(timestamp)
+}
+
+fn split_calendar_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<f64>().ok())
+        .filter(|number| number.is_finite() && *number > 0.0)
+}
+
+fn normalized_calendar_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn parse_upcoming_split_calendar(
+    value: &Value,
+    symbol: &str,
+    now: i64,
+    end: i64,
+) -> Result<Vec<SplitEvent>, MarketError> {
+    let results = value
+        .get("finance")
+        .and_then(|finance| finance.get("result"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| MarketError("Yahoo Finance returned malformed split calendar results".into()))?;
+    let Some(result) = results.first() else {
+        return Ok(Vec::new());
+    };
+    let documents = result
+        .get("documents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MarketError("Yahoo Finance returned malformed split calendar documents".into()))?;
+    let Some(document) = documents.first() else {
+        return Ok(Vec::new());
+    };
+    let columns = document
+        .get("columns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MarketError("Yahoo Finance returned malformed split calendar columns".into()))?;
+    let rows = document
+        .get("rows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MarketError("Yahoo Finance returned malformed split calendar rows".into()))?;
+    let labels = columns
+        .iter()
+        .map(|column| {
+            column
+                .get("label")
+                .and_then(Value::as_str)
+                .map(normalized_calendar_label)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let find_index = |candidates: &[&str]| {
+        labels
+            .iter()
+            .position(|label| candidates.iter().any(|candidate| label.as_str() == *candidate))
+    };
+    let symbol_index = find_index(&["symbol", "ticker"])
+        .ok_or_else(|| MarketError("Yahoo Finance split calendar is missing its symbol column".into()))?;
+    let date_index = find_index(&["payableon", "eventstartdate", "startdatetime", "date"])
+        .ok_or_else(|| MarketError("Yahoo Finance split calendar is missing its date column".into()))?;
+    let old_index = find_index(&["oldshareworth", "oldshares"])
+        .ok_or_else(|| MarketError("Yahoo Finance split calendar is missing its old-share column".into()))?;
+    let new_index = find_index(&["shareworth", "newshareworth", "newshares"])
+        .ok_or_else(|| MarketError("Yahoo Finance split calendar is missing its new-share column".into()))?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let Some(values) = row.as_array() else { continue };
+        let Some(row_symbol) = values.get(symbol_index).and_then(Value::as_str) else { continue };
+        if !row_symbol.trim().eq_ignore_ascii_case(symbol) {
+            continue;
+        }
+        let Some(timestamp) = values.get(date_index).and_then(parse_calendar_timestamp) else { continue };
+        if timestamp <= now || timestamp > end {
+            continue;
+        }
+        let Some(old_worth) = values.get(old_index).and_then(split_calendar_number) else { continue };
+        let Some(new_worth) = values.get(new_index).and_then(split_calendar_number) else { continue };
+        // Yahoo's split calendar expresses a 3-for-1 split as old_share_worth=1,
+        // share_worth=3, and a 1-for-5 reverse split as 5 -> 1. The holdings
+        // multiplier is therefore new shares divided by old shares.
+        let ratio = new_worth / old_worth;
+        if !ratio.is_finite() || ratio <= 0.0 || (ratio - 1.0).abs() <= 0.0000001 {
+            continue;
+        }
+        events.push(SplitEvent {
+            provider_symbol: symbol.to_ascii_uppercase(),
+            timestamp,
+            ratio,
+        });
+    }
+    events.sort_by_key(|event| event.timestamp);
+    events.dedup_by(|left, right| {
+        left.timestamp == right.timestamp && (left.ratio - right.ratio).abs() <= 1e-9
+    });
+    Ok(events)
+}
+
+fn upcoming_splits_calendar(provider_symbol: &str) -> Result<Vec<SplitEvent>, MarketError> {
+    let symbol = provider_symbol.trim().to_ascii_uppercase();
+    if symbol.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = now_unix();
+    let end = now.saturating_add(366 * 24 * 60 * 60);
+    let start_date = yahoo_date_string(now);
+    let end_date = yahoo_date_string(end);
+    let body = json!({
+        "sortType": "DESC",
+        "entityIdType": "splits",
+        "sortField": "startdatetime",
+        "includeFields": [
+            "ticker",
+            "companyshortname",
+            "startdatetime",
+            "optionable",
+            "old_share_worth",
+            "share_worth"
+        ],
+        "size": 100,
+        "offset": 0,
+        "query": {
+            "operator": "AND",
+            "operands": [
+                {"operator": "EQ", "operands": ["ticker", symbol.clone()]},
+                {"operator": "GTE", "operands": ["startdatetime", start_date]},
+                {"operator": "LTE", "operands": ["startdatetime", end_date]}
+            ]
+        }
+    });
+
+    let mut last_auth_error = None;
+    for attempt in 0..2 {
+        let crumb = yahoo_crumb()?;
+        let had_crumb = crumb.is_some();
+        let mut url = format!("{CALENDAR_URL}?lang=en-US&region=US");
+        if let Some(crumb) = crumb.as_deref() {
+            url.push_str("&crumb=");
+            url.push_str(&urlencoding::encode(crumb));
+        }
+        let value = match post_json_value(&url, &body) {
+            Ok(value) => value,
+            Err(error) if attempt == 0 && had_crumb && crumb_auth_error(&error) => {
+                invalidate_yahoo_crumb();
+                last_auth_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(error) = value
+            .get("finance")
+            .and_then(|finance| finance.get("error"))
+            .filter(|error| !error.is_null())
+        {
+            let detail = error
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| error.get("code").and_then(Value::as_str))
+                .unwrap_or("unknown error");
+            let error = MarketError(format!(
+                "Yahoo Finance split calendar request failed for {symbol}: {detail}"
+            ));
+            if attempt == 0 && had_crumb && crumb_auth_error(&error) {
+                invalidate_yahoo_crumb();
+                last_auth_error = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+
+        return parse_upcoming_split_calendar(&value, &symbol, now, end);
+    }
+
+    Err(last_auth_error.unwrap_or_else(|| {
+        MarketError(format!("Yahoo Finance could not authenticate split calendar data for {symbol}"))
+    }))
+}
+
 fn crumb_auth_error(error: &MarketError) -> bool {
     let lower = error.0.to_ascii_lowercase();
     lower.contains("401")
@@ -1153,10 +1472,16 @@ fn dividends_impl(provider_symbol: &str) -> Result<DividendHistory, MarketError>
     // than chart events. Treat this as best-effort so a calendar endpoint
     // failure never discards otherwise valid dividend history.
     let calendar = dividend_calendar(symbol).ok().flatten();
+    // Yahoo's chart events are dependable for historical splits, but announced
+    // future splits live in the dedicated financial calendar. Keep failure
+    // distinguishable from an authoritative empty result so cached announcements
+    // survive a temporary calendar outage.
+    let upcoming_splits = upcoming_splits_calendar(symbol).ok();
 
     Ok(DividendHistory {
         events: dividends,
         splits,
+        upcoming_splits,
         currency,
         calendar,
     })
@@ -1697,6 +2022,54 @@ mod tests {
             chart.chart.result.unwrap()[0].meta.has_pre_post_market_data,
             Some(true)
         );
+    }
+
+    #[test]
+    fn split_calendar_timestamp_preserves_yahoo_time_and_offset() {
+        let midnight = parse_calendar_timestamp(&json!("2027-01-15")).expect("date");
+        let utc = parse_calendar_timestamp(&json!("2027-01-15T04:30:15.000Z")).expect("utc");
+        assert_eq!(utc - midnight, 4 * 3_600 + 30 * 60 + 15);
+
+        let offset = parse_calendar_timestamp(&json!("2027-01-15T04:30:15-05:00"))
+            .expect("offset");
+        assert_eq!(offset - midnight, 9 * 3_600 + 30 * 60 + 15);
+    }
+
+    #[test]
+    fn upcoming_split_calendar_parses_forward_and_reverse_ratios() {
+        let payload = json!({
+            "finance": {
+                "result": [{
+                    "documents": [{
+                        "columns": [
+                            {"label": "Symbol"},
+                            {"label": "Company Name"},
+                            {"label": "Payable On"},
+                            {"label": "Optionable?"},
+                            {"label": "Old Share Worth"},
+                            {"label": "Share Worth"}
+                        ],
+                        "rows": [
+                            ["TEST", "Test Corp", "2027-01-15T00:00:00.000Z", false, 1, 3],
+                            ["TEST", "Test Corp", "2027-02-01T00:00:00.000Z", false, 5, 1],
+                            ["OTHER", "Other Corp", "2027-03-01T00:00:00.000Z", false, 1, 2]
+                        ]
+                    }]
+                }],
+                "error": null
+            }
+        });
+        let events = parse_upcoming_split_calendar(&payload, "TEST", 1_700_000_000, 2_000_000_000)
+            .expect("split calendar");
+        assert_eq!(events.len(), 2);
+        assert!((events[0].ratio - 3.0).abs() < 1e-9);
+        assert!((events[1].ratio - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn malformed_split_calendar_does_not_become_an_authoritative_empty_result() {
+        let payload = json!({"finance": {"error": null}});
+        assert!(parse_upcoming_split_calendar(&payload, "TEST", 1_700_000_000, 2_000_000_000).is_err());
     }
 
     #[test]

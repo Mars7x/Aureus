@@ -1950,11 +1950,17 @@ fn build_setup_page(
     currency.set_model(Some(&currency_model));
     currency.set_selected(u32::MAX);
 
+    let dividend_cash = SwitchRow::new();
+    dividend_cash.set_title("Add Dividends to Cash");
+    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
+    dividend_cash.set_active(true);
+
     let account_group = PreferencesGroup::builder()
         .title("First Account")
         .build();
     account_group.add(&name);
     account_group.add(&currency);
+    account_group.add(&dividend_cash);
 
     let create = Button::builder()
         .label("Create Account")
@@ -2045,6 +2051,7 @@ fn build_setup_page(
         let root_stack = root_stack.clone();
         let name = name.clone();
         let currency = currency.clone();
+        let dividend_cash = dividend_cash.clone();
         let create_for_callback = create.clone();
         create.connect_clicked(move |_| {
             let account_name = name.text().trim().to_string();
@@ -2059,6 +2066,19 @@ fn build_setup_page(
 
             match refs.state.database.add_account(&account) {
                 Ok(account_id) => {
+                    if !dividend_cash.is_active() {
+                        if let Err(error) = refs
+                            .state
+                            .database
+                            .set_dividend_cash_enabled(account_id, false)
+                        {
+                            let _ = refs.state.database.delete_account(account_id);
+                            refs.toast_overlay.add_toast(Toast::new(&format!(
+                                "Could not save dividend cash setting: {error}"
+                            )));
+                            return;
+                        }
+                    }
                     let _ = refs
                         .state
                         .database
@@ -2616,7 +2636,7 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
             items.push((
                 split.timestamp,
                 format!("{} · {kind}", position.code),
-                format_distribution_date(split.timestamp),
+                format!("Effective date · {}", format_distribution_date(split.timestamp)),
                 split_ratio_text(split.ratio),
             ));
         }
@@ -2627,7 +2647,7 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
         refs.upcoming_box.append(&upcoming_action_card(
             "Nothing announced",
             "Next 12 months",
-            "Upcoming ex-dividend dates, dividend payments, and splits will appear here",
+            "Upcoming ex-dividend dates, dividend payments, splits, and reverse splits will appear here",
         ));
         return;
     }
@@ -5782,6 +5802,12 @@ fn prepare_report_export(
                 .state
                 .database
                 .replace_split_events(symbol, &history.splits);
+            if let Some(upcoming_splits) = &history.upcoming_splits {
+                let _ = refs
+                    .state
+                    .database
+                    .replace_upcoming_split_events(symbol, upcoming_splits);
+            }
             if let Some(calendar) = &history.calendar {
                 let _ = refs.state.database.set_dividend_calendar(
                     symbol,
@@ -8739,6 +8765,20 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
                     .state
                     .database
                     .replace_split_events(&detail.provider_symbol, &history.splits);
+                if let Some(upcoming_splits) = &history.upcoming_splits {
+                    let _ = detail
+                        .app
+                        .state
+                        .database
+                        .replace_upcoming_split_events(&detail.provider_symbol, upcoming_splits);
+                }
+                if let Some(calendar) = &history.calendar {
+                    let _ = detail.app.state.database.set_dividend_calendar(
+                        &detail.provider_symbol,
+                        calendar.ex_dividend_date,
+                        calendar.payment_date,
+                    );
+                }
                 let _ = detail
                     .app
                     .state
@@ -9299,9 +9339,15 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     currency.set_model(Some(&currency_model));
     currency.set_selected(if base_currency(&refs.state) == "USD" { 1 } else { 0 });
 
+    let dividend_cash = SwitchRow::new();
+    dividend_cash.set_title("Add Dividends to Cash");
+    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
+    dividend_cash.set_active(true);
+
     let group = PreferencesGroup::new();
     group.add(&name);
     group.add(&currency);
+    group.add(&dividend_cash);
 
     let body = dialog_body();
     body.append(&group);
@@ -9348,6 +9394,7 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
         let refs = refs.clone();
         let name = name.clone();
         let currency = currency.clone();
+        let dividend_cash = dividend_cash.clone();
         add.connect_clicked(move |_| {
             let account_name = name.text().trim().to_string();
             if account_name.is_empty() {
@@ -9364,6 +9411,19 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
             };
             match refs.state.database.add_account(&account) {
                 Ok(account_id) => {
+                    if !dividend_cash.is_active() {
+                        if let Err(error) = refs
+                            .state
+                            .database
+                            .set_dividend_cash_enabled(account_id, false)
+                        {
+                            let _ = refs.state.database.delete_account(account_id);
+                            refs.toast_overlay.add_toast(Toast::new(&format!(
+                                "Could not save dividend cash setting: {error}"
+                            )));
+                            return;
+                        }
+                    }
                     let _ = refs
                         .state
                         .database
@@ -9931,9 +9991,20 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
         currency.set_subtitle("Currency is fixed after cash or activity is recorded");
     }
 
+    let dividend_cash = SwitchRow::new();
+    dividend_cash.set_title("Add Dividends to Cash");
+    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
+    dividend_cash.set_active(
+        refs.state
+            .database
+            .dividend_cash_enabled(account.id)
+            .unwrap_or(true),
+    );
+
     let group = PreferencesGroup::new();
     group.add(&name);
     group.add(&currency);
+    group.add(&dividend_cash);
 
     let body = dialog_body();
     body.append(&group);
@@ -9989,6 +10060,17 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
                 currency_at(currency.selected()),
             ) {
                 Ok(()) => {
+                    if let Err(error) = refs
+                        .state
+                        .database
+                        .set_dividend_cash_enabled(account_id, dividend_cash.is_active())
+                    {
+                        refs.toast_overlay.add_toast(Toast::new(&format!(
+                            "Could not update dividend cash setting: {error}"
+                        )));
+                        return;
+                    }
+                    let _ = refs.state.database.sync_paid_dividends_to_cash();
                     refs.refresh();
                     refs.toast_overlay.add_toast(Toast::new("Account updated"));
                     dialog.close();
@@ -12993,6 +13075,12 @@ fn refresh_dividends_async(refs: UiRefs, positions: Vec<Position>, announce: boo
                 .state
                 .database
                 .replace_split_events(symbol, &history.splits);
+            if let Some(upcoming_splits) = &history.upcoming_splits {
+                let _ = refs
+                    .state
+                    .database
+                    .replace_upcoming_split_events(symbol, upcoming_splits);
+            }
             if let Some(calendar) = &history.calendar {
                 let _ = refs.state.database.set_dividend_calendar(
                     symbol,
