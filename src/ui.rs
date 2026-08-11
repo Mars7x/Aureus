@@ -1024,10 +1024,16 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     let accounts_list = positions_list();
     let watchlist_list = positions_list();
     let dividend_list = positions_list();
-    // Dividend history should read like a light native history list rather than
-    // a second card competing with the chart. Keep only row separators.
+    // A dedicated class provides a small fallback for the populated history
+    // surface in case a runtime/theme does not paint Adwaita's boxed-list class.
+    // The fallback only applies while boxed-list is present, so the empty state
+    // remains directly on the page background.
+    dividend_list.add_css_class("dividend-history-list");
+    // Keep the empty state on the bare page surface. Once real distributions
+    // exist, rebuild_dividend_page restores libadwaita's native boxed-list
+    // treatment so the history reads like a standard GNOME list group.
     dividend_list.remove_css_class("boxed-list");
-    dividend_list.set_show_separators(true);
+    dividend_list.set_show_separators(false);
     let dividend_recent_heading = section_heading("Recent Distributions");
     // The empty placeholder already says "No Recent Distributions". Hide the
     // section heading until real rows exist so the empty state does not repeat
@@ -1036,7 +1042,9 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     let dividend_income = Label::builder()
         .label("—")
         .halign(Align::Center)
-        .css_classes(["title-1", "dividend-headline"])
+        // Match Overview's native libadwaita title metric exactly. Avoid a
+        // custom point-size override so currency glyphs render consistently.
+        .css_classes(["title-1"])
         .build();
     let dividend_yield = Label::builder()
         .label("—")
@@ -3202,7 +3210,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
 
     if positions.is_empty() {
         refs.dividends_stack.set_visible_child_name("empty");
-        refs.dividend_income.set_label("—");
+        set_dividend_income_text(&refs.dividend_income, "—");
         refs.dividend_yield.set_label("—");
         refs.dividend_status.set_label("No holdings yet");
         refs.dividend_chart
@@ -3386,13 +3394,17 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
     // so changing the period can never leave a stale forward run-rate above a
     // smaller set of bars.
     if selected_complete {
-        refs.dividend_income
-            .set_label(&format_currency(selected_total, base));
+        set_dividend_income_text(
+            &refs.dividend_income,
+            &format_currency(selected_total, base),
+        );
     } else if selected_total > 0.0 {
-        refs.dividend_income
-            .set_label(&format!("{}+", format_currency(selected_total, base)));
+        set_dividend_income_text(
+            &refs.dividend_income,
+            &format!("{}+", format_currency(selected_total, base)),
+        );
     } else {
-        refs.dividend_income.set_label("—");
+        set_dividend_income_text(&refs.dividend_income, "—");
     }
 
     let portfolio_market = sum_optional_converted(
@@ -3468,12 +3480,16 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
 
     append_dividend_history_summaries(refs, positions, base, usd_cad, selected_year);
 
-    // Keep Recent Distributions on the page surface in both states. Real rows
-    // are separated by native ListBox separators; an empty section shows only
-    // the centered placeholder. This avoids introducing a second heavy card.
-    refs.dividend_list.remove_css_class("boxed-list");
-    refs.dividend_recent_heading
-        .set_visible(refs.dividend_list.row_at_index(0).is_some());
+    // Use the normal libadwaita boxed-list treatment only when there are real
+    // rows. The empty placeholder remains directly on the page surface.
+    let has_recent = refs.dividend_list.row_at_index(0).is_some();
+    if has_recent {
+        refs.dividend_list.add_css_class("boxed-list");
+    } else {
+        refs.dividend_list.remove_css_class("boxed-list");
+    }
+    refs.dividend_list.set_show_separators(false);
+    refs.dividend_recent_heading.set_visible(has_recent);
 
     // The selector already names historical years, so do not repeat the same
     // year immediately below it. Annual names the current year because its
@@ -5040,30 +5056,6 @@ fn install_window_actions(
                 .database
                 .account_position_count(account_id)
                 .unwrap_or(0);
-            let transaction_count = refs
-                .state
-                .database
-                .account_transaction_count(account_id)
-                .unwrap_or(0);
-
-            if position_count > 0 {
-                let dialog = AlertDialog::builder()
-                    .heading(format!("{} still has holdings", account.name))
-                    .body("Remove its holdings before deleting this account")
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&parent));
-                return;
-            }
-            if transaction_count > 0 {
-                let dialog = AlertDialog::builder()
-                    .heading(format!("{} has activity history", account.name))
-                    .body("Remove its activity before deleting this account")
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present(Some(&parent));
-                return;
-            }
             if accounts.len() <= 1 {
                 let dialog = AlertDialog::builder()
                     .heading("Keep at least one account")
@@ -5074,12 +5066,22 @@ fn install_window_actions(
                 return;
             }
 
+            let warning = if position_count > 0 {
+                format!(
+                    "This permanently removes the account, its {} holding{}, and all activity and cash history. This cannot be undone.",
+                    position_count,
+                    if position_count == 1 { "" } else { "s" }
+                )
+            } else {
+                "This permanently removes the account and all activity and cash history. This cannot be undone."
+                    .to_string()
+            };
             let dialog = AlertDialog::builder()
                 .heading(format!("Remove {}?", account.name))
-                .body("Removes the account from Aureus")
+                .body(warning)
                 .build();
             dialog.add_response("cancel", "Cancel");
-            dialog.add_response("remove", "Remove");
+            dialog.add_response("remove", "Remove Account");
             dialog.set_default_response(Some("cancel"));
             dialog.set_close_response("cancel");
             dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
@@ -5088,6 +5090,7 @@ fn install_window_actions(
                 match refs.state.database.delete_account(account_id) {
                     Ok(true) => {
                         refs.refresh();
+                        refresh_portfolio_history_async(refs.clone(), false);
                         refs.toast_overlay.add_toast(Toast::new("Account removed"));
                     }
                     Ok(false) => {}
@@ -9328,16 +9331,27 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
     let body = dialog_body();
     body.append(&group);
     let scroller = dialog_scroller(&body, 480);
+    scroller.set_vexpand(true);
 
     let save = Button::builder()
         .label("Save")
-        .css_classes(["suggested-action"])
+        .css_classes(["suggested-action", "pill"])
+        .halign(Align::Fill)
+        .hexpand(true)
         .build();
+    let actions = dialog_bottom_action(&save);
+    let page = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .build();
+    page.append(&scroller);
+    page.append(&actions);
+
     let header = HeaderBar::new();
-    header.pack_end(&save);
+    header.set_title_widget(Some(&adw::WindowTitle::new("Edit Account", "")));
     let toolbar = ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scroller));
+    toolbar.set_content(Some(&page));
     let dialog = Dialog::builder()
         .title("Edit Account")
         .content_width(480)
@@ -12992,6 +13006,25 @@ fn format_money_number(value: f64) -> String {
         grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
     }
     format!("{sign}{grouped}.{fraction}")
+}
+
+// Cantarell intentionally draws the heavy dollar sign with a detached upper
+// stem. At title-1 size that reads like a stray dash above Aureus's dividend
+// headline. Keep the surrounding text in the native GNOME font, but render only
+// the dollar glyph with Noto Sans, whose dollar stem is continuous. Noto Sans is
+// part of the GNOME/Freedesktop font stack; if unavailable Pango falls back
+// harmlessly to the normal sans family.
+fn set_dividend_income_text(label: &Label, text: &str) {
+    let Some(dollar) = text.find('$') else {
+        label.set_text(text);
+        return;
+    };
+
+    let before = glib::markup_escape_text(&text[..dollar]);
+    let after = glib::markup_escape_text(&text[dollar + 1..]);
+    label.set_markup(&format!(
+        "{before}<span font_family=\"Noto Sans\">$</span>{after}"
+    ));
 }
 
 fn format_currency(value: f64, currency: &str) -> String {

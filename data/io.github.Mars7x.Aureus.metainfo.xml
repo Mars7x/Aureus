@@ -21,7 +21,7 @@
   <releases>
     <release version="1.0.2" date="2026-08-10">
       <description>
-        <p>Refines pull-to-refresh and Allocation rendering, and redesigns Dividends with a current-year Annual view, ownership-aware history, synchronized period totals, complete month labels, visually distinct future estimates, crossfading period changes, simplified period captions, a stronger headline value, and lightweight Recent Distributions rows without a card background.</p>
+        <p>Refines pull-to-refresh and Allocation rendering, redesigns Dividends with a current-year Annual view and ownership-aware history, removes the detached dollar-stem artifact from the dividend headline, gives populated Recent Distributions a reliable Adwaita boxed-list surface, aligns Edit Account with Aureus's shared bottom-pill form actions, and allows accounts with holdings or activity to be removed after an explicit destructive-data warning.</p>
       </description>
     </release>
     <release version="1.0.1" date="2026-08-10">

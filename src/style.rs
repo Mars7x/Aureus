@@ -16,13 +16,6 @@ const LAYOUT_CSS: &str = r#"
   min-width: 108px;
 }
 
-/* The dividend total is the page's primary metric. Keep the standard title-1
- * weight and hierarchy, but give it a small size lift without using the
- * deprecated libadwaita large-title class. */
-.dividend-headline {
-  font-size: 22pt;
-}
-
 .detail-hero {
   padding: 18px 20px;
 }
@@ -95,6 +88,25 @@ row.transaction-date-section:selected {
 row.search-keyboard-selected {
   background-color: alpha(@accent_bg_color, 0.16);
   outline: none;
+}
+
+/* Populated dividend history should read as a native Adwaita boxed list.
+ * boxed-list normally supplies this surface itself; these declarations are a
+ * conservative fallback for themes/runtimes where that class only styles rows.
+ * The selector requires boxed-list, so the empty-state presentation stays bare. */
+list.dividend-history-list.boxed-list {
+  background-color: var(--card-bg-color);
+  border-radius: 12px;
+}
+
+list.dividend-history-list.boxed-list > row:first-child {
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+
+list.dividend-history-list.boxed-list > row:last-child {
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
 }
 
 /* Stock pictures intentionally are not GtkButtons: native button chrome can
