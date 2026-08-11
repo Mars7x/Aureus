@@ -749,6 +749,37 @@ fn validate_transaction_change(
 
 impl UiRefs {
     fn refresh(&self) {
+        if self
+            .state
+            .database
+            .restore_reconciliation_pending()
+            .unwrap_or(false)
+        {
+            self.overview_stack.set_visible_child_name("reconciling");
+            self.accounts_stack.set_visible_child_name("reconciling");
+            self.dividends_stack.set_visible_child_name("reconciling");
+            self.total_value.set_label("—");
+            self.total_gain.set_label("—");
+            self.realized_gain.set_label("—");
+            self.investment_return.set_label("—");
+            self.cost_basis.set_label("—");
+            self.quote_note
+                .set_label("Reconciling restored portfolio · holdings temporarily hidden");
+
+            // Watchlist data is independent of portfolio share accounting, so it
+            // remains usable while restored holdings are being reconciled.
+            if self.current_page.borrow().as_str() == "watchlist" {
+                let watchlist = self.state.database.load_watchlist().unwrap_or_default();
+                self.watchlist_stack.set_visible_child_name(if watchlist.is_empty() {
+                    "empty"
+                } else {
+                    "watchlist"
+                });
+                rebuild_watchlist_list(self, &watchlist);
+            }
+            return;
+        }
+
         let positions = match self.state.database.load_positions() {
             Ok(positions) => positions,
             Err(error) => {
@@ -917,6 +948,14 @@ impl UiRefs {
     // to them. Overview was already built by refresh(), so avoid rebuilding its
     // rows, allocation, upcoming actions, and chart twice during startup.
     fn prime_hidden_pages(&self) {
+        if self
+            .state
+            .database
+            .restore_reconciliation_pending()
+            .unwrap_or(false)
+        {
+            return;
+        }
         let positions = self.state.database.load_positions().unwrap_or_default();
         let accounts = self.state.database.load_accounts().unwrap_or_default();
         let watchlist = self.state.database.load_watchlist().unwrap_or_default();
@@ -1855,7 +1894,14 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         let watchlist_checked = Rc::new(Cell::new(false));
         pages.connect_visible_child_name_notify(move |stack| {
             match stack.visible_child_name().as_deref() {
-                Some("dividends") if !dividends_checked.replace(true) => {
+                Some("dividends")
+                    if !refs
+                        .state
+                        .database
+                        .restore_reconciliation_pending()
+                        .unwrap_or(false)
+                        && !dividends_checked.replace(true) =>
+                {
                     let positions = refs.state.database.load_positions().unwrap_or_default();
                     let stale = refs
                         .state
@@ -1885,31 +1931,42 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     // Prime hidden destinations before the window is presented. This keeps the
     // very first sidebar/bottom-tab transition as complete as later switches.
     refs.prime_hidden_pages();
-    if !state.database.load_transactions().unwrap_or_default().is_empty()
-        || !state.database.load_cash_entries().unwrap_or_default().is_empty()
+    if state
+        .database
+        .restore_reconciliation_pending()
+        .unwrap_or(false)
     {
-        refresh_portfolio_history_async(refs.clone(), false);
-    }
+        // A restored backup intentionally contains no provider caches. Rebuild
+        // corporate actions first so pre-split quantities are never presented as
+        // current holdings, even after an offline restore/relaunch.
+        reconcile_restored_portfolio_async(refs.clone(), false);
+    } else {
+        if !state.database.load_transactions().unwrap_or_default().is_empty()
+            || !state.database.load_cash_entries().unwrap_or_default().is_empty()
+        {
+            refresh_portfolio_history_async(refs.clone(), false);
+        }
 
-    let positions = state.database.load_positions().unwrap_or_default();
-    let stale_quotes = state
-        .database
-        .positions_needing_refresh(QUOTE_CACHE_SECONDS)
-        .unwrap_or_default();
-    let fetch_fx = portfolio_needs_fx_with_cash(&state, &positions, &base_currency(&state))
-        && state
+        let positions = state.database.load_positions().unwrap_or_default();
+        let stale_quotes = state
             .database
-            .fx_rate_needs_refresh(USD_CAD_PAIR, FX_CACHE_SECONDS)
-            .unwrap_or(true);
-    if !stale_quotes.is_empty() || fetch_fx {
-        refresh_market_async(refs.clone(), stale_quotes, fetch_fx, false);
-    }
-    let stale_actions = state
-        .database
-        .dividends_needing_refresh(&positions, DIVIDEND_CACHE_SECONDS)
-        .unwrap_or_default();
-    if !stale_actions.is_empty() {
-        refresh_dividends_async(refs.clone(), stale_actions, false);
+            .positions_needing_refresh(QUOTE_CACHE_SECONDS)
+            .unwrap_or_default();
+        let fetch_fx = portfolio_needs_fx_with_cash(&state, &positions, &base_currency(&state))
+            && state
+                .database
+                .fx_rate_needs_refresh(USD_CAD_PAIR, FX_CACHE_SECONDS)
+                .unwrap_or(true);
+        if !stale_quotes.is_empty() || fetch_fx {
+            refresh_market_async(refs.clone(), stale_quotes, fetch_fx, false);
+        }
+        let stale_actions = state
+            .database
+            .dividends_needing_refresh(&positions, DIVIDEND_CACHE_SECONDS)
+            .unwrap_or_default();
+        if !stale_actions.is_empty() {
+            refresh_dividends_async(refs.clone(), stale_actions, false);
+        }
     }
 
     // If Aureus remains open across a split's effective time, apply cached
@@ -2280,8 +2337,10 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
         .child(&add_first)
         .build();
 
+    let reconciling = restore_reconciliation_status_page();
     refs.overview_stack.add_named(&empty, Some("empty"));
     refs.overview_stack.add_named(&scroller, Some("portfolio"));
+    refs.overview_stack.add_named(&reconciling, Some("reconciling"));
 
     let refs_clone = refs.clone();
     add_first.connect_clicked(move |button| {
@@ -2657,6 +2716,16 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
     }
 }
 
+fn restore_reconciliation_status_page() -> StatusPage {
+    StatusPage::builder()
+        .icon_name("view-refresh-symbolic")
+        .title("Reconciling Restored Portfolio")
+        .description(
+            "Checking Yahoo Finance for stock splits and other corporate actions before showing restored holdings. This requires an internet connection; reconnect and refresh if it cannot finish.",
+        )
+        .build()
+}
+
 fn build_accounts_page(refs: &UiRefs) -> gtk::Widget {
     let content = page_content_box();
     content.append(&refs.accounts_list);
@@ -2670,8 +2739,10 @@ fn build_accounts_page(refs: &UiRefs) -> gtk::Widget {
         .title("No Accounts")
         .description("Create an account to track cash and activity")
         .build();
+    let reconciling = restore_reconciliation_status_page();
     refs.accounts_stack.add_named(&empty, Some("empty"));
     refs.accounts_stack.add_named(&scroller, Some("accounts"));
+    refs.accounts_stack.add_named(&reconciling, Some("reconciling"));
     refs.accounts_stack.clone().upcast()
 }
 
@@ -3003,8 +3074,10 @@ fn build_dividends_page(refs: &UiRefs) -> gtk::Widget {
         .description("Add a holding to see dividend estimates")
         .build();
 
+    let reconciling = restore_reconciliation_status_page();
     refs.dividends_stack.add_named(&empty, Some("empty"));
     refs.dividends_stack.add_named(&scroller, Some("portfolio"));
+    refs.dividends_stack.add_named(&reconciling, Some("reconciling"));
     refs.dividends_stack.clone().upcast()
 }
 
@@ -5416,6 +5489,15 @@ fn install_window_actions(
                 }
                 begin_shortcut_refresh(&refs);
             }
+            if refs
+                .state
+                .database
+                .restore_reconciliation_pending()
+                .unwrap_or(false)
+            {
+                reconcile_restored_portfolio_async(refs.clone(), true);
+                return;
+            }
             match pages.visible_child_name().as_deref() {
                 Some("accounts") => {
                     let positions = refs.state.database.load_positions().unwrap_or_default();
@@ -5568,6 +5650,17 @@ fn set_report_period_model(row: &ComboRow, periods: &[ReportPeriod]) {
 }
 
 fn present_reports_dialog(parent: &ApplicationWindow, refs: UiRefs) {
+    if refs
+        .state
+        .database
+        .restore_reconciliation_pending()
+        .unwrap_or(false)
+    {
+        refs.toast_overlay.add_toast(Toast::new(
+            "Finish restored-portfolio reconciliation before exporting a report",
+        ));
+        return;
+    }
     let accounts = refs.state.database.load_accounts().unwrap_or_default();
     if accounts.is_empty() {
         refs.toast_overlay
@@ -6964,7 +7057,12 @@ fn apply_import_backup(
 ) {
     match refs.state.database.import_backup_json(&portfolio_json) {
         Ok(()) => {
-            refs.toast_overlay.add_toast(Toast::new("Backup imported"));
+            // Ignore callbacks from requests started against the database state
+            // that existed before the import. Otherwise a late quote/dividend
+            // response could write stale provider data into the restored portfolio.
+            invalidate_root_refresh_generations(&refs);
+            refs.toast_overlay
+                .add_toast(Toast::new("Backup imported · reconciling portfolio"));
             if let Some(after_import) = after_import {
                 apply_appearance(&refs.state);
                 refs.refresh();
@@ -6984,18 +7082,216 @@ fn apply_import_backup(
     }
 }
 
+fn invalidate_root_refresh_generations(refs: &UiRefs) {
+    refs.market_refresh_generation
+        .set(refs.market_refresh_generation.get().wrapping_add(1));
+    refs.dividend_refresh_generation
+        .set(refs.dividend_refresh_generation.get().wrapping_add(1));
+    refs.watchlist_refresh_generation
+        .set(refs.watchlist_refresh_generation.get().wrapping_add(1));
+    refs.portfolio_history_generation
+        .set(refs.portfolio_history_generation.get().wrapping_add(1));
+}
+
+fn persist_corporate_action_history(
+    refs: &UiRefs,
+    symbol: &str,
+    history: &DividendHistory,
+) -> Result<(), String> {
+    let currency = history
+        .currency
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("N/A");
+    refs.state
+        .database
+        .replace_dividend_events(symbol, currency, &history.events)
+        .map_err(|error| error.to_string())?;
+    refs.state
+        .database
+        .replace_split_events(symbol, &history.splits)
+        .map_err(|error| error.to_string())?;
+    if let Some(upcoming_splits) = &history.upcoming_splits {
+        refs.state
+            .database
+            .replace_upcoming_split_events(symbol, upcoming_splits)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(calendar) = &history.calendar {
+        refs.state
+            .database
+            .set_dividend_calendar(symbol, calendar.ex_dividend_date, calendar.payment_date)
+            .map_err(|error| error.to_string())?;
+    }
+    refs.state
+        .database
+        .set_dividends_fetched(symbol)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn refresh_after_reconciliation(refs: UiRefs) {
+    apply_appearance(&refs.state);
+    refs.refresh();
+    refs.prime_hidden_pages();
+
+    let positions = refs.state.database.load_positions().unwrap_or_default();
+    let fetch_fx =
+        portfolio_needs_fx_with_cash(&refs.state, &positions, &base_currency(&refs.state));
+    refresh_market_async(refs.clone(), positions, fetch_fx, false);
+
+    let watchlist = refs.state.database.load_watchlist().unwrap_or_default();
+    if !watchlist.is_empty() {
+        refresh_watchlist_async(refs.clone(), watchlist, false);
+    }
+    if !refs
+        .state
+        .database
+        .load_transactions()
+        .unwrap_or_default()
+        .is_empty()
+        || !refs
+            .state
+            .database
+            .load_cash_entries()
+            .unwrap_or_default()
+            .is_empty()
+    {
+        refresh_portfolio_history_async(refs, false);
+    }
+}
+
+struct RestoreReconciliationResult {
+    generation: u64,
+    histories: Vec<(String, DividendHistory)>,
+    failures: usize,
+}
+
+fn reconcile_restored_portfolio_async(refs: UiRefs, announce: bool) {
+    if !refs
+        .state
+        .database
+        .restore_reconciliation_pending()
+        .unwrap_or(false)
+    {
+        if announce {
+            finish_refresh_feedback(&refs);
+        }
+        return;
+    }
+
+    let positions = refs.state.database.load_positions().unwrap_or_default();
+    let mut symbols = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    for position in positions {
+        let symbol = position.provider_symbol.trim().to_ascii_uppercase();
+        if !symbol.is_empty() && seen.insert(symbol.clone()) {
+            symbols.push(symbol);
+        }
+    }
+
+    if symbols.is_empty() {
+        match refs.state.database.set_restore_reconciliation_pending(false) {
+            Ok(()) => {
+                refresh_after_reconciliation(refs.clone());
+                refs.toast_overlay
+                    .add_toast(Toast::new("Restored portfolio reconciled"));
+            }
+            Err(error) => refs.toast_overlay.add_toast(Toast::new(&format!(
+                "Could not finish backup reconciliation: {error}"
+            ))),
+        }
+        if announce {
+            finish_refresh_feedback(&refs);
+        }
+        return;
+    }
+
+    // Reuse the dividend/corporate-action generation so a later manual refresh
+    // or retry invalidates an older reconciliation result cleanly.
+    let generation = refs.dividend_refresh_generation.get().wrapping_add(1);
+    refs.dividend_refresh_generation.set(generation);
+    refs.refresh();
+
+    let (sender, receiver) = mpsc::channel::<RestoreReconciliationResult>();
+    std::thread::spawn(move || {
+        let mut histories = Vec::new();
+        let mut failures = 0usize;
+        for symbol in symbols {
+            match market_data::dividends(&symbol) {
+                Ok(history) => histories.push((symbol, history)),
+                Err(_) => failures += 1,
+            }
+        }
+        let _ = sender.send(RestoreReconciliationResult {
+            generation,
+            histories,
+            failures,
+        });
+    });
+
+    let receiver = Rc::new(RefCell::new(receiver));
+    glib::timeout_add_local(Duration::from_millis(75), move || {
+        let Ok(result) = receiver.borrow().try_recv() else {
+            return glib::ControlFlow::Continue;
+        };
+        if refs.dividend_refresh_generation.get() != result.generation {
+            if announce {
+                finish_refresh_feedback(&refs);
+            }
+            return glib::ControlFlow::Break;
+        }
+
+        let mut failed = result.failures > 0;
+        for (symbol, history) in &result.histories {
+            if persist_corporate_action_history(&refs, symbol, history).is_err() {
+                failed = true;
+            }
+        }
+        if refs.state.database.sync_positions_from_activity().is_err() {
+            failed = true;
+        }
+        if refs.state.database.sync_paid_dividends_to_cash().is_err() {
+            failed = true;
+        }
+
+        if !failed {
+            if refs
+                .state
+                .database
+                .set_restore_reconciliation_pending(false)
+                .is_err()
+            {
+                failed = true;
+            }
+        }
+
+        if failed {
+            // Keep the persistent marker set. The app continues to hide the
+            // possibly pre-split holdings and will retry on the next launch or
+            // any manual refresh instead of treating partial data as complete.
+            refs.refresh();
+            refs.toast_overlay.add_toast(Toast::new(
+                "Could not finish backup reconciliation · reconnect and refresh",
+            ));
+        } else {
+            refresh_after_reconciliation(refs.clone());
+            refs.toast_overlay
+                .add_toast(Toast::new("Restored portfolio reconciled"));
+        }
+
+        if announce {
+            finish_refresh_feedback(&refs);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 fn refresh_after_import(refs: UiRefs) {
     apply_appearance(&refs.state);
     refs.refresh();
     refs.prime_hidden_pages();
-    let positions = refs.state.database.load_positions().unwrap_or_default();
-    let fetch_fx =
-        portfolio_needs_fx_with_cash(&refs.state, &positions, &base_currency(&refs.state));
-    refresh_market_async(refs.clone(), positions.clone(), fetch_fx, false);
-    refresh_dividends_async(refs.clone(), positions, false);
-    let watchlist = refs.state.database.load_watchlist().unwrap_or_default();
-    refresh_watchlist_async(refs.clone(), watchlist, false);
-    refresh_portfolio_history_async(refs, false);
+    reconcile_restored_portfolio_async(refs, false);
 }
 
 fn present_watchlist_detail(item_id: i64, refs: UiRefs) {
@@ -11004,6 +11300,18 @@ fn present_add_activity_dialog_with_context(
     preset_asset: Option<SearchResult>,
     preset_kind: Option<&'static str>,
 ) {
+    if refs
+        .state
+        .database
+        .restore_reconciliation_pending()
+        .unwrap_or(false)
+    {
+        refs.toast_overlay.add_toast(Toast::new(
+            "Finish restored-portfolio reconciliation before changing activity",
+        ));
+        return;
+    }
+
     let accounts = match refs.state.database.load_accounts() {
         Ok(accounts) if !accounts.is_empty() => accounts,
         _ => {
@@ -13062,33 +13370,7 @@ fn refresh_dividends_async(refs: UiRefs, positions: Vec<Position>, announce: boo
         }
 
         for (symbol, history) in &result.histories {
-            let currency = history
-                .currency
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("N/A");
-            let _ = refs
-                .state
-                .database
-                .replace_dividend_events(symbol, currency, &history.events);
-            let _ = refs
-                .state
-                .database
-                .replace_split_events(symbol, &history.splits);
-            if let Some(upcoming_splits) = &history.upcoming_splits {
-                let _ = refs
-                    .state
-                    .database
-                    .replace_upcoming_split_events(symbol, upcoming_splits);
-            }
-            if let Some(calendar) = &history.calendar {
-                let _ = refs.state.database.set_dividend_calendar(
-                    symbol,
-                    calendar.ex_dividend_date,
-                    calendar.payment_date,
-                );
-            }
-            let _ = refs.state.database.set_dividends_fetched(symbol);
+            let _ = persist_corporate_action_history(&refs, symbol, history);
         }
 
         let _ = refs.state.database.sync_positions_from_activity();

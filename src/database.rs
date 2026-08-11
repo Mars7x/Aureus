@@ -2400,6 +2400,12 @@ impl Database {
                 params![backup.base_currency],
             )?;
             self.connection.execute("DELETE FROM settings WHERE key = 'last-account-id'", [])?;
+            // A portable backup intentionally contains Activity rather than provider
+            // caches such as split_history. Until Yahoo's full corporate-action
+            // history has been fetched again, reconstructed share quantities can be
+            // pre-split. Persist this marker so an offline/failed restore is retried
+            // on the next launch rather than silently becoming authoritative.
+            self.set_restore_reconciliation_pending(true)?;
             Ok(())
         })();
 
@@ -2413,6 +2419,20 @@ impl Database {
                 Err(error.to_string())
             }
         }
+    }
+
+    pub fn restore_reconciliation_pending(&self) -> Result<bool> {
+        Ok(matches!(
+            self.setting("restore-reconciliation-pending")?.as_deref(),
+            Some("1")
+        ))
+    }
+
+    pub fn set_restore_reconciliation_pending(&self, pending: bool) -> Result<()> {
+        self.set_setting(
+            "restore-reconciliation-pending",
+            if pending { "1" } else { "0" },
+        )
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -2854,6 +2874,81 @@ mod tests {
         assert!(!restored
             .dividend_cash_enabled(account.id)
             .expect("restored setting"));
+    }
+
+    #[test]
+    fn backup_restore_is_marked_for_corporate_action_reconciliation() {
+        let source = Database::open_in_memory().expect("source database");
+        source
+            .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
+            .expect("account");
+        let backup = source.export_backup_json().expect("backup");
+
+        let restored = Database::open_in_memory().expect("restored database");
+        restored.import_backup_json(&backup).expect("restore");
+        assert!(restored
+            .restore_reconciliation_pending()
+            .expect("pending marker"));
+        restored
+            .set_restore_reconciliation_pending(false)
+            .expect("clear marker");
+        assert!(!restored
+            .restore_reconciliation_pending()
+            .expect("cleared marker"));
+    }
+
+    #[test]
+    fn restored_backup_rebuilds_post_backup_split_from_corporate_actions() {
+        let source = Database::open_in_memory().expect("source database");
+        let account_id = source
+            .add_account(&NewAccount { name: "TFSA".into(), currency: "CAD".into() })
+            .expect("account");
+        source
+            .add_transaction(&NewTransaction {
+                account_id,
+                code: "TEST".into(),
+                exchange: "TOR".into(),
+                provider_symbol: "TEST.TO".into(),
+                name: "Test Corp".into(),
+                transaction_type: "OPEN".into(),
+                trade_date: "2025-01-01".into(),
+                timestamp: 1_735_689_600,
+                shares: 10.0,
+                price: 20.0,
+                fees: 0.0,
+                settle_cash: false,
+                currency: "CAD".into(),
+            })
+            .expect("activity");
+        let backup = source.export_backup_json().expect("backup");
+
+        let restored = Database::open_in_memory().expect("restored database");
+        restored.import_backup_json(&backup).expect("restore");
+        let before = restored.load_positions().expect("positions").remove(0);
+        assert!((before.shares - 10.0).abs() < 0.0000001);
+        assert!(restored
+            .restore_reconciliation_pending()
+            .expect("pending marker"));
+
+        restored
+            .replace_split_events(
+                "TEST.TO",
+                &[SplitEvent {
+                    provider_symbol: "TEST.TO".into(),
+                    timestamp: 1_740_000_000,
+                    ratio: 2.0,
+                }],
+            )
+            .expect("corporate-action refresh");
+        restored.sync_positions_from_activity().expect("sync");
+        restored
+            .set_restore_reconciliation_pending(false)
+            .expect("reconciled");
+
+        let after = restored.load_positions().expect("positions").remove(0);
+        assert!((after.shares - 20.0).abs() < 0.0000001);
+        assert!((after.average_cost - 10.0).abs() < 0.0000001);
+        assert!((after.shares * after.average_cost - 200.0).abs() < 0.0000001);
     }
 
     #[test]
