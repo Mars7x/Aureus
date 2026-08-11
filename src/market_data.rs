@@ -771,28 +771,22 @@ pub fn quote_health_from_error(error: &str) -> &'static str {
 }
 
 pub fn quote_state_label(market_state: Option<&str>, timestamp: i64, now: i64) -> String {
-    let timestamp_valid = valid_provider_timestamp(timestamp, now);
-    let age = if timestamp_valid {
-        now.saturating_sub(timestamp)
-    } else {
-        i64::MAX
-    };
+    // `timestamp` is the provider's last trade/price timestamp, not the time at
+    // which Aureus fetched the response. An illiquid security can therefore
+    // have a perfectly fresh Yahoo response whose last trade is many minutes
+    // old. Do not infer cache freshness from the trade timestamp. Actual cache
+    // fallback is reported by the caller only when a provider request fails.
+    if !valid_provider_timestamp(timestamp, now) {
+        return "Quote unavailable".into();
+    }
+
     let state = market_state.unwrap_or("").trim().to_ascii_uppercase();
     match state.as_str() {
-        "REGULAR" | "OPEN" if age <= 20 * 60 => "Live price".into(),
-        "PRE" | "PREPRE" if age <= 20 * 60 => "Pre-market price".into(),
-        "POST" | "POSTPOST" if age <= 20 * 60 => "After-hours price".into(),
-        // A closed exchange legitimately carries the most recent regular close
-        // across weekends and holidays, but an indefinitely old cached CLOSED
-        // state must not look authoritative forever.
-        "CLOSED" if timestamp_valid && age <= 10 * 24 * 60 * 60 => "Market closed".into(),
-        "REGULAR" | "OPEN" | "PRE" | "PREPRE" | "POST" | "POSTPOST" | "CLOSED" => {
-            "Stale cached quote".into()
-        }
-        _ if !timestamp_valid => "Stale cached quote".into(),
-        _ if age <= 20 * 60 => "Current price".into(),
-        _ if age <= 3 * 24 * 60 * 60 => "Market closed".into(),
-        _ => "Stale cached quote".into(),
+        "REGULAR" | "OPEN" => "Live price".into(),
+        "PRE" | "PREPRE" => "Pre-market price".into(),
+        "POST" | "POSTPOST" => "After-hours price".into(),
+        "CLOSED" => "Market closed".into(),
+        _ => "Current price".into(),
     }
 }
 
@@ -912,22 +906,22 @@ mod tests {
     }
 
     #[test]
-    fn future_or_old_active_timestamps_never_look_current_or_live() {
+    fn quote_state_uses_session_not_last_trade_age() {
         let now = 1_800_000_000;
         let future = now + PROVIDER_CLOCK_SKEW_SECONDS + 1;
-        assert_eq!(quote_state_label(Some("REGULAR"), future, now), "Stale cached quote");
-        assert_eq!(quote_state_label(None, future, now), "Stale cached quote");
+        assert_eq!(quote_state_label(Some("REGULAR"), future, now), "Quote unavailable");
+        assert_eq!(quote_state_label(None, future, now), "Quote unavailable");
         assert_eq!(
             quote_state_label(Some("POST"), now - 2 * 60 * 60, now),
-            "Stale cached quote"
+            "After-hours price"
         );
         assert_eq!(
-            quote_state_label(Some("CLOSED"), now - 4 * 24 * 60 * 60, now),
-            "Market closed"
+            quote_state_label(Some("PRE"), now - 2 * 60 * 60, now),
+            "Pre-market price"
         );
         assert_eq!(
             quote_state_label(Some("CLOSED"), now - 20 * 24 * 60 * 60, now),
-            "Stale cached quote"
+            "Market closed"
         );
     }
 
