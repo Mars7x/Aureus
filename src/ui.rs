@@ -4145,7 +4145,7 @@ fn rebuild_allocation(
         .iter()
         .map(|row| row.downgrade())
         .collect::<Vec<_>>();
-    refs.allocation_ring.set_interaction_callback(move |selected, hovered| {
+    refs.allocation_ring.set_interaction_callback(move |selected| {
         for (index, weak) in row_weaks.iter().enumerate() {
             let Some(row) = weak.upgrade() else {
                 continue;
@@ -4154,11 +4154,6 @@ fn rebuild_allocation(
                 row.add_css_class("allocation-selected");
             } else {
                 row.remove_css_class("allocation-selected");
-            }
-            if hovered == Some(index) {
-                row.add_css_class("allocation-hovered");
-            } else {
-                row.remove_css_class("allocation-hovered");
             }
         }
     });
@@ -4268,17 +4263,6 @@ fn allocation_legend_row(
         });
     }
     row.add_controller(keys);
-
-    let motion = gtk::EventControllerMotion::new();
-    {
-        let ring = ring.clone();
-        motion.connect_enter(move |_, _, _| ring.set_hover_index(Some(index)));
-    }
-    {
-        let ring = ring.clone();
-        motion.connect_leave(move |_| ring.set_hover_index(None));
-    }
-    row.add_controller(motion);
 
     row
 }

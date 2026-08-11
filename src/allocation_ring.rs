@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{DrawingArea, EventControllerMotion, GestureClick};
+use gtk::{DrawingArea, GestureClick};
 
 #[derive(Clone, Debug)]
 pub struct AllocationSlice {
@@ -17,7 +17,7 @@ pub struct AllocationSlice {
     pub is_cash: bool,
 }
 
-type InteractionCallback = Rc<dyn Fn(Option<usize>, Option<usize>)>;
+type InteractionCallback = Rc<dyn Fn(Option<usize>)>;
 
 #[derive(Clone)]
 pub struct AllocationRing {
@@ -30,7 +30,6 @@ pub struct AllocationRing {
 struct RingState {
     slices: Vec<AllocationSlice>,
     selected_index: Option<usize>,
-    hover_index: Option<usize>,
     previous_selection: Option<usize>,
     transition_progress: f64,
     transition_generation: u64,
@@ -52,7 +51,6 @@ impl AllocationRing {
         let state = Rc::new(RefCell::new(RingState {
             slices: Vec::new(),
             selected_index: None,
-            hover_index: None,
             previous_selection: None,
             transition_progress: 1.0,
             transition_generation: 0,
@@ -95,35 +93,6 @@ impl AllocationRing {
         }
         area.add_controller(click);
 
-        let motion = EventControllerMotion::new();
-        {
-            let area = area.clone();
-            let state = state.clone();
-            let interaction_callback = interaction_callback.clone();
-            motion.connect_motion(move |_, x, y| {
-                let next = {
-                    let current = state.borrow();
-                    slice_at_point(
-                        &current,
-                        f64::from(area.width()),
-                        f64::from(area.height()),
-                        x,
-                        y,
-                    )
-                };
-                set_hover_index_internal(&area, &state, &interaction_callback, next);
-            });
-        }
-        {
-            let area = area.clone();
-            let state = state.clone();
-            let interaction_callback = interaction_callback.clone();
-            motion.connect_leave(move |_| {
-                set_hover_index_internal(&area, &state, &interaction_callback, None);
-            });
-        }
-        area.add_controller(motion);
-
         let manager = adw::StyleManager::for_display(&area.display());
         {
             let area = area.clone();
@@ -149,7 +118,6 @@ impl AllocationRing {
         let mut state = self.state.borrow_mut();
         state.slices = slices;
         state.selected_index = None;
-        state.hover_index = None;
         state.previous_selection = None;
         state.transition_progress = 1.0;
         state.transition_generation = state.transition_generation.wrapping_add(1);
@@ -160,7 +128,7 @@ impl AllocationRing {
 
     pub fn set_interaction_callback<F>(&self, callback: F)
     where
-        F: Fn(Option<usize>, Option<usize>) + 'static,
+        F: Fn(Option<usize>) + 'static,
     {
         *self.interaction_callback.borrow_mut() = Some(Rc::new(callback));
         notify_interaction(&self.interaction_callback, &self.state);
@@ -168,16 +136,6 @@ impl AllocationRing {
 
     pub fn clear_interaction_callback(&self) {
         self.interaction_callback.borrow_mut().take();
-    }
-
-    pub fn set_hover_index(&self, index: Option<usize>) {
-        let next = index.filter(|index| *index < self.state.borrow().slices.len());
-        set_hover_index_internal(
-            &self.area,
-            &self.state,
-            &self.interaction_callback,
-            next,
-        );
     }
 
     pub fn toggle_index(&self, index: usize) {
@@ -274,7 +232,7 @@ fn draw_ring(
     let center_y = height / 2.0;
     let radius = width.min(height) * 0.34;
     // Keep the allocation donut visually light while preserving its overall diameter.
-    let line_width = (width.min(height) * 0.082).clamp(14.0, 19.0);
+    let line_width = (width.min(height) * 0.065).clamp(11.0, 15.0);
     // Text must live inside the donut hole even when the ring is compressed.
     // Keep a small inset from the inner stroke and scale typography against
     // this actual available diameter rather than assuming a desktop size.
@@ -287,9 +245,6 @@ fn draw_ring(
 
     context.set_line_width(line_width);
     context.set_line_cap(gtk::cairo::LineCap::Butt);
-    context.set_source_rgba(subdued, subdued, subdued, if dark { 0.18 } else { 0.12 });
-    context.arc(center_x, center_y, radius, 0.0, PI * 2.0);
-    let _ = context.stroke();
 
     let total: f64 = state
         .slices
@@ -297,6 +252,12 @@ fn draw_ring(
         .map(|slice| slice.value.max(0.0))
         .sum();
     if total <= f64::EPSILON {
+        // Only show the muted donut as an empty-state track. When allocation
+        // slices exist, drawing this track underneath them becomes visible as
+        // a gray inner crescent while the selected slice lifts outward.
+        context.set_source_rgba(subdued, subdued, subdued, if dark { 0.18 } else { 0.12 });
+        context.arc(center_x, center_y, radius, 0.0, PI * 2.0);
+        let _ = context.stroke();
         draw_center_text(
             context,
             center_x,
@@ -321,7 +282,7 @@ fn draw_ring(
         let sweep = (value / total) * PI * 2.0;
         let (red, green, blue) =
             allocation_color(slice.color_index, slice.color, slice.is_cash, dark);
-        let active_index = state.hover_index.or(state.selected_index);
+        let active_index = state.selected_index;
         let alpha = if active_index.is_some() && active_index != Some(index) {
             0.42
         } else {
@@ -331,11 +292,7 @@ fn draw_ring(
         // the previous slice eases back while the new one eases outward, so
         // the emphasis follows the same 160 ms transition as the center text.
         let progress = state.transition_progress.clamp(0.0, 1.0);
-        let emphasis = if state.hover_index == Some(index) {
-            1.0
-        } else if state.hover_index.is_some() {
-            0.0
-        } else if state.selected_index == Some(index) {
+        let emphasis = if state.selected_index == Some(index) {
             progress
         } else if state.previous_selection == Some(index)
             && state.previous_selection != state.selected_index
@@ -352,20 +309,7 @@ fn draw_ring(
     }
 
     let progress = state.transition_progress.clamp(0.0, 1.0);
-    if let Some(hover_index) = state.hover_index {
-        draw_center_content(
-            context,
-            center_x,
-            center_y,
-            state,
-            Some(hover_index),
-            total,
-            foreground,
-            subdued,
-            1.0,
-            center_text_width,
-        );
-    } else if progress < 1.0 && state.previous_selection != state.selected_index {
+    if progress < 1.0 && state.previous_selection != state.selected_index {
         draw_center_content(
             context,
             center_x,
@@ -461,28 +405,7 @@ fn notify_interaction(
         return;
     };
     let current = state.borrow();
-    callback(current.selected_index, current.hover_index);
-}
-
-fn set_hover_index_internal(
-    area: &DrawingArea,
-    state: &Rc<RefCell<RingState>>,
-    callback: &Rc<RefCell<Option<InteractionCallback>>>,
-    next: Option<usize>,
-) {
-    let changed = {
-        let mut current = state.borrow_mut();
-        if current.hover_index == next {
-            false
-        } else {
-            current.hover_index = next;
-            true
-        }
-    };
-    if changed {
-        area.queue_draw();
-        notify_interaction(callback, state);
-    }
+    callback(current.selected_index);
 }
 
 fn draw_center_content(
@@ -520,7 +443,7 @@ fn draw_center_content(
             alpha,
         );
     } else {
-        // Keep the center visually quiet until a slice is hovered or selected.
+        // Keep the center visually quiet until a slice is selected.
         // The surrounding Allocation heading already provides the context.
     }
 }
