@@ -127,6 +127,8 @@ struct YahooChartMeta {
     regular_market_price: Option<f64>,
     #[serde(default, rename = "regularMarketTime")]
     regular_market_time: Option<i64>,
+    #[serde(default, rename = "hasPrePostMarketData")]
+    has_pre_post_market_data: Option<bool>,
     #[serde(default, rename = "previousClose")]
     previous_close: Option<f64>,
     #[serde(default, rename = "chartPreviousClose")]
@@ -215,6 +217,8 @@ struct YahooQuoteCalendar {
     post_market_price: Option<f64>,
     #[serde(default, rename = "postMarketTime")]
     post_market_time: Option<i64>,
+    #[serde(default, rename = "hasPrePostMarketData")]
+    has_pre_post_market_data: Option<bool>,
     #[serde(default, rename = "marketState")]
     market_state: Option<String>,
     #[serde(default, rename = "exDividendDate")]
@@ -815,15 +819,24 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
                     )
                     .or_else(|| valid_percent(quote.regular_market_change_percent));
                     let state = normalized_market_state(quote.market_state.as_deref());
+                    // Yahoo exposes an explicit capability bit for whether this
+                    // security actually has pre-/post-market data. Market state
+                    // alone is not enough: it can reflect the exchange/session
+                    // clock even for securities that do not trade extended hours.
+                    let supports_extended_hours = quote.has_pre_post_market_data == Some(true);
 
-                    let extended = match state.as_deref() {
-                        Some("PRE") => valid_price(quote.pre_market_price)
-                            .zip(valid_current_timestamp(quote.pre_market_time, now))
-                            .filter(|(_, timestamp)| *timestamp > regular_timestamp),
-                        Some("POST") => valid_price(quote.post_market_price)
-                            .zip(valid_current_timestamp(quote.post_market_time, now))
-                            .filter(|(_, timestamp)| *timestamp > regular_timestamp),
-                        _ => None,
+                    let extended = if supports_extended_hours {
+                        match state.as_deref() {
+                            Some("PRE") => valid_price(quote.pre_market_price)
+                                .zip(valid_current_timestamp(quote.pre_market_time, now))
+                                .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                            Some("POST") => valid_price(quote.post_market_price)
+                                .zip(valid_current_timestamp(quote.post_market_time, now))
+                                .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                            _ => None,
+                        }
+                    } else {
+                        None
                     };
 
                     if let Some((close, timestamp)) = extended {
@@ -1223,6 +1236,18 @@ fn history_from_url(
     }
 
     let result = take_single_chart_result(envelope.chart.result, symbol)?;
+
+    // `includePrePost=true` is only meaningful when Yahoo explicitly says this
+    // security has extended-hours market data. Some symbols inherit PRE/POST
+    // session metadata from their exchange even though they are not eligible for
+    // extended-hours trading. In that case, re-request the exact same chart as
+    // regular-session-only so synthetic/session-clock points can never appear.
+    if chart_includes_extended_hours && result.meta.has_pre_post_market_data != Some(true) {
+        let regular_url = url.replace("includePrePost=true", "includePrePost=false");
+        if regular_url != url {
+            return history_from_url(symbol, &regular_url, range, false);
+        }
+    }
 
     let bars = yahoo_bars_from_result(&result)?;
     if bars.is_empty() {
@@ -1650,6 +1675,27 @@ mod tests {
         assert_eq!(
             parsed.quote_response.error.as_ref().map(|error| error.code.as_str()),
             Some("Unauthorized")
+        );
+    }
+
+    #[test]
+    fn yahoo_extended_hours_capability_flag_parses_from_quote_and_chart() {
+        let quote = serde_json::from_str::<YahooQuoteEnvelope>(
+            r#"{"quoteResponse":{"result":[{"symbol":"TEST","hasPrePostMarketData":false}],"error":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            quote.quote_response.result.unwrap()[0].has_pre_post_market_data,
+            Some(false)
+        );
+
+        let chart = serde_json::from_str::<YahooChartEnvelope>(
+            r#"{"chart":{"result":[{"meta":{"symbol":"TEST","hasPrePostMarketData":true},"timestamp":[],"indicators":{"quote":[]}}],"error":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            chart.chart.result.unwrap()[0].meta.has_pre_post_market_data,
+            Some(true)
         );
     }
 
