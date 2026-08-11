@@ -3210,7 +3210,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
 
     if positions.is_empty() {
         refs.dividends_stack.set_visible_child_name("empty");
-        refs.dividend_income.set_label("—");
+        set_dividend_income_text(&refs.dividend_income, "—");
         refs.dividend_yield.set_label("—");
         refs.dividend_status.set_label("No holdings yet");
         refs.dividend_chart
@@ -3394,13 +3394,17 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
     // so changing the period can never leave a stale forward run-rate above a
     // smaller set of bars.
     if selected_complete {
-        refs.dividend_income
-            .set_label(&format_currency(selected_total, base));
+        set_dividend_income_text(
+            &refs.dividend_income,
+            &format_currency(selected_total, base),
+        );
     } else if selected_total > 0.0 {
-        refs.dividend_income
-            .set_label(&format!("{}+", format_currency(selected_total, base)));
+        set_dividend_income_text(
+            &refs.dividend_income,
+            &format!("{}+", format_currency(selected_total, base)),
+        );
     } else {
-        refs.dividend_income.set_label("—");
+        set_dividend_income_text(&refs.dividend_income, "—");
     }
 
     let portfolio_market = sum_optional_converted(
@@ -13004,6 +13008,12 @@ fn format_money_number(value: f64) -> String {
     format!("{sign}{grouped}.{fraction}")
 }
 
+// Keep the dividend headline on GTK/Pango's normal text path. Per-glyph font
+// markup caused the dollar stem to render as a detached artifact on some
+// systems/themes.
+fn set_dividend_income_text(label: &Label, text: &str) {
+    label.set_label(text);
+}
 
 fn format_currency(value: f64, currency: &str) -> String {
     let prefix = match currency {

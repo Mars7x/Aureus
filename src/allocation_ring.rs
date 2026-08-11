@@ -25,7 +25,6 @@ pub struct AllocationRing {
 #[derive(Clone, Default)]
 struct RingState {
     slices: Vec<AllocationSlice>,
-    currency: String,
     selected_index: Option<usize>,
     previous_selection: Option<usize>,
     transition_progress: f64,
@@ -47,7 +46,6 @@ impl AllocationRing {
 
         let state = Rc::new(RefCell::new(RingState {
             slices: Vec::new(),
-            currency: "CAD".into(),
             selected_index: None,
             previous_selection: None,
             transition_progress: 1.0,
@@ -106,10 +104,9 @@ impl AllocationRing {
         &self.area
     }
 
-    pub fn set_slices(&self, slices: Vec<AllocationSlice>, currency: &str) {
+    pub fn set_slices(&self, slices: Vec<AllocationSlice>, _currency: &str) {
         let mut state = self.state.borrow_mut();
         state.slices = slices;
-        state.currency = currency.to_string();
         state.selected_index = None;
         state.previous_selection = None;
         state.transition_progress = 1.0;
@@ -390,7 +387,7 @@ fn draw_center_content(
             max_width,
             &slice.label,
             &format!("{percent:.1}%"),
-            &format_currency(slice.value, &state.currency),
+            "",
             foreground,
             subdued,
             alpha,
@@ -402,7 +399,7 @@ fn draw_center_content(
             center_y,
             max_width,
             "Portfolio",
-            &format_currency(total, &state.currency),
+            "",
             "",
             foreground,
             subdued,
@@ -467,13 +464,51 @@ fn draw_center_line(
 
     // Keep the original vertical baselines and typography, but center using the
     // actual painted glyph bounds. The previous character-count estimate could
-    // put short labels, percentages and currency strings on different visual
+    // put short labels and percentages on different visual
     // centerlines even though they shared the same nominal center point.
     let x = context
         .text_extents(text)
         .map(|extents| center_x - extents.width() / 2.0 - extents.x_bearing())
         .unwrap_or(center_x);
     context.move_to(x, baseline_y);
+    let _ = context.show_text(text);
+}
+
+fn draw_center_line_centered(
+    context: &gtk::cairo::Context,
+    center_x: f64,
+    center_y: f64,
+    max_width: f64,
+    text: &str,
+    preferred_size: f64,
+    minimum_size: f64,
+    weight: gtk::cairo::FontWeight,
+    tone: f64,
+    alpha: f64,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    let font_size = fitted_font_size(
+        context,
+        text,
+        max_width,
+        preferred_size,
+        minimum_size,
+        weight,
+    );
+    context.select_font_face("Sans", gtk::cairo::FontSlant::Normal, weight);
+    context.set_font_size(font_size);
+    context.set_source_rgba(tone, tone, tone, alpha);
+
+    if let Ok(extents) = context.text_extents(text) {
+        let x = center_x - extents.width() / 2.0 - extents.x_bearing();
+        let y = center_y - extents.height() / 2.0 - extents.y_bearing();
+        context.move_to(x, y);
+    } else {
+        context.move_to(center_x, center_y);
+    }
     let _ = context.show_text(text);
 }
 
@@ -489,7 +524,7 @@ fn draw_center_text(
     subdued: f64,
     alpha: f64,
 ) {
-    // Clip as a final safety net: even unusually long currency/ticker strings
+    // Clip as a final safety net: even unusually long ticker strings
     // can never paint outside the donut hole. Typography also scales down to
     // fit, so clipping should only matter at extremely small transient sizes.
     let clip_radius = (max_width / 2.0).max(12.0);
@@ -497,7 +532,15 @@ fn draw_center_text(
     context.arc(center_x, center_y, clip_radius, 0.0, PI * 2.0);
     context.clip();
 
-    if tertiary.is_empty() {
+    if secondary.is_empty() && tertiary.is_empty() {
+        // With only one center label (for example the unselected Portfolio
+        // state), center the painted glyph bounds on the donut's true midpoint
+        // instead of retaining the old two-line baseline offset.
+        draw_center_line_centered(
+            context, center_x, center_y, max_width, primary, 13.5, 7.0,
+            gtk::cairo::FontWeight::Bold, foreground, 0.94 * alpha,
+        );
+    } else if tertiary.is_empty() {
         draw_center_line(
             context, center_x, center_y - 3.0, max_width, primary, 13.5, 7.0, 0.57,
             gtk::cairo::FontWeight::Bold, foreground, 0.94 * alpha,
@@ -559,40 +602,4 @@ fn slice_at_point(state: &RingState, width: f64, height: f64, x: f64, y: f64) ->
         }
     }
     None
-}
-
-fn format_money_number(value: f64) -> String {
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let raw = format!("{:.2}", value.abs());
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
-    if whole.len() < 5 {
-        return format!("{sign}{raw}");
-    }
-
-    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
-    let first = whole.len() % 3;
-    if first > 0 {
-        grouped.push_str(&whole[..first]);
-        if first < whole.len() {
-            grouped.push(',');
-        }
-    }
-    for (index, chunk) in whole[first..].as_bytes().chunks(3).enumerate() {
-        if index > 0 {
-            grouped.push(',');
-        }
-        grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-    }
-    format!("{sign}{grouped}.{fraction}")
-}
-
-fn format_currency(value: f64, currency: &str) -> String {
-    let number = format_money_number(value);
-    match currency {
-        "CAD" => format!("C${number}"),
-        "USD" => format!("US${number}"),
-        "EUR" => format!("€{number}"),
-        "GBP" => format!("£{number}"),
-        _ => format!("{number} {currency}"),
-    }
 }

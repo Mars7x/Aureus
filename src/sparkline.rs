@@ -24,23 +24,9 @@ impl Sparkline {
         let points = Rc::new(RefCell::new(Vec::new()));
         {
             let points = points.clone();
-            area.set_draw_func(move |area, context, width, height| {
-                draw_sparkline(area, context, width, height, &points.borrow());
+            area.set_draw_func(move |_, context, width, height| {
+                draw_sparkline(context, width, height, &points.borrow());
             });
-        }
-
-        let manager = adw::StyleManager::for_display(&area.display());
-        {
-            let area = area.clone();
-            manager.connect_accent_color_rgba_notify(move |_| area.queue_draw());
-        }
-        {
-            let area = area.clone();
-            manager.connect_dark_notify(move |_| area.queue_draw());
-        }
-        {
-            let area = area.clone();
-            manager.connect_high_contrast_notify(move |_| area.queue_draw());
         }
 
         Self { area, points }
@@ -58,7 +44,6 @@ impl Sparkline {
 }
 
 fn draw_sparkline(
-    area: &DrawingArea,
     context: &gtk::cairo::Context,
     width: i32,
     height: i32,
@@ -98,17 +83,23 @@ fn draw_sparkline(
     high += padding;
     let price_span = (high - low).max(f64::EPSILON);
 
-    let manager = adw::StyleManager::for_display(&area.display());
-    let accent = manager.accent_color_rgba();
+    // Match Aureus's full-size price charts: the sparkline color describes
+    // the plotted period itself, not the user's UI accent. A non-negative
+    // first-to-last move is green; a negative move is red.
+    let rising = points
+        .last()
+        .zip(points.first())
+        .map(|(last, first)| last.close >= first.close)
+        .unwrap_or(true);
+    let (line_red, line_green, line_blue) = if rising {
+        (46.0 / 255.0, 194.0 / 255.0, 126.0 / 255.0)
+    } else {
+        (224.0 / 255.0, 27.0 / 255.0, 36.0 / 255.0)
+    };
     context.set_line_width(1.8);
     context.set_line_cap(gtk::cairo::LineCap::Round);
     context.set_line_join(gtk::cairo::LineJoin::Round);
-    context.set_source_rgba(
-        f64::from(accent.red()),
-        f64::from(accent.green()),
-        f64::from(accent.blue()),
-        0.95,
-    );
+    context.set_source_rgba(line_red, line_green, line_blue, 0.95);
 
     for (index, point) in points.iter().enumerate() {
         let x = left
