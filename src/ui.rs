@@ -3210,7 +3210,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
 
     if positions.is_empty() {
         refs.dividends_stack.set_visible_child_name("empty");
-        set_dividend_income_text(&refs.dividend_income, "—");
+        refs.dividend_income.set_label("—");
         refs.dividend_yield.set_label("—");
         refs.dividend_status.set_label("No holdings yet");
         refs.dividend_chart
@@ -3394,17 +3394,13 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
     // so changing the period can never leave a stale forward run-rate above a
     // smaller set of bars.
     if selected_complete {
-        set_dividend_income_text(
-            &refs.dividend_income,
-            &format_currency(selected_total, base),
-        );
+        refs.dividend_income
+            .set_label(&format_currency(selected_total, base));
     } else if selected_total > 0.0 {
-        set_dividend_income_text(
-            &refs.dividend_income,
-            &format!("{}+", format_currency(selected_total, base)),
-        );
+        refs.dividend_income
+            .set_label(&format!("{}+", format_currency(selected_total, base)));
     } else {
-        set_dividend_income_text(&refs.dividend_income, "—");
+        refs.dividend_income.set_label("—");
     }
 
     let portfolio_market = sum_optional_converted(
@@ -13008,24 +13004,6 @@ fn format_money_number(value: f64) -> String {
     format!("{sign}{grouped}.{fraction}")
 }
 
-// Cantarell intentionally draws the heavy dollar sign with a detached upper
-// stem. At title-1 size that reads like a stray dash above Aureus's dividend
-// headline. Keep the surrounding text in the native GNOME font, but render only
-// the dollar glyph with Noto Sans, whose dollar stem is continuous. Noto Sans is
-// part of the GNOME/Freedesktop font stack; if unavailable Pango falls back
-// harmlessly to the normal sans family.
-fn set_dividend_income_text(label: &Label, text: &str) {
-    let Some(dollar) = text.find('$') else {
-        label.set_text(text);
-        return;
-    };
-
-    let before = glib::markup_escape_text(&text[..dollar]);
-    let after = glib::markup_escape_text(&text[dollar + 1..]);
-    label.set_markup(&format!(
-        "{before}<span font_family=\"Noto Sans\">$</span>{after}"
-    ));
-}
 
 fn format_currency(value: f64, currency: &str) -> String {
     let prefix = match currency {
