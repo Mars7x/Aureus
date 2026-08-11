@@ -89,9 +89,16 @@ impl PriceChart {
         points: Vec<PricePoint>,
         currency: &str,
         range: HistoryRange,
+        trend_override: Option<f64>,
         exchange_gmt_offset: i32,
     ) {
-        self.set_points_internal(points, currency, range, None, exchange_gmt_offset);
+        self.set_points_internal(
+            points,
+            currency,
+            range,
+            trend_override,
+            exchange_gmt_offset,
+        );
     }
 
     pub fn set_points_with_trend(

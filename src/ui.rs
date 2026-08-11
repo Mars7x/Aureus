@@ -7380,12 +7380,6 @@ fn load_watch_history_range(
                 &detail.app.state.database,
                 &detail.provider_symbol,
             );
-            detail.chart.set_points_with_market_offset(
-                cached.clone(),
-                &detail.currency,
-                range,
-                cached_market_offset,
-            );
             let cached_day_change = detail
                 .app
                 .state
@@ -7397,7 +7391,20 @@ fn load_watch_history_range(
                         .into_iter()
                         .find(|item| item.provider_symbol.eq_ignore_ascii_case(&detail.provider_symbol))
                         .and_then(|item| item.day_change_percent)
-                });
+                })
+                .filter(|value| value.is_finite());
+            let cached_range_change = if range == HistoryRange::OneDay {
+                cached_day_change
+            } else {
+                cached_provider_range_return
+            };
+            detail.chart.set_points_with_market_offset(
+                cached.clone(),
+                &detail.currency,
+                range,
+                cached_range_change,
+                cached_market_offset,
+            );
             if needs_refresh {
                 // The chart cache is useful immediately, but a persisted
                 // percentage must never flash while the provider is refreshing
@@ -7408,11 +7415,6 @@ fn load_watch_history_range(
                 set_gain_class(&detail.day_change, 0.0);
                 detail.history_status.set_label("Cached history · updating range");
             } else {
-                let cached_range_change = if range == HistoryRange::OneDay {
-                    cached_day_change
-                } else {
-                    cached_provider_range_return
-                };
                 update_watch_history_summary(&detail, &cached, range, cached_range_change, false);
                 detail.history_status.set_label("Cached history");
             }
@@ -7502,21 +7504,24 @@ fn load_watch_history_range(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or(&detail.currency);
+                    let range_change = if load.range == HistoryRange::OneDay {
+                        history.day_change_percent
+                    } else {
+                        history.range_return_percent
+                    }
+                    .filter(|value| value.is_finite());
                     detail.chart.set_points_with_market_offset(
                         history.points.clone(),
                         currency,
                         load.range,
+                        range_change,
                         history.exchange_gmt_offset.unwrap_or(0),
                     );
                     update_watch_history_summary(
                         &detail,
                         &history.points,
                         load.range,
-                        if load.range == HistoryRange::OneDay {
-                            history.day_change_percent
-                        } else {
-                            history.range_return_percent
-                        },
+                        range_change,
                         true,
                     );
                     if let Some(price) = history.current_price {
@@ -8712,12 +8717,6 @@ fn load_history_range(
                 &detail.app.state.database,
                 &detail.provider_symbol,
             );
-            detail.chart.set_points_with_market_offset(
-                cached.clone(),
-                &detail.currency,
-                range,
-                cached_market_offset,
-            );
             let cached_day_change = detail
                 .app
                 .state
@@ -8725,7 +8724,20 @@ fn load_history_range(
                 .position(detail.position_id)
                 .ok()
                 .flatten()
-                .and_then(|position| position.day_change_percent);
+                .and_then(|position| position.day_change_percent)
+                .filter(|value| value.is_finite());
+            let cached_range_change = if range == HistoryRange::OneDay {
+                cached_day_change
+            } else {
+                cached_provider_range_return
+            };
+            detail.chart.set_points_with_market_offset(
+                cached.clone(),
+                &detail.currency,
+                range,
+                cached_range_change,
+                cached_market_offset,
+            );
             if needs_refresh {
                 // Reuse cached points for an instant chart, but never display a
                 // persisted range return while the provider's authoritative
@@ -8739,11 +8751,6 @@ fn load_history_range(
                     .history_status
                     .set_label("Cached history · updating range");
             } else {
-                let cached_range_change = if range == HistoryRange::OneDay {
-                    cached_day_change
-                } else {
-                    cached_provider_range_return
-                };
                 update_history_summary(&detail, &cached, range, cached_range_change, false);
                 detail
                     .history_status
@@ -8842,21 +8849,24 @@ fn load_history_range(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or(&detail.currency);
+                    let range_change = if load.range == HistoryRange::OneDay {
+                        history.day_change_percent
+                    } else {
+                        history.range_return_percent
+                    }
+                    .filter(|value| value.is_finite());
                     detail.chart.set_points_with_market_offset(
                         history.points.clone(),
                         currency,
                         load.range,
+                        range_change,
                         history.exchange_gmt_offset.unwrap_or(0),
                     );
                     update_history_summary(
                         &detail,
                         &history.points,
                         load.range,
-                        if load.range == HistoryRange::OneDay {
-                            history.day_change_percent
-                        } else {
-                            history.range_return_percent
-                        },
+                        range_change,
                         true,
                     );
                     crossfade_loaded_label(&detail.history_status, "Updated just now");
