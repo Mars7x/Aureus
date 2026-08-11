@@ -28,10 +28,6 @@ const LAYOUT_CSS: &str = r#"
   padding: 12px 14px;
 }
 
-.upcoming-card:focus-visible {
-  outline: 2px solid @accent_color;
-}
-
 .range-toggle {
   min-width: 0;
   padding-left: 6px;

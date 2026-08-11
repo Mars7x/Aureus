@@ -2401,7 +2401,6 @@ fn upcoming_action_card(title: &str, subtitle: &str, detail: &str) -> GtkBox {
         .build();
     card.add_css_class("card");
     card.add_css_class("upcoming-card");
-    card.set_focusable(true);
     card.set_accessible_role(gtk::AccessibleRole::Group);
     card.append(
         &Label::builder()
