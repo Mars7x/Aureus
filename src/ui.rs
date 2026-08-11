@@ -34,7 +34,10 @@ use crate::model::{
 const BASE_CURRENCY_KEY: &str = "base-currency";
 const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
+const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
+const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v12-exact-range-meta";
 const USD_CAD_PAIR: &str = "USDCAD";
+const USD_CAD_HISTORY_SYMBOL: &str = "CAD=X";
 const QUOTE_CACHE_SECONDS: i64 = 15 * 60;
 const FX_CACHE_SECONDS: i64 = 12 * 60 * 60;
 const DIVIDEND_CACHE_SECONDS: i64 = 24 * 60 * 60;
@@ -970,6 +973,18 @@ fn position_pull_refresh_visual(header: &HeaderBar, visual_revealer: &Revealer) 
 
 pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     let database = Database::open_default().map_err(|error| error.to_string())?;
+    market_data::configure_yfinance();
+    let cached_provider = database
+        .setting(MARKET_DATA_CACHE_PROVIDER_KEY)
+        .map_err(|error| format!("Could not load market-data cache settings: {error}"))?;
+    if cached_provider.as_deref() != Some(MARKET_DATA_CACHE_PROVIDER_VALUE) {
+        database
+            .invalidate_market_price_cache()
+            .map_err(|error| format!("Could not reset the previous market-data cache: {error}"))?;
+        database
+            .set_setting(MARKET_DATA_CACHE_PROVIDER_KEY, MARKET_DATA_CACHE_PROVIDER_VALUE)
+            .map_err(|error| format!("Could not update market-data cache settings: {error}"))?;
+    }
     // Re-derive positions on every launch so a previously cached split becomes
     // effective automatically as soon as its timestamp is reached. Treat a
     // failed synchronization as a startup error instead of showing stale data.
@@ -2145,9 +2160,10 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
     let mut first_history_range: Option<ToggleButton> = None;
     for range in [
         HistoryRange::OneDay,
-        HistoryRange::OneWeek,
+        HistoryRange::FiveDays,
         HistoryRange::OneMonth,
-        HistoryRange::ThreeMonths,
+        HistoryRange::SixMonths,
+        HistoryRange::YearToDate,
         HistoryRange::OneYear,
         HistoryRange::FiveYears,
         HistoryRange::All,
@@ -3997,7 +4013,7 @@ fn rebuild_allocation(
             .entry(position.provider_symbol.clone())
             .or_insert_with(|| (position.code.clone(), position.name.clone(), 0.0));
         // Prefer a later non-empty company name if an older imported position
-        // for the same Yahoo symbol did not have one.
+        // for the same provider symbol did not have one.
         if entry.1.trim().is_empty() && !position.name.trim().is_empty() {
             entry.1 = position.name.clone();
         }
@@ -5667,7 +5683,7 @@ fn prepare_report_export(
             }
         }
         let fx_history = if needs_fx {
-            match market_data::daily_history_between("CAD=X", period_start, period_end) {
+            match market_data::daily_history_between(USD_CAD_HISTORY_SYMBOL, period_start, period_end) {
                 Ok(history) => Some(history),
                 Err(_) => {
                     failures += 1;
@@ -7033,14 +7049,15 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         .spacing(6)
         .homogeneous(true)
         .build();
-    let active_range = Rc::new(Cell::new(HistoryRange::OneMonth));
+    let active_range = Rc::new(Cell::new(HistoryRange::OneDay));
     let mut range_buttons = Vec::new();
     let mut first_button: Option<ToggleButton> = None;
     for range in [
         HistoryRange::OneDay,
-        HistoryRange::OneWeek,
+        HistoryRange::FiveDays,
         HistoryRange::OneMonth,
-        HistoryRange::ThreeMonths,
+        HistoryRange::SixMonths,
+        HistoryRange::YearToDate,
         HistoryRange::OneYear,
         HistoryRange::FiveYears,
         HistoryRange::All,
@@ -7054,7 +7071,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         } else {
             first_button = Some(button.clone());
         }
-        if range == HistoryRange::OneMonth {
+        if range == HistoryRange::OneDay {
             button.set_active(true);
         }
         range_box.append(&button);
@@ -7064,7 +7081,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     let details = positions_list();
     details.append(&detail_value_row("Exchange", friendly_exchange(&asset.exchange)));
     details.append(&detail_value_row("Currency", &asset.currency));
-    details.append(&detail_value_row("Yahoo symbol", &asset.provider_symbol));
+    details.append(&detail_value_row("Data symbol", &asset.provider_symbol));
     if !asset.asset_type.trim().is_empty() {
         details.append(&detail_value_row(
             "Type",
@@ -7177,7 +7194,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         button.connect_toggled(move |button| {
             if button.is_active() {
                 active_range.set(range);
-                load_watch_history_range(detail.clone(), range, false, false);
+                load_watch_history_range(detail.clone(), range, false, true);
             }
         });
     }
@@ -7212,7 +7229,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     if refresh_quote_on_open {
         refresh_watch_detail_quote(detail.clone());
     }
-    load_watch_history_range(detail, HistoryRange::OneMonth, false, true);
+    load_watch_history_range(detail, HistoryRange::OneDay, false, true);
 }
 
 fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
@@ -7350,6 +7367,24 @@ fn load_watch_history_range(
         range,
     );
     let had_cache = cached.len() >= 2;
+    let cached_provider_range_return = if range == HistoryRange::OneDay {
+        None
+    } else {
+        cached_history_range_return(&detail.app.state.database, &detail.provider_symbol, range)
+    };
+    let needs_refresh = force_refresh
+        || detail
+            .app
+            .state
+            .database
+            .history_needs_refresh(
+                &detail.provider_symbol,
+                range.key(),
+                range.interval(),
+                range.cache_seconds(),
+            )
+            .unwrap_or(true)
+        || (range != HistoryRange::OneDay && cached_provider_range_return.is_none());
 
     // A user-initiated refresh must not repaint the visible chart from the
     // database cache before the network result arrives. The page may already
@@ -7358,11 +7393,46 @@ fn load_watch_history_range(
     // used for initial/range loads and as the failure fallback.
     if !announce {
         if had_cache {
-            detail
-                .chart
-                .set_points(cached.clone(), &detail.currency, range);
-            update_watch_history_summary(&detail, &cached, range, false);
-            detail.history_status.set_label("Cached history");
+            let cached_market_offset = cached_history_market_offset(
+                &detail.app.state.database,
+                &detail.provider_symbol,
+            );
+            detail.chart.set_points_with_market_offset(
+                cached.clone(),
+                &detail.currency,
+                range,
+                cached_market_offset,
+            );
+            let cached_day_change = detail
+                .app
+                .state
+                .database
+                .load_watchlist()
+                .ok()
+                .and_then(|items| {
+                    items
+                        .into_iter()
+                        .find(|item| item.provider_symbol.eq_ignore_ascii_case(&detail.provider_symbol))
+                        .and_then(|item| item.day_change_percent)
+                });
+            if needs_refresh {
+                // The chart cache is useful immediately, but a persisted
+                // percentage must never flash while the provider is refreshing
+                // the authoritative range return.
+                detail.range_return.set_label("—");
+                detail.day_change.set_label(&format!("Loading {} change…", range.label()));
+                detail.day_change.add_css_class("dim-label");
+                set_gain_class(&detail.day_change, 0.0);
+                detail.history_status.set_label("Cached history · updating range");
+            } else {
+                let cached_range_change = if range == HistoryRange::OneDay {
+                    cached_day_change
+                } else {
+                    cached_provider_range_return
+                };
+                update_watch_history_summary(&detail, &cached, range, cached_range_change, false);
+                detail.history_status.set_label("Cached history");
+            }
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -7376,18 +7446,6 @@ fn load_watch_history_range(
 
     let generation = detail.generation.get().saturating_add(1);
     detail.generation.set(generation);
-    let needs_refresh = force_refresh
-        || detail
-            .app
-            .state
-            .database
-            .history_needs_refresh(
-                &detail.provider_symbol,
-                range.key(),
-                range.interval(),
-                range.cache_seconds(),
-            )
-            .unwrap_or(true);
     if !needs_refresh {
         if announce {
             complete_detail_refresh(&detail.pull_refresh, &detail.shortcut_refresh);
@@ -7432,16 +7490,26 @@ fn load_watch_history_range(
                     load.range.key(),
                     load.range.interval(),
                 );
-                if let Some(price) = history.current_price {
-                    if let Some(item_id) =
-                        watchlist_item_id_for_symbol(&detail.app, &detail.provider_symbol)
+                save_history_display_metadata(
+                    &detail.app.state.database,
+                    &detail.provider_symbol,
+                    load.range,
+                    &history,
+                );
+                if load.range == HistoryRange::OneDay {
+                    if let (Some(price), Some(day_change)) =
+                        (history.current_price, history.day_change_percent)
                     {
-                        let _ = detail.app.state.database.update_watchlist_quote(
-                            item_id,
-                            price,
-                            history.day_change_percent,
-                            history.quote_timestamp,
-                        );
+                        if let Some(item_id) =
+                            watchlist_item_id_for_symbol(&detail.app, &detail.provider_symbol)
+                        {
+                            let _ = detail.app.state.database.update_watchlist_quote(
+                                item_id,
+                                price,
+                                Some(day_change),
+                                history.quote_timestamp,
+                            );
+                        }
                     }
                 }
                 refresh_with_loaded_crossfade(detail.app.clone());
@@ -7451,10 +7519,23 @@ fn load_watch_history_range(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or(&detail.currency);
-                    detail
-                        .chart
-                        .set_points(history.points.clone(), currency, load.range);
-                    update_watch_history_summary(&detail, &history.points, load.range, true);
+                    detail.chart.set_points_with_market_offset(
+                        history.points.clone(),
+                        currency,
+                        load.range,
+                        history.exchange_gmt_offset.unwrap_or(0),
+                    );
+                    update_watch_history_summary(
+                        &detail,
+                        &history.points,
+                        load.range,
+                        if load.range == HistoryRange::OneDay {
+                            history.day_change_percent
+                        } else {
+                            history.range_return_percent
+                        },
+                        true,
+                    );
                     if let Some(price) = history.current_price {
                         crossfade_loaded_label(
                             &detail.current_price,
@@ -7470,6 +7551,12 @@ fn load_watch_history_range(
                         detail.history_status.set_label(
                             "Update failed · showing cached history",
                         );
+                        if force_refresh {
+                            detail.range_return.set_label("—");
+                            detail.day_change.set_label(history_range_unavailable_label(load.range));
+                            detail.day_change.add_css_class("dim-label");
+                            set_gain_class(&detail.day_change, 0.0);
+                        }
                     } else {
                         detail.chart.set_message("Price history is unavailable right now");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -7490,12 +7577,75 @@ fn load_watch_history_range(
     });
 }
 
+fn history_range_return_cache_key(provider_symbol: &str, range: HistoryRange) -> String {
+    // Version the provider-authoritative range return separately from candle history.
+    // v7 also invalidates the old All-time special case, which incorrectly
+    // substituted the first monthly chart candle for Yahoo's range metadata.
+    format!(
+        "history-range-return-exact-v7:{}:{}",
+        provider_symbol.trim().to_ascii_uppercase(),
+        range.key()
+    )
+}
+
+fn history_market_offset_cache_key(provider_symbol: &str) -> String {
+    format!(
+        "history-market-offset:{}",
+        provider_symbol.trim().to_ascii_uppercase()
+    )
+}
+
+fn cached_history_range_return(
+    database: &Database,
+    provider_symbol: &str,
+    range: HistoryRange,
+) -> Option<f64> {
+    database
+        .setting(&history_range_return_cache_key(provider_symbol, range))
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+fn cached_history_market_offset(database: &Database, provider_symbol: &str) -> i32 {
+    database
+        .setting(&history_market_offset_cache_key(provider_symbol))
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
+fn save_history_display_metadata(
+    database: &Database,
+    provider_symbol: &str,
+    range: HistoryRange,
+    history: &History,
+) {
+    let range_return_key = history_range_return_cache_key(provider_symbol, range);
+    if let Some(change) = history.range_return_percent.filter(|value| value.is_finite()) {
+        let _ = database.set_setting(&range_return_key, &change.to_string());
+    } else {
+        // Do not let an older successful range return reappear after a
+        // provider response that no longer contains a valid range baseline.
+        let _ = database.set_setting(&range_return_key, "");
+    }
+    if let Some(offset) = history.exchange_gmt_offset {
+        let _ = database.set_setting(
+            &history_market_offset_cache_key(provider_symbol),
+            &offset.to_string(),
+        );
+    }
+}
+
 fn history_range_change_suffix(range: HistoryRange) -> &'static str {
     match range {
         HistoryRange::OneDay => "today",
-        HistoryRange::OneWeek => "this week",
-        HistoryRange::OneMonth => "this month",
-        HistoryRange::ThreeMonths => "over 3 months",
+        HistoryRange::FiveDays => "over 5 days",
+        HistoryRange::OneMonth => "over 1 month",
+        HistoryRange::SixMonths => "over 6 months",
+        HistoryRange::YearToDate => "YTD",
         HistoryRange::OneYear => "over 1 year",
         HistoryRange::FiveYears => "over 5 years",
         HistoryRange::All => "all time",
@@ -7505,9 +7655,10 @@ fn history_range_change_suffix(range: HistoryRange) -> &'static str {
 fn history_range_unavailable_label(range: HistoryRange) -> &'static str {
     match range {
         HistoryRange::OneDay => "Today's change unavailable",
-        HistoryRange::OneWeek => "This week's change unavailable",
-        HistoryRange::OneMonth => "This month's change unavailable",
-        HistoryRange::ThreeMonths => "3-month change unavailable",
+        HistoryRange::FiveDays => "5-day change unavailable",
+        HistoryRange::OneMonth => "1-month change unavailable",
+        HistoryRange::SixMonths => "6-month change unavailable",
+        HistoryRange::YearToDate => "YTD change unavailable",
         HistoryRange::OneYear => "1-year change unavailable",
         HistoryRange::FiveYears => "5-year change unavailable",
         HistoryRange::All => "All-time change unavailable",
@@ -7518,9 +7669,10 @@ fn update_watch_history_summary(
     detail: &WatchDetailRefs,
     points: &[PricePoint],
     range: HistoryRange,
+    range_return_override: Option<f64>,
     animate: bool,
 ) {
-    let Some(first) = points.first() else {
+    if points.is_empty() {
         if animate {
             crossfade_loaded_label(&detail.range_return, "—");
             crossfade_loaded_label(&detail.range_high_low, "No history available");
@@ -7533,16 +7685,26 @@ fn update_watch_history_summary(
         detail.day_change.add_css_class("dim-label");
         set_gain_class(&detail.day_change, 0.0);
         return;
-    };
-    let Some(last) = points.last() else {
+    }
+    let Some(change) = range_return_override.filter(|value| value.is_finite()) else {
+        let label = history_range_unavailable_label(range);
+        if animate {
+            crossfade_loaded_label(&detail.range_return, "—");
+            crossfade_loaded_label(&detail.day_change, label);
+        } else {
+            detail.range_return.set_label("—");
+            detail.day_change.set_label(label);
+        }
+        detail.day_change.add_css_class("dim-label");
+        set_gain_class(&detail.day_change, 0.0);
         return;
     };
-    let change = if first.close.abs() < f64::EPSILON {
-        0.0
-    } else {
-        (last.close - first.close) / first.close * 100.0
+    let range_return = match range {
+        HistoryRange::OneDay => format!("{change:+.2}% today"),
+        HistoryRange::YearToDate => format!("{change:+.2}% YTD"),
+        HistoryRange::All => format!("{change:+.2}% all time"),
+        _ => format!("{change:+.2}% over {}", range.label()),
     };
-    let range_return = format!("{change:+.2}% over {}", range.label());
     let day_change = format!("{change:+.2}% {}", history_range_change_suffix(range));
     let low = points
         .iter()
@@ -8032,14 +8194,15 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         .spacing(6)
         .homogeneous(true)
         .build();
-    let active_range = Rc::new(Cell::new(HistoryRange::OneMonth));
+    let active_range = Rc::new(Cell::new(HistoryRange::OneDay));
     let mut range_buttons = Vec::new();
     let mut first_button: Option<ToggleButton> = None;
     for range in [
         HistoryRange::OneDay,
-        HistoryRange::OneWeek,
+        HistoryRange::FiveDays,
         HistoryRange::OneMonth,
-        HistoryRange::ThreeMonths,
+        HistoryRange::SixMonths,
+        HistoryRange::YearToDate,
         HistoryRange::OneYear,
         HistoryRange::FiveYears,
         HistoryRange::All,
@@ -8053,7 +8216,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         } else {
             first_button = Some(button.clone());
         }
-        if range == HistoryRange::OneMonth {
+        if range == HistoryRange::OneDay {
             button.set_active(true);
         }
         range_box.append(&button);
@@ -8284,7 +8447,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         button.connect_toggled(move |button| {
             if button.is_active() {
                 active_range.set(range);
-                load_history_range(detail.clone(), range, false, false);
+                load_history_range(detail.clone(), range, false, true);
             }
         });
     }
@@ -8321,7 +8484,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     }
 
     refs.navigation.push(&page);
-    load_history_range(detail, HistoryRange::OneMonth, false, true);
+    load_history_range(detail, HistoryRange::OneDay, false, true);
     load_position_dividends(dividend_detail, false);
 }
 
@@ -8538,19 +8701,71 @@ fn load_history_range(
         range,
     );
     let had_cache = cached.len() >= 2;
+    let cached_provider_range_return = if range == HistoryRange::OneDay {
+        None
+    } else {
+        cached_history_range_return(&detail.app.state.database, &detail.provider_symbol, range)
+    };
+    let needs_refresh = force_refresh
+        || detail
+            .app
+            .state
+            .database
+            .history_needs_refresh(
+                &detail.provider_symbol,
+                range.key(),
+                range.interval(),
+                range.cache_seconds(),
+            )
+            .unwrap_or(true)
+        || (range != HistoryRange::OneDay && cached_provider_range_return.is_none());
 
     // Keep the last coherent visible snapshot in place during a manual
     // refresh. Reapplying persisted cache here can make the chart and range
     // percentage visibly jump backward until the fresh request completes.
     if !announce {
         if had_cache {
-            detail
-                .chart
-                .set_points(cached.clone(), &detail.currency, range);
-            update_history_summary(&detail, &cached, range, false);
-            detail
-                .history_status
-                .set_label("Cached history");
+            let cached_market_offset = cached_history_market_offset(
+                &detail.app.state.database,
+                &detail.provider_symbol,
+            );
+            detail.chart.set_points_with_market_offset(
+                cached.clone(),
+                &detail.currency,
+                range,
+                cached_market_offset,
+            );
+            let cached_day_change = detail
+                .app
+                .state
+                .database
+                .position(detail.position_id)
+                .ok()
+                .flatten()
+                .and_then(|position| position.day_change_percent);
+            if needs_refresh {
+                // Reuse cached points for an instant chart, but never display a
+                // persisted range return while the provider's authoritative
+                // range return is being refreshed. This prevents a plausible-but-
+                // wrong value from flashing before the response arrives.
+                detail.range_return.set_label("—");
+                detail.day_change.set_label(&format!("Loading {} change…", range.label()));
+                detail.day_change.add_css_class("dim-label");
+                set_gain_class(&detail.day_change, 0.0);
+                detail
+                    .history_status
+                    .set_label("Cached history · updating range");
+            } else {
+                let cached_range_change = if range == HistoryRange::OneDay {
+                    cached_day_change
+                } else {
+                    cached_provider_range_return
+                };
+                update_history_summary(&detail, &cached, range, cached_range_change, false);
+                detail
+                    .history_status
+                    .set_label("Cached history");
+            }
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -8570,18 +8785,6 @@ fn load_history_range(
     let generation = detail.generation.get().saturating_add(1);
     detail.generation.set(generation);
 
-    let needs_refresh = force_refresh
-        || detail
-            .app
-            .state
-            .database
-            .history_needs_refresh(
-                &detail.provider_symbol,
-                range.key(),
-                range.interval(),
-                range.cache_seconds(),
-            )
-            .unwrap_or(true);
     if !needs_refresh {
         if announce {
             complete_detail_refresh(&detail.pull_refresh, &detail.shortcut_refresh);
@@ -8629,13 +8832,23 @@ fn load_history_range(
                     load.range.key(),
                     load.range.interval(),
                 );
-                if let Some(price) = history.current_price {
-                    let _ = detail.app.state.database.update_quote(
-                        detail.position_id,
-                        price,
-                        history.day_change_percent,
-                        history.quote_timestamp,
-                    );
+                save_history_display_metadata(
+                    &detail.app.state.database,
+                    &detail.provider_symbol,
+                    load.range,
+                    &history,
+                );
+                if load.range == HistoryRange::OneDay {
+                    if let (Some(price), Some(day_change)) =
+                        (history.current_price, history.day_change_percent)
+                    {
+                        let _ = detail.app.state.database.update_quote(
+                            detail.position_id,
+                            price,
+                            Some(day_change),
+                            history.quote_timestamp,
+                        );
+                    }
                 }
                 refresh_with_loaded_crossfade(detail.app.clone());
 
@@ -8646,10 +8859,23 @@ fn load_history_range(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
                         .unwrap_or(&detail.currency);
-                    detail
-                        .chart
-                        .set_points(history.points.clone(), currency, load.range);
-                    update_history_summary(&detail, &history.points, load.range, true);
+                    detail.chart.set_points_with_market_offset(
+                        history.points.clone(),
+                        currency,
+                        load.range,
+                        history.exchange_gmt_offset.unwrap_or(0),
+                    );
+                    update_history_summary(
+                        &detail,
+                        &history.points,
+                        load.range,
+                        if load.range == HistoryRange::OneDay {
+                            history.day_change_percent
+                        } else {
+                            history.range_return_percent
+                        },
+                        true,
+                    );
                     crossfade_loaded_label(&detail.history_status, "Updated just now");
                     update_detail_quote(&detail, &history, true);
                 }
@@ -8660,6 +8886,12 @@ fn load_history_range(
                         detail.history_status.set_label(
                             "Update failed · showing cached history",
                         );
+                        if force_refresh {
+                            detail.range_return.set_label("—");
+                            detail.day_change.set_label(history_range_unavailable_label(load.range));
+                            detail.day_change.add_css_class("dim-label");
+                            set_gain_class(&detail.day_change, 0.0);
+                        }
                     } else {
                         detail.chart.set_message("Price history is unavailable right now");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -8777,9 +9009,10 @@ fn update_history_summary(
     detail: &DetailRefs,
     points: &[PricePoint],
     range: HistoryRange,
+    range_return_override: Option<f64>,
     animate: bool,
 ) {
-    let Some(first) = points.first() else {
+    if points.is_empty() {
         if animate {
             crossfade_loaded_label(&detail.range_return, "—");
             crossfade_loaded_label(&detail.range_high_low, "No history available");
@@ -8792,16 +9025,26 @@ fn update_history_summary(
         detail.day_change.add_css_class("dim-label");
         set_gain_class(&detail.day_change, 0.0);
         return;
-    };
-    let Some(last) = points.last() else {
+    }
+    let Some(change) = range_return_override.filter(|value| value.is_finite()) else {
+        let label = history_range_unavailable_label(range);
+        if animate {
+            crossfade_loaded_label(&detail.range_return, "—");
+            crossfade_loaded_label(&detail.day_change, label);
+        } else {
+            detail.range_return.set_label("—");
+            detail.day_change.set_label(label);
+        }
+        detail.day_change.add_css_class("dim-label");
+        set_gain_class(&detail.day_change, 0.0);
         return;
     };
-    let change = if first.close.abs() < f64::EPSILON {
-        0.0
-    } else {
-        (last.close - first.close) / first.close * 100.0
+    let range_return = match range {
+        HistoryRange::OneDay => format!("{change:+.2}% today"),
+        HistoryRange::YearToDate => format!("{change:+.2}% YTD"),
+        HistoryRange::All => format!("{change:+.2}% all time"),
+        _ => format!("{change:+.2}% over {}", range.label()),
     };
-    let range_return = format!("{change:+.2}% over {}", range.label());
     let day_change = format!("{change:+.2}% {}", history_range_change_suffix(range));
     let low = points.iter().map(|point| point.close).fold(f64::INFINITY, f64::min);
     let high = points.iter().map(|point| point.close).fold(f64::NEG_INFINITY, f64::max);
@@ -11410,7 +11653,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         refs
             .state
             .database
-            .history_points("CAD=X", range.interval(), minimum)
+            .history_points(USD_CAD_HISTORY_SYMBOL, range.interval(), minimum)
             .unwrap_or_default()
     });
     let fx_missing = needs_fx
@@ -12359,7 +12602,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let cached_fx = refs
             .state
             .database
-            .history_points("CAD=X", range.interval(), minimum)
+            .history_points(USD_CAD_HISTORY_SYMBOL, range.interval(), minimum)
             .unwrap_or_default();
         let cached_empty = cached_fx.is_empty();
         let one_day_window_too_short = range == HistoryRange::OneDay
@@ -12371,7 +12614,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let stale = refs
             .state
             .database
-            .history_needs_refresh("CAD=X", range.key(), range.interval(), range.cache_seconds())
+            .history_needs_refresh(USD_CAD_HISTORY_SYMBOL, range.key(), range.interval(), range.cache_seconds())
             .unwrap_or(true);
         cached_empty || stale || one_day_window_too_short
     } else {
@@ -12399,7 +12642,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let fx_history = if fetch_fx {
             // Keep the full OneDay backing window for conversion. Securities
             // themselves are trimmed to their latest market session.
-            match market_data::history_window("CAD=X", range) {
+            match market_data::history_window(USD_CAD_HISTORY_SYMBOL, range) {
                 Ok(history) => Some(history),
                 Err(_) => {
                     failures += 1;
@@ -12442,9 +12685,9 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
             let _ = refs
                 .state
                 .database
-                .save_history("CAD=X", result.range.interval(), &history.points);
+                .save_history(USD_CAD_HISTORY_SYMBOL, result.range.interval(), &history.points);
             let _ = refs.state.database.set_history_fetched(
-                "CAD=X",
+                USD_CAD_HISTORY_SYMBOL,
                 result.range.key(),
                 result.range.interval(),
             );

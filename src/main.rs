@@ -4,6 +4,7 @@ mod database;
 mod dividend_chart;
 mod fx;
 mod market_data;
+mod market_providers;
 mod report;
 mod model;
 mod sparkline;

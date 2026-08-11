@@ -734,6 +734,28 @@ impl Database {
         result
     }
 
+    /// Invalidate provider-specific market caches while retaining portfolio
+    /// activity and already-recorded corporate-action history until the new
+    /// provider successfully replaces it.
+    pub fn invalidate_market_price_cache(&self) -> Result<()> {
+        self.connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             DELETE FROM price_history;
+             DELETE FROM history_fetches;
+             DELETE FROM dividend_fetches;
+             DELETE FROM settings WHERE key LIKE 'dividend-calendar:%';
+             DELETE FROM settings WHERE key LIKE 'history-range-change:%';
+             DELETE FROM settings WHERE key LIKE 'history-range-return-%';
+             DELETE FROM settings WHERE key LIKE 'history-market-offset:%';
+             UPDATE positions
+                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL;
+             UPDATE watchlist
+                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL;
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
     pub fn update_quote(
         &self,
         position_id: i64,

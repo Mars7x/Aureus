@@ -22,6 +22,7 @@ struct ChartState {
     range: HistoryRange,
     inspect_index: Option<usize>,
     trend_override: Option<f64>,
+    exchange_gmt_offset: i32,
     message: Option<String>,
     empty_message: String,
 }
@@ -51,6 +52,7 @@ impl PriceChart {
                 range: HistoryRange::OneMonth,
                 inspect_index: None,
                 trend_override: None,
+                exchange_gmt_offset: 0,
                 message: Some(initial_message.into()),
                 empty_message: empty_message.into(),
             }))
@@ -82,8 +84,14 @@ impl PriceChart {
         &self.stack
     }
 
-    pub fn set_points(&self, points: Vec<PricePoint>, currency: &str, range: HistoryRange) {
-        self.set_points_with_trend(points, currency, range, None);
+    pub fn set_points_with_market_offset(
+        &self,
+        points: Vec<PricePoint>,
+        currency: &str,
+        range: HistoryRange,
+        exchange_gmt_offset: i32,
+    ) {
+        self.set_points_internal(points, currency, range, None, exchange_gmt_offset);
     }
 
     pub fn set_points_with_trend(
@@ -93,11 +101,22 @@ impl PriceChart {
         range: HistoryRange,
         trend_override: Option<f64>,
     ) {
+        self.set_points_internal(points, currency, range, trend_override, 0);
+    }
+
+    fn set_points_internal(
+        &self,
+        points: Vec<PricePoint>,
+        currency: &str,
+        range: HistoryRange,
+        trend_override: Option<f64>,
+        exchange_gmt_offset: i32,
+    ) {
         let active = self.active.get();
         let reduced = reduce_points_for_display(points, 1200);
 
         // Refreshing the same range updates in place. A range change renders into
-        // the hidden chart first and then crossfades, so only explicit 1D/1W/…
+        // the hidden chart first and then crossfades, so only explicit 1D/5D/…
         // changes animate instead of every background quote update flashing.
         if self.states[active].borrow().range == range {
             let mut state = self.states[active].borrow_mut();
@@ -105,6 +124,7 @@ impl PriceChart {
             state.currency = currency.to_string();
             state.inspect_index = None;
             state.trend_override = trend_override;
+            state.exchange_gmt_offset = exchange_gmt_offset;
             state.message = None;
             drop(state);
             self.areas[active].queue_draw();
@@ -119,6 +139,7 @@ impl PriceChart {
             state.range = range;
             state.inspect_index = None;
             state.trend_override = trend_override;
+            state.exchange_gmt_offset = exchange_gmt_offset;
             state.message = None;
         }
         self.areas[next].queue_draw();
@@ -420,10 +441,10 @@ fn draw_chart(
     context.set_source_rgba(foreground, foreground, foreground, 0.58);
     if let Some(first) = state.points.first() {
         context.move_to(plot_left, height - 7.0);
-        let _ = context.show_text(&format_axis_time(first.timestamp, state.range));
+        let _ = context.show_text(&format_axis_time(first.timestamp, state.range, state.exchange_gmt_offset));
     }
     if let Some(last) = state.points.last() {
-        let label = format_axis_time(last.timestamp, state.range);
+        let label = format_axis_time(last.timestamp, state.range, state.exchange_gmt_offset);
         let estimated_width = label.chars().count() as f64 * 6.4;
         context.move_to(
             (plot_right - estimated_width).max(plot_left + 40.0),
@@ -443,7 +464,7 @@ fn draw_chart(
 
     let point = &state.points[index];
     let price = format_price(point.close, &state.currency);
-    let time = format_inspect_time(point.timestamp, state.range);
+    let time = format_inspect_time(point.timestamp, state.range, state.exchange_gmt_offset);
     let popup_width = 154.0;
     let popup_height = 44.0;
     let popup_x = if x + popup_width + 14.0 < width {
@@ -551,29 +572,30 @@ fn format_price(value: f64, currency: &str) -> String {
     }
 }
 
-fn format_axis_time(timestamp: i64, range: HistoryRange) -> String {
+fn format_axis_time(timestamp: i64, range: HistoryRange, exchange_gmt_offset: i32) -> String {
+    let local_timestamp = timestamp.saturating_add(i64::from(exchange_gmt_offset));
     match range {
-        HistoryRange::OneDay | HistoryRange::OneWeek => {
-            let (_, hour, minute) = split_utc(timestamp);
+        HistoryRange::OneDay => {
+            let (_, hour, minute) = split_utc(local_timestamp);
             format!("{hour:02}:{minute:02}")
         }
-        HistoryRange::OneMonth | HistoryRange::ThreeMonths => {
-            let (year, month, day, _, _) = utc_parts(timestamp);
-            let _ = year;
+        HistoryRange::FiveDays | HistoryRange::OneMonth => {
+            let (_, month, day, _, _) = utc_parts(local_timestamp);
             format!("{month:02}/{day:02}")
         }
         _ => {
-            let (year, month, _, _, _) = utc_parts(timestamp);
+            let (year, month, _, _, _) = utc_parts(local_timestamp);
             format!("{year}-{month:02}")
         }
     }
 }
 
-fn format_inspect_time(timestamp: i64, range: HistoryRange) -> String {
-    let (year, month, day, hour, minute) = utc_parts(timestamp);
+fn format_inspect_time(timestamp: i64, range: HistoryRange, exchange_gmt_offset: i32) -> String {
+    let local_timestamp = timestamp.saturating_add(i64::from(exchange_gmt_offset));
+    let (year, month, day, hour, minute) = utc_parts(local_timestamp);
     match range {
-        HistoryRange::OneDay | HistoryRange::OneWeek => {
-            format!("{year}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+        HistoryRange::OneDay | HistoryRange::FiveDays => {
+            format!("{year}-{month:02}-{day:02} {hour:02}:{minute:02}")
         }
         _ => format!("{year}-{month:02}-{day:02}"),
     }
