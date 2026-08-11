@@ -4843,7 +4843,7 @@ fn install_window_actions(
                 .application_icon(crate::APP_ID)
                 .developer_name("Mars7x")
                 .version(crate::APP_VERSION)
-                .comments("A native portfolio tracker")
+                .comments("A clean portfolio tracker that just works")
                 .build();
             dialog.add_credit_section(
                 Some("Data"),
