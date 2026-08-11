@@ -2211,7 +2211,7 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
     allocation_card.add_css_class("card");
     let allocation_card_content = GtkBox::builder()
         .orientation(Orientation::Vertical)
-        .spacing(8)
+        .spacing(14)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
@@ -4086,7 +4086,8 @@ fn allocation_legend_row(
         .width_request(10)
         .height_request(10)
         .halign(Align::Center)
-        .valign(Align::Center)
+        .valign(Align::Start)
+        .margin_top(5)
         .build();
     let color_index = slice.color_index;
     let color = slice.color;
@@ -4112,7 +4113,13 @@ fn allocation_legend_row(
         .spacing(1)
         .hexpand(true)
         .build();
-    labels.append(
+
+    let top_line = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .build();
+    top_line.append(
         &Label::builder()
             .label(&slice.label)
             .halign(Align::Start)
@@ -4121,13 +4128,17 @@ fn allocation_legend_row(
             .css_classes(["heading"])
             .build(),
     );
+    top_line.append(
+        &Label::builder()
+            .label(&format!("{:.1}%", slice.value / total * 100.0))
+            .halign(Align::End)
+            .valign(Align::Start)
+            .build(),
+    );
+    labels.append(&top_line);
     labels.append(
         &Label::builder()
-            .label(&format!(
-                "{} · {:.1}%",
-                format_currency(slice.value, base),
-                slice.value / total * 100.0
-            ))
+            .label(&format_allocation_currency(slice.value, base))
             .halign(Align::Start)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
@@ -4144,6 +4155,39 @@ fn allocation_legend_row(
     }
     row.add_controller(click);
     row
+}
+
+fn format_allocation_currency(value: f64, currency: &str) -> String {
+    let prefix = match currency {
+        "CAD" => "C$",
+        "USD" => "US$",
+        "EUR" => "€",
+        "GBP" => "£",
+        _ => "",
+    };
+    let sign = if value.is_sign_negative() { "−" } else { "" };
+    let raw = format!("{:.2}", value.abs());
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
+    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
+    let first = whole.len() % 3;
+    if first > 0 {
+        grouped.push_str(&whole[..first]);
+        if first < whole.len() {
+            grouped.push(',');
+        }
+    }
+    for (chunk_index, chunk) in whole[first..].as_bytes().chunks(3).enumerate() {
+        if chunk_index > 0 {
+            grouped.push(',');
+        }
+        grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+    }
+    let number = format!("{sign}{grouped}.{fraction}");
+    if prefix.is_empty() {
+        format!("{number} {currency}")
+    } else {
+        format!("{prefix}{number}")
+    }
 }
 
 fn cash_holding_row(account: &Account, base: &str, usd_cad: Option<f64>) -> ListBoxRow {

@@ -204,7 +204,7 @@ fn draw_ring(
     let center_y = height / 2.0;
     let radius = width.min(height) * 0.34;
     // Keep the allocation donut visually light while preserving its overall diameter.
-    let line_width = (width.min(height) * 0.095).clamp(16.0, 22.0);
+    let line_width = (width.min(height) * 0.082).clamp(14.0, 19.0);
     // Text must live inside the donut hole even when the ring is compressed.
     // Keep a small inset from the inner stroke and scale typography against
     // this actual available diameter rather than assuming a desktop size.
