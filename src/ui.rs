@@ -34,6 +34,7 @@ use crate::model::{
 const BASE_CURRENCY_KEY: &str = "base-currency";
 const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
+const PORTFOLIO_HISTORY_RANGE_KEY: &str = "portfolio-history-range";
 const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
 const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v12-exact-range-meta";
 const USD_CAD_PAIR: &str = "USDCAD";
@@ -1035,6 +1036,13 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     database
         .sync_paid_dividends_to_cash()
         .map_err(|error| format!("Could not synchronize dividend cash: {error}"))?;
+    let initial_portfolio_history_range = database
+        .setting(PORTFOLIO_HISTORY_RANGE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(portfolio_history_range_from_key)
+        .unwrap_or(HistoryRange::OneYear);
     let state = AppState {
         database: Rc::new(database),
     };
@@ -1060,7 +1068,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         .build();
 
     let portfolio_history_chart = PriceChart::new_portfolio();
-    let portfolio_history_range = Rc::new(Cell::new(HistoryRange::OneYear));
+    let portfolio_history_range = Rc::new(Cell::new(initial_portfolio_history_range));
     let overview_list = positions_list();
     let allocation_ring = AllocationRing::new();
     let allocation_legend = GtkBox::builder()
@@ -2211,6 +2219,20 @@ fn page_stack() -> Stack {
         .build()
 }
 
+fn portfolio_history_range_from_key(key: &str) -> Option<HistoryRange> {
+    match key {
+        "1d" => Some(HistoryRange::OneDay),
+        "5d" => Some(HistoryRange::FiveDays),
+        "1m" => Some(HistoryRange::OneMonth),
+        "6m" => Some(HistoryRange::SixMonths),
+        "ytd" => Some(HistoryRange::YearToDate),
+        "1y" => Some(HistoryRange::OneYear),
+        "5y" => Some(HistoryRange::FiveYears),
+        "all" => Some(HistoryRange::All),
+        _ => None,
+    }
+}
+
 fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
     let content = page_content_box();
 
@@ -2264,6 +2286,10 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
             button.connect_toggled(move |button| {
                 if button.is_active() {
                     refs.portfolio_history_range.set(range);
+                    let _ = refs
+                        .state
+                        .database
+                        .set_setting(PORTFOLIO_HISTORY_RANGE_KEY, range.key());
                     update_portfolio_history_from_cache(&refs);
                     refresh_portfolio_history_async(refs.clone(), false);
                 }
