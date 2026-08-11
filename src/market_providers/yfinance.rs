@@ -179,6 +179,18 @@ struct YahooQuoteCalendar {
     regular_market_previous_close: Option<f64>,
     #[serde(default, rename = "regularMarketTime")]
     regular_market_time: Option<i64>,
+    #[serde(default, rename = "preMarketPrice")]
+    pre_market_price: Option<f64>,
+    #[serde(default, rename = "preMarketTime")]
+    pre_market_time: Option<i64>,
+    #[serde(default, rename = "preMarketChangePercent")]
+    pre_market_change_percent: Option<f64>,
+    #[serde(default, rename = "postMarketPrice")]
+    post_market_price: Option<f64>,
+    #[serde(default, rename = "postMarketTime")]
+    post_market_time: Option<i64>,
+    #[serde(default, rename = "postMarketChangePercent")]
+    post_market_change_percent: Option<f64>,
     #[serde(default, rename = "marketState")]
     market_state: Option<String>,
     #[serde(default, rename = "exDividendDate")]
@@ -296,14 +308,52 @@ fn freshest_regular_price(
     let chart_timestamp = chart_timestamp.filter(|value| *value > 0);
 
     match (quote, chart_price, chart_timestamp) {
-        // Yahoo's quote feed is the source used for the headline regular-market
-        // quote. Prefer it when both feeds identify the same market second; only
-        // let chart win when its timestamp is strictly newer.
-        (Some(quote), Some(chart), Some(chart_time)) if chart_time > quote.timestamp => Some(chart),
-        (Some(quote), _, _) if quote.timestamp > 0 => valid_price(Some(quote.close)),
+        // Extended-session timestamps must never make a PRE/POST price become
+        // the numerator for Yahoo's regular-session range returns. Compare only
+        // the quote's regular snapshot with the chart's regular snapshot.
+        (Some(quote), Some(chart), Some(chart_time))
+            if chart_time > quote.regular_timestamp =>
+        {
+            Some(chart)
+        }
+        (Some(quote), _, _) if quote.regular_timestamp > 0 => {
+            valid_price(Some(quote.regular_close))
+        }
         (None, chart, _) => chart,
-        // A malformed/untimestamped quote must never outrank a chart snapshot.
         (Some(_), chart, _) => chart,
+    }
+}
+
+fn freshest_display_price(
+    quote: Option<&Quote>,
+    chart_price: Option<f64>,
+    chart_timestamp: Option<i64>,
+) -> (Option<f64>, Option<i64>, Option<String>, Option<f64>) {
+    let chart_price = valid_price(chart_price);
+    let chart_timestamp = chart_timestamp.filter(|value| *value > 0);
+
+    match (quote, chart_price, chart_timestamp) {
+        (Some(quote), Some(chart), Some(chart_time)) if chart_time > quote.timestamp => {
+            let state = match quote
+                .market_state
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+                .as_str()
+            {
+                "PRE" | "PREPRE" | "POST" | "POSTPOST" => Some("CLOSED".into()),
+                _ => quote.market_state.clone(),
+            };
+            (Some(chart), Some(chart_time), state, None)
+        }
+        (Some(quote), _, _) if quote.timestamp > 0 => (
+            valid_price(Some(quote.close)),
+            Some(quote.timestamp),
+            quote.market_state.clone(),
+            quote.extended_change_percent,
+        ),
+        (None, chart, timestamp) => (chart, timestamp, None, None),
+        (Some(_), chart, timestamp) => (chart, timestamp, None, None),
     }
 }
 
@@ -436,9 +486,9 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     let encoded = urlencoding::encode(symbol);
 
     // Prefer Yahoo's dedicated quote response for the current market snapshot.
-    // Keeping price + regularMarketChangePercent from one response prevents the
-    // transient mismatch that can occur when search and chart caches refresh at
-    // different times.
+    // Yahoo exposes exchange-aware marketState plus separate pre/regular/post
+    // prices. Let that state select the headline price instead of hard-coding
+    // exchange hours in Aureus.
     let quote_url = format!("{QUOTE_URL}?symbols={encoded}");
     if let Ok(response) = get_json::<YahooQuoteEnvelope>(&quote_url) {
         if let Some(quote) = response
@@ -447,31 +497,80 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
             .into_iter()
             .find(|quote| quote.symbol.is_empty() || quote.symbol.eq_ignore_ascii_case(symbol))
         {
-            // A quote without regularMarketTime has no trustworthy freshness
-            // ordering relative to the chart response. Do not manufacture a
-            // timestamp with `now`: that can make stale/incomplete quote data
-            // incorrectly win the range-return numerator. Fall through to the
-            // timestamped chart snapshot instead.
-            if let (Some(close), Some(timestamp)) = (
-                quote
-                    .regular_market_price
-                    .filter(|value| value.is_finite() && *value > 0.0),
-                quote.regular_market_time.filter(|value| *value > 0),
-            ) {
-                return Ok(Quote {
-                    timestamp,
-                    close,
-                    change_percent: percent_change(
-                        Some(close),
-                        quote.regular_market_previous_close,
-                    )
-                    .or_else(|| {
-                        quote
-                            .regular_market_change_percent
-                            .filter(|value| value.is_finite())
-                    }),
-                    market_state: quote.market_state,
+            if let Some(regular_close) = valid_price(quote.regular_market_price) {
+                let regular_timestamp = quote
+                    .regular_market_time
+                    .filter(|value| *value > 0)
+                    .unwrap_or(0);
+                let regular_change = percent_change(
+                    Some(regular_close),
+                    quote.regular_market_previous_close,
+                )
+                .or_else(|| {
+                    quote
+                        .regular_market_change_percent
+                        .filter(|value| value.is_finite())
                 });
+
+                let state = quote
+                    .market_state
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+
+                let extended = match state.as_str() {
+                    "PRE" | "PREPRE" => valid_price(quote.pre_market_price)
+                        .zip(quote.pre_market_time.filter(|value| *value > 0 && (regular_timestamp == 0 || *value > regular_timestamp)))
+                        .map(|(price, timestamp)| {
+                            let change = quote
+                                .pre_market_change_percent
+                                .filter(|value| value.is_finite())
+                                .or_else(|| percent_change(Some(price), Some(regular_close)));
+                            (price, timestamp, change)
+                        }),
+                    "POST" | "POSTPOST" => valid_price(quote.post_market_price)
+                        .zip(quote.post_market_time.filter(|value| *value > 0 && (regular_timestamp == 0 || *value > regular_timestamp)))
+                        .map(|(price, timestamp)| {
+                            let change = quote
+                                .post_market_change_percent
+                                .filter(|value| value.is_finite())
+                                .or_else(|| percent_change(Some(price), Some(regular_close)));
+                            (price, timestamp, change)
+                        }),
+                    _ => None,
+                };
+
+                if let Some((close, timestamp, extended_change_percent)) = extended {
+                    return Ok(Quote {
+                        timestamp,
+                        close,
+                        regular_timestamp,
+                        regular_close,
+                        change_percent: regular_change,
+                        extended_change_percent,
+                        market_state: quote.market_state,
+                    });
+                }
+
+                // If Yahoo says PRE/POST but does not provide a usable
+                // extended-session snapshot, keep showing the regular close and
+                // label that displayed price as closed rather than pretending the
+                // regular close is an extended-hours trade.
+                if regular_timestamp > 0 {
+                    let display_state = match state.as_str() {
+                        "PRE" | "PREPRE" | "POST" | "POSTPOST" => Some("CLOSED".into()),
+                        _ => quote.market_state,
+                    };
+                    return Ok(Quote {
+                        timestamp: regular_timestamp,
+                        close: regular_close,
+                        regular_timestamp,
+                        regular_close,
+                        change_percent: regular_change,
+                        extended_change_percent: None,
+                        market_state: display_state,
+                    });
+                }
             }
         }
     }
@@ -547,7 +646,10 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     Ok(Quote {
         timestamp,
         close,
+        regular_timestamp: timestamp,
+        regular_close: close,
         change_percent,
+        extended_change_percent: None,
         market_state: result.meta.market_state,
     })
 }
@@ -779,14 +881,18 @@ fn history_from_url(
         .regular_market_time
         .or_else(|| points.last().map(|point| point.timestamp));
 
-    // Quote and chart are independent Yahoo caches. Use the actually newer
-    // regular-session snapshot instead of blindly preferring one endpoint.
+    // Quote and chart are independent Yahoo caches. Keep two notions of
+    // "current" deliberately separate:
+    // - headline/display price may be PRE/POST when Yahoo says that session is active;
+    // - range-return numerator stays regular-session only.
     let quote_snapshot = range.and_then(|_| quote_impl(symbol).ok());
-    let current_price = freshest_regular_price(
+    let regular_current_price = freshest_regular_price(
         quote_snapshot.as_ref(),
         chart_price,
         chart_timestamp,
     );
+    let (current_price, display_timestamp, display_market_state, extended_change_percent) =
+        freshest_display_price(quote_snapshot.as_ref(), chart_price, chart_timestamp);
 
     // Keep the rolling-period boundary atomic with this exact Yahoo chart
     // response. A separate period1/period2 lookup can land on a different
@@ -795,7 +901,7 @@ fn history_from_url(
     let range_anchor = range.and_then(|_| {
         canonical_range_anchor(result.meta.chart_previous_close)
     });
-    let range_return_percent = percent_change(current_price, range_anchor)
+    let range_return_percent = percent_change(regular_current_price, range_anchor)
         .filter(|value| value.is_finite());
 
     let day_change_percent = match range {
@@ -812,15 +918,9 @@ fn history_from_url(
         None => None,
     };
 
-    let quote_timestamp = match (
-        quote_snapshot.as_ref().map(|quote| quote.timestamp),
-        chart_timestamp,
-    ) {
-        (Some(quote_time), Some(chart_time)) => quote_time.max(chart_time),
-        (Some(quote_time), None) => quote_time,
-        (None, Some(chart_time)) => chart_time,
-        (None, None) => now_unix(),
-    };
+    let quote_timestamp = display_timestamp
+        .or(chart_timestamp)
+        .unwrap_or_else(now_unix);
 
     // Keep points ordered after deriving provider-specific return anchors. The
     // provider-neutral display layer is responsible for trimming the wider 6M
@@ -833,6 +933,8 @@ fn history_from_url(
         currency: result.meta.currency,
         current_price,
         quote_timestamp,
+        market_state: display_market_state.or(result.meta.market_state),
+        extended_change_percent,
         day_change_percent,
         range_return_percent,
         exchange_gmt_offset: result.meta.gmtoffset,
@@ -928,7 +1030,10 @@ mod tests {
         let quote = Quote {
             timestamp: 200,
             close: 105.0,
+            regular_timestamp: 200,
+            regular_close: 105.0,
             change_percent: None,
+            extended_change_percent: None,
             market_state: None,
         };
         assert_eq!(freshest_regular_price(Some(&quote), Some(104.0), Some(199)), Some(105.0));
@@ -937,11 +1042,37 @@ mod tests {
     }
 
     #[test]
+    fn extended_price_does_not_replace_regular_range_numerator() {
+        let quote = Quote {
+            timestamp: 250,
+            close: 107.0,
+            regular_timestamp: 200,
+            regular_close: 105.0,
+            change_percent: Some(-1.0),
+            extended_change_percent: Some(1.9),
+            market_state: Some("POST".into()),
+        };
+
+        assert_eq!(
+            freshest_regular_price(Some(&quote), Some(106.0), Some(201)),
+            Some(106.0)
+        );
+        let display = freshest_display_price(Some(&quote), Some(106.0), Some(201));
+        assert_eq!(display.0, Some(107.0));
+        assert_eq!(display.1, Some(250));
+        assert_eq!(display.2.as_deref(), Some("POST"));
+        assert_eq!(display.3, Some(1.9));
+    }
+
+    #[test]
     fn untimestamped_or_invalid_snapshots_never_gain_fake_freshness() {
         let quote = Quote {
             timestamp: 0,
             close: 110.0,
+            regular_timestamp: 0,
+            regular_close: 110.0,
             change_percent: None,
+            extended_change_percent: None,
             market_state: None,
         };
         assert_eq!(freshest_regular_price(Some(&quote), Some(108.0), Some(200)), Some(108.0));

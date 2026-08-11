@@ -12,7 +12,7 @@ use crate::model::{
 };
 use crate::storage;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 pub struct Database {
     connection: Connection,
@@ -77,7 +77,7 @@ impl Database {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        let version: i64 = self
+        let mut version: i64 = self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -87,7 +87,13 @@ impl Database {
             // Migrate v14 in place so both genuine 1.0.40 databases and the
             // mislabeled 1.0.41-1.0.44 databases keep all user data.
             self.migrate_v14_to_v15()?;
-        } else if version != 0 && version != SCHEMA_VERSION {
+            version = 15;
+        }
+        if version == 15 {
+            self.migrate_v15_to_v16()?;
+            version = 16;
+        }
+        if version != 0 && version != SCHEMA_VERSION {
             // Never destroy a portfolio just because a database version is not
             // understood. Failing visibly is safer than silently resetting it.
             return Err(invalid_database_error(format!(
@@ -136,6 +142,8 @@ impl Database {
                  last_price REAL,\n\
                  day_change_percent REAL,\n\
                  quote_updated_at INTEGER,\n\
+                 quote_market_state TEXT,\n\
+                 extended_change_percent REAL,\n\
                  created_at INTEGER NOT NULL DEFAULT (unixepoch()),\n\
                  UNIQUE(account_id, provider_symbol)\n\
              );\n\
@@ -163,6 +171,8 @@ impl Database {
                  last_price REAL,\n\
                  day_change_percent REAL,\n\
                  quote_updated_at INTEGER,\n\
+                 quote_market_state TEXT,\n\
+                 extended_change_percent REAL,\n\
                  created_at INTEGER NOT NULL DEFAULT (unixepoch())\n\
              );\n\
              CREATE TABLE IF NOT EXISTS settings (\n\
@@ -206,7 +216,7 @@ impl Database {
                  provider_symbol TEXT PRIMARY KEY COLLATE NOCASE,\n\
                  fetched_at INTEGER NOT NULL\n\
              );\n\
-             PRAGMA user_version = 15;\n\
+             PRAGMA user_version = 16;\n\
              COMMIT;",
         )?;
 
@@ -280,6 +290,51 @@ impl Database {
         let foreign_keys = self.connection.execute_batch("PRAGMA foreign_keys = ON;");
         migration?;
         foreign_keys?;
+        Ok(())
+    }
+
+    fn migrate_v15_to_v16(&self) -> Result<()> {
+        // Some very old/minimal databases can legitimately be missing cache
+        // tables. Create their v15 shape first so the additive migration is
+        // safe without ever rebuilding portfolio data.
+        self.connection.execute_batch(
+            "BEGIN IMMEDIATE;\n\
+             CREATE TABLE IF NOT EXISTS positions (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n\
+                 code TEXT NOT NULL COLLATE NOCASE,\n\
+                 exchange TEXT NOT NULL COLLATE NOCASE,\n\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE,\n\
+                 name TEXT NOT NULL,\n\
+                 shares REAL NOT NULL CHECK (shares > 0),\n\
+                 average_cost REAL NOT NULL CHECK (average_cost >= 0),\n\
+                 currency TEXT NOT NULL,\n\
+                 last_price REAL,\n\
+                 day_change_percent REAL,\n\
+                 quote_updated_at INTEGER,\n\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),\n\
+                 UNIQUE(account_id, provider_symbol)\n\
+             );\n\
+             CREATE TABLE IF NOT EXISTS watchlist (\n\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+                 code TEXT NOT NULL COLLATE NOCASE,\n\
+                 exchange TEXT NOT NULL COLLATE NOCASE,\n\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE UNIQUE,\n\
+                 name TEXT NOT NULL,\n\
+                 asset_type TEXT NOT NULL DEFAULT '',\n\
+                 currency TEXT NOT NULL,\n\
+                 last_price REAL,\n\
+                 day_change_percent REAL,\n\
+                 quote_updated_at INTEGER,\n\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())\n\
+             );\n\
+             ALTER TABLE positions ADD COLUMN quote_market_state TEXT;\n\
+             ALTER TABLE positions ADD COLUMN extended_change_percent REAL;\n\
+             ALTER TABLE watchlist ADD COLUMN quote_market_state TEXT;\n\
+             ALTER TABLE watchlist ADD COLUMN extended_change_percent REAL;\n\
+             PRAGMA user_version = 16;\n\
+             COMMIT;",
+        )?;
         Ok(())
     }
 
@@ -373,7 +428,7 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT p.id, p.account_id, a.name, p.code, p.exchange, p.provider_symbol, p.name, p.shares,\n\
                     p.average_cost, p.currency, p.last_price, p.day_change_percent,\n\
-                    p.quote_updated_at\n\
+                    p.quote_updated_at, p.quote_market_state, p.extended_change_percent\n\
              FROM positions p\n\
              JOIN accounts a ON a.id = p.account_id\n\
              ORDER BY p.code COLLATE NOCASE ASC, a.name COLLATE NOCASE ASC",
@@ -393,6 +448,8 @@ impl Database {
                 last_price: row.get(10)?,
                 day_change_percent: row.get(11)?,
                 quote_updated_at: row.get(12)?,
+                quote_market_state: row.get(13)?,
+                extended_change_percent: row.get(14)?,
             })
         })?;
         rows.collect()
@@ -748,9 +805,11 @@ impl Database {
              DELETE FROM settings WHERE key LIKE 'history-range-return-%';
              DELETE FROM settings WHERE key LIKE 'history-market-offset:%';
              UPDATE positions
-                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL;
+                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL,
+                    quote_market_state = NULL, extended_change_percent = NULL;
              UPDATE watchlist
-                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL;
+                SET last_price = NULL, day_change_percent = NULL, quote_updated_at = NULL,
+                    quote_market_state = NULL, extended_change_percent = NULL;
              COMMIT;",
         )?;
         Ok(())
@@ -762,12 +821,22 @@ impl Database {
         price: f64,
         day_change_percent: Option<f64>,
         timestamp: i64,
+        market_state: Option<&str>,
+        extended_change_percent: Option<f64>,
     ) -> Result<()> {
         self.connection.execute(
             "UPDATE positions\n\
-             SET last_price = ?2, day_change_percent = ?3, quote_updated_at = ?4\n\
+             SET last_price = ?2, day_change_percent = ?3, quote_updated_at = ?4,\n\
+                 quote_market_state = ?5, extended_change_percent = ?6\n\
              WHERE id = ?1",
-            params![position_id, price, day_change_percent, timestamp],
+            params![
+                position_id,
+                price,
+                day_change_percent,
+                timestamp,
+                market_state,
+                extended_change_percent
+            ],
         )?;
         Ok(())
     }
@@ -1497,7 +1566,8 @@ impl Database {
     pub fn load_watchlist(&self) -> Result<Vec<WatchlistItem>> {
         let mut statement = self.connection.prepare(
             "SELECT id, code, exchange, provider_symbol, name, asset_type, currency,\n\
-                    last_price, day_change_percent, quote_updated_at\n\
+                    last_price, day_change_percent, quote_updated_at, quote_market_state,\n\
+                    extended_change_percent\n\
              FROM watchlist\n\
              ORDER BY code COLLATE NOCASE ASC",
         )?;
@@ -1513,6 +1583,8 @@ impl Database {
                 last_price: row.get(7)?,
                 day_change_percent: row.get(8)?,
                 quote_updated_at: row.get(9)?,
+                quote_market_state: row.get(10)?,
+                extended_change_percent: row.get(11)?,
             })
         })?;
         rows.collect()
@@ -1557,12 +1629,22 @@ impl Database {
         price: f64,
         day_change_percent: Option<f64>,
         timestamp: i64,
+        market_state: Option<&str>,
+        extended_change_percent: Option<f64>,
     ) -> Result<()> {
         self.connection.execute(
             "UPDATE watchlist\n\
-             SET last_price = ?2, day_change_percent = ?3, quote_updated_at = ?4\n\
+             SET last_price = ?2, day_change_percent = ?3, quote_updated_at = ?4,\n\
+                 quote_market_state = ?5, extended_change_percent = ?6\n\
              WHERE id = ?1",
-            params![item_id, price, day_change_percent, timestamp],
+            params![
+                item_id,
+                price,
+                day_change_percent,
+                timestamp,
+                market_state,
+                extended_change_percent
+            ],
         )?;
         Ok(())
     }

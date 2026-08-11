@@ -397,6 +397,7 @@ struct DetailRefs {
     chart: PriceChart,
     current_price: Label,
     day_change: Label,
+    extended_change: Label,
     quote_status: Label,
     market_value: Label,
     total_gain: Label,
@@ -426,6 +427,7 @@ struct WatchDetailRefs {
     chart: PriceChart,
     current_price: Label,
     day_change: Label,
+    extended_change: Label,
     quote_status: Label,
     quote_refresh_box: GtkBox,
     quote_refresh_spinner: Spinner,
@@ -4541,7 +4543,17 @@ fn rebuild_watchlist_list(refs: &UiRefs, items: &[WatchlistItem]) {
             set_gain_class(&label, change);
             details.append(&label);
         }
-        details.append(&quote_health_label(item.last_price, item.quote_updated_at));
+        if let Some(label) = extended_session_change_label(
+            item.quote_market_state.as_deref(),
+            item.extended_change_percent,
+        ) {
+            details.append(&label);
+        }
+        details.append(&quote_health_label(
+            item.last_price,
+            item.quote_updated_at,
+            item.quote_market_state.as_deref(),
+        ));
         content.append(&details);
 
         let sparkline = Sparkline::new();
@@ -4571,7 +4583,11 @@ fn clear_list(list: &ListBox) {
 }
 
 
-fn quote_health_text(last_price: Option<f64>, quote_updated_at: Option<i64>) -> String {
+fn quote_health_text(
+    last_price: Option<f64>,
+    quote_updated_at: Option<i64>,
+    market_state: Option<&str>,
+) -> String {
     let Some(_) = last_price else {
         return "Quote unavailable".into();
     };
@@ -4579,28 +4595,77 @@ fn quote_health_text(last_price: Option<f64>, quote_updated_at: Option<i64>) -> 
         return "Cached quote · time unknown".into();
     };
     let now = current_unix_timestamp();
-    let state = market_data::quote_state_label(None, updated_at, now);
+    let state = market_data::quote_state_label(market_state, updated_at, now);
     format!("{} · {}", state, relative_time(updated_at))
 }
 
 fn quote_health_css_class(text: &str) -> &'static str {
-    if text.starts_with("Live") || text.starts_with("Current") {
-        "success"
-    } else if text.starts_with("Stale") || text.starts_with("Network") || text.starts_with("Quote unavailable") {
+    if text.starts_with("Stale")
+        || text.starts_with("Network")
+        || text.starts_with("Quote unavailable")
+    {
         "warning"
     } else {
+        // Price freshness/session text is informational, not a gain indicator.
         "dim-label"
     }
 }
 
-fn quote_health_label(last_price: Option<f64>, quote_updated_at: Option<i64>) -> Label {
-    let text = quote_health_text(last_price, quote_updated_at);
-    let label = Label::builder()
+fn quote_health_label(
+    last_price: Option<f64>,
+    quote_updated_at: Option<i64>,
+    market_state: Option<&str>,
+) -> Label {
+    let text = quote_health_text(last_price, quote_updated_at, market_state);
+    Label::builder()
         .label(&text)
         .halign(Align::Start)
         .css_classes(["caption", quote_health_css_class(&text)])
+        .build()
+}
+
+fn extended_session_change_text(
+    market_state: Option<&str>,
+    change: Option<f64>,
+) -> Option<String> {
+    let change = change.filter(|value| value.is_finite())?;
+    let suffix = match market_state.unwrap_or("").to_ascii_uppercase().as_str() {
+        "PRE" | "PREPRE" => "pre-market",
+        "POST" | "POSTPOST" => "after hours",
+        _ => return None,
+    };
+    Some(format!("{change:+.2}% {suffix}"))
+}
+
+fn extended_session_change_label(
+    market_state: Option<&str>,
+    change: Option<f64>,
+) -> Option<Label> {
+    let text = extended_session_change_text(market_state, change)?;
+    let label = Label::builder()
+        .label(&text)
+        .halign(Align::Start)
+        .css_classes(["caption"])
         .build();
-    label
+    set_gain_class(&label, change.unwrap_or(0.0));
+    Some(label)
+}
+
+fn update_extended_session_change_label(
+    label: &Label,
+    market_state: Option<&str>,
+    change: Option<f64>,
+) {
+    label.remove_css_class("dim-label");
+    if let Some(text) = extended_session_change_text(market_state, change) {
+        label.set_label(&text);
+        label.set_visible(true);
+        set_gain_class(label, change.unwrap_or(0.0));
+    } else {
+        label.set_label("");
+        label.set_visible(false);
+        set_gain_class(label, 0.0);
+    }
 }
 
 fn set_quote_status(label: &Label, text: &str) {
@@ -4721,7 +4786,18 @@ fn position_row(
         details.append(&day);
     }
 
-    details.append(&quote_health_label(position.last_price, position.quote_updated_at));
+    if let Some(label) = extended_session_change_label(
+        position.quote_market_state.as_deref(),
+        position.extended_change_percent,
+    ) {
+        details.append(&label);
+    }
+
+    details.append(&quote_health_label(
+        position.last_price,
+        position.quote_updated_at,
+        position.quote_market_state.as_deref(),
+    ));
 
     if position.currency != base {
         if let Some(native_value) = position.market_value() {
@@ -6939,6 +7015,12 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     } else {
         day_change.add_css_class("dim-label");
     }
+    let extended_change = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .visible(false)
+        .css_classes(["caption"])
+        .build();
     let quote_status = Label::builder()
         .label(if asset.market_price.is_some() { "Search result price" } else { "Quote unavailable" })
         .halign(Align::Start)
@@ -6988,6 +7070,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     );
     hero_text.append(&current_price);
     hero_text.append(&day_change);
+    hero_text.append(&extended_change);
     hero_text.append(&quote_status);
     hero_text.append(&quote_refresh_box);
     hero.append(&hero_text);
@@ -7132,6 +7215,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         chart,
         current_price,
         day_change,
+        extended_change,
         quote_status,
         quote_refresh_box,
         quote_refresh_spinner,
@@ -7244,6 +7328,8 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                         quote.close,
                         quote.change_percent,
                         quote.timestamp,
+                        quote.market_state.as_deref(),
+                        quote.extended_change_percent,
                     );
                 }
                 for position in detail
@@ -7264,6 +7350,8 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                         quote.close,
                         quote.change_percent,
                         quote.timestamp,
+                        quote.market_state.as_deref(),
+                        quote.extended_change_percent,
                     );
                 }
                 let price_text = format_currency(quote.close, &detail.currency);
@@ -7274,6 +7362,8 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                 );
                 let status_text = format!("{} · {}", quote_state, relative_time(quote.timestamp));
                 let change = quote.change_percent;
+                let market_state = quote.market_state.clone();
+                let extended_change = quote.extended_change_percent;
                 let update_day = detail.active_range.get() == HistoryRange::OneDay;
                 let day_text = if update_day {
                     Some(match change {
@@ -7294,6 +7384,11 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                 crossfade_loaded_labels(targets, move || {
                     detail_for_text.current_price.set_label(&price_text);
                     set_quote_status(&detail_for_text.quote_status, &status_text);
+                    update_extended_session_change_label(
+                        &detail_for_text.extended_change,
+                        market_state.as_deref(),
+                        extended_change,
+                    );
                     if update_day {
                         detail_for_text.day_change.remove_css_class("dim-label");
                         match change {
@@ -7482,17 +7577,17 @@ fn load_watch_history_range(
                     &history,
                 );
                 if load.range == HistoryRange::OneDay {
-                    if let (Some(price), Some(day_change)) =
-                        (history.current_price, history.day_change_percent)
-                    {
+                    if let Some(price) = history.current_price {
                         if let Some(item_id) =
                             watchlist_item_id_for_symbol(&detail.app, &detail.provider_symbol)
                         {
                             let _ = detail.app.state.database.update_watchlist_quote(
                                 item_id,
                                 price,
-                                Some(day_change),
+                                history.day_change_percent,
                                 history.quote_timestamp,
+                                history.market_state.as_deref(),
+                                history.extended_change_percent,
                             );
                         }
                     }
@@ -7525,9 +7620,31 @@ fn load_watch_history_range(
                         true,
                     );
                     if let Some(price) = history.current_price {
-                        crossfade_loaded_label(
-                            &detail.current_price,
-                            format_currency(price, &detail.currency),
+                        let price_text = format_currency(price, &detail.currency);
+                        let quote_state = market_data::quote_state_label(
+                            history.market_state.as_deref(),
+                            history.quote_timestamp,
+                            current_unix_timestamp(),
+                        );
+                        let status_text =
+                            format!("{} · {}", quote_state, relative_time(history.quote_timestamp));
+                        let detail_for_quote = detail.clone();
+                        let market_state = history.market_state.clone();
+                        let extended_change = history.extended_change_percent;
+                        crossfade_loaded_labels(
+                            vec![
+                                (detail.current_price.clone(), price_text.clone()),
+                                (detail.quote_status.clone(), status_text.clone()),
+                            ],
+                            move || {
+                                detail_for_quote.current_price.set_label(&price_text);
+                                set_quote_status(&detail_for_quote.quote_status, &status_text);
+                                update_extended_session_change_label(
+                                    &detail_for_quote.extended_change,
+                                    market_state.as_deref(),
+                                    extended_change,
+                                );
+                            },
                         );
                     }
                     crossfade_loaded_label(&detail.history_status, "Updated just now");
@@ -8077,7 +8194,22 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     } else {
         day_change.add_css_class("dim-label");
     }
-    let quote_status = quote_health_label(position.last_price, position.quote_updated_at);
+    let extended_change = Label::builder()
+        .label("")
+        .halign(Align::Start)
+        .visible(false)
+        .css_classes(["caption"])
+        .build();
+    update_extended_session_change_label(
+        &extended_change,
+        position.quote_market_state.as_deref(),
+        position.extended_change_percent,
+    );
+    let quote_status = quote_health_label(
+        position.last_price,
+        position.quote_updated_at,
+        position.quote_market_state.as_deref(),
+    );
 
     let hero = GtkBox::builder()
         .orientation(Orientation::Horizontal)
@@ -8107,6 +8239,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     );
     hero_text.append(&current_price);
     hero_text.append(&day_change);
+    hero_text.append(&extended_change);
     hero_text.append(&quote_status);
     hero.append(&hero_text);
 
@@ -8358,6 +8491,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         chart,
         current_price,
         day_change,
+        extended_change,
         quote_status,
         market_value,
         total_gain,
@@ -8829,14 +8963,14 @@ fn load_history_range(
                     &history,
                 );
                 if load.range == HistoryRange::OneDay {
-                    if let (Some(price), Some(day_change)) =
-                        (history.current_price, history.day_change_percent)
-                    {
+                    if let Some(price) = history.current_price {
                         let _ = detail.app.state.database.update_quote(
                             detail.position_id,
                             price,
-                            Some(day_change),
+                            history.day_change_percent,
                             history.quote_timestamp,
+                            history.market_state.as_deref(),
+                            history.extended_change_percent,
                         );
                     }
                 }
@@ -8955,10 +9089,16 @@ fn update_detail_quote(detail: &DetailRefs, history: &History, animate: bool) {
         return;
     };
     let price_text = format_currency(price, &detail.currency);
-    let state = market_data::quote_state_label(None, history.quote_timestamp, current_unix_timestamp());
+    let state = market_data::quote_state_label(
+        history.market_state.as_deref(),
+        history.quote_timestamp,
+        current_unix_timestamp(),
+    );
     let status_text = format!("{} · {}", state, relative_time(history.quote_timestamp));
     let update_day = detail.active_range.get() == HistoryRange::OneDay;
     let change = history.day_change_percent;
+    let market_state = history.market_state.clone();
+    let extended_change = history.extended_change_percent;
     let mut targets = vec![
         (detail.current_price.clone(), price_text.clone()),
         (detail.quote_status.clone(), status_text.clone()),
@@ -8975,6 +9115,11 @@ fn update_detail_quote(detail: &DetailRefs, history: &History, animate: bool) {
         move || {
             detail.current_price.set_label(&price_text);
             set_quote_status(&detail.quote_status, &status_text);
+            update_extended_session_change_label(
+                &detail.extended_change,
+                market_state.as_deref(),
+                extended_change,
+            );
             if update_day {
                 detail.day_change.remove_css_class("dim-label");
                 match change {
@@ -11213,6 +11358,8 @@ fn present_add_activity_dialog_with_context(
                                 market_price,
                                 asset.change_percent,
                                 current_unix_timestamp(),
+                                None,
+                                None,
                             );
                         }
 
@@ -12867,6 +13014,8 @@ fn refresh_watchlist_async(refs: UiRefs, items: Vec<WatchlistItem>, announce: bo
                     price,
                     history.day_change_percent,
                     history.quote_timestamp,
+                    history.market_state.as_deref(),
+                    history.extended_change_percent,
                 );
             }
         }
@@ -12968,6 +13117,8 @@ fn refresh_market_async(
                     quote.close,
                     quote.change_percent,
                     quote.timestamp,
+                    quote.market_state.as_deref(),
+                    quote.extended_change_percent,
                 );
             }
         }

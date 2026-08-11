@@ -20,9 +20,20 @@ pub struct SearchResult {
 
 #[derive(Clone, Debug)]
 pub struct Quote {
+    /// Timestamp for the price currently shown by Aureus. During supported
+    /// extended sessions this is the pre-/post-market timestamp.
     pub timestamp: i64,
+    /// Price currently shown by Aureus. This is the active pre-/regular/post
+    /// session price when Yahoo exposes one for the security.
     pub close: f64,
+    /// Latest regular-session price and timestamp. Range returns stay anchored
+    /// to regular trading even when the headline price is in an extended session.
+    pub regular_timestamp: i64,
+    pub regular_close: f64,
+    /// Provider-authoritative regular-session change for the trading day.
     pub change_percent: Option<f64>,
+    /// Extended-session move relative to the regular close when PRE/POST is active.
+    pub extended_change_percent: Option<f64>,
     pub market_state: Option<String>,
 }
 
@@ -235,8 +246,11 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 pub struct History {
     pub points: Vec<PricePoint>,
     pub currency: Option<String>,
+    /// Active-session headline price (pre-/regular/post when available).
     pub current_price: Option<f64>,
     pub quote_timestamp: i64,
+    pub market_state: Option<String>,
+    pub extended_change_percent: Option<f64>,
     /// Provider-authoritative regular-session change for the current trading day.
     pub day_change_percent: Option<f64>,
     /// Provider-authoritative change for the requested chart range. This is
@@ -400,7 +414,7 @@ pub fn quote_state_label(market_state: Option<&str>, timestamp: i64, now: i64) -
     let age = now.saturating_sub(timestamp);
     match market_state.unwrap_or("").to_ascii_uppercase().as_str() {
         "REGULAR" | "OPEN" => "Live price".into(),
-        "PRE" => "Pre-market price".into(),
+        "PRE" | "PREPRE" => "Pre-market price".into(),
         "POST" | "POSTPOST" => "After-hours price".into(),
         "CLOSED" => "Market closed".into(),
         _ if age <= 20 * 60 => "Current price".into(),

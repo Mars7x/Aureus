@@ -58,6 +58,8 @@ pub struct WatchlistItem {
     pub last_price: Option<f64>,
     pub day_change_percent: Option<f64>,
     pub quote_updated_at: Option<i64>,
+    pub quote_market_state: Option<String>,
+    pub extended_change_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +136,8 @@ pub struct Position {
     pub last_price: Option<f64>,
     pub day_change_percent: Option<f64>,
     pub quote_updated_at: Option<i64>,
+    pub quote_market_state: Option<String>,
+    pub extended_change_percent: Option<f64>,
 }
 
 impl Position {
@@ -207,6 +211,8 @@ mod tests {
             last_price: Some(25.0),
             day_change_percent: None,
             quote_updated_at: None,
+            quote_market_state: None,
+            extended_change_percent: None,
         }
     }
 
