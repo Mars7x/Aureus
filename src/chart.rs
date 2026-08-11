@@ -86,24 +86,6 @@ impl PriceChart {
         &self.stack
     }
 
-    pub fn set_points_with_market_offset(
-        &self,
-        points: Vec<PricePoint>,
-        currency: &str,
-        range: HistoryRange,
-        trend_override: Option<f64>,
-        exchange_gmt_offset: i32,
-    ) {
-        self.set_points_internal(
-            points,
-            currency,
-            range,
-            trend_override,
-            exchange_gmt_offset,
-            None,
-        );
-    }
-
     pub fn set_points_with_market_session(
         &self,
         points: Vec<PricePoint>,
