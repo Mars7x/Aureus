@@ -16,6 +16,10 @@ const QUOTE_URL: &str = "https://query1.finance.yahoo.com/v7/finance/quote";
 const QUOTE_SUMMARY_URL: &str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary";
 const YAHOO_COOKIE_URL: &str = "https://fc.yahoo.com";
 const YAHOO_CRUMB_URL: &str = "https://query1.finance.yahoo.com/v1/test/getcrumb";
+const MAX_CLOCK_SKEW_SECONDS: i64 = 10 * 60;
+const MAX_EVENT_FUTURE_SECONDS: i64 = 3 * 366 * 24 * 60 * 60;
+const MIN_MARKET_TIMESTAMP: i64 = -2_208_988_800; // 1900-01-01 UTC
+const CRUMB_CACHE_SECONDS: i64 = 30 * 60;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct YfinanceProvider;
@@ -55,11 +59,12 @@ fn yahoo_interval(range: HistoryRange) -> &'static str {
 #[derive(Debug, Deserialize)]
 struct YahooSearchResponse {
     #[serde(default)]
-    quotes: Vec<YahooSearchQuote>,
+    quotes: Option<Vec<YahooSearchQuote>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct YahooSearchQuote {
+    #[serde(default)]
     symbol: String,
     #[serde(default)]
     exchange: String,
@@ -102,6 +107,7 @@ struct YahooChartError {
 
 #[derive(Debug, Deserialize)]
 struct YahooChartResult {
+    #[serde(default)]
     meta: YahooChartMeta,
     #[serde(default)]
     timestamp: Option<Vec<i64>>,
@@ -111,8 +117,10 @@ struct YahooChartResult {
     events: Option<YahooEvents>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct YahooChartMeta {
+    #[serde(default)]
+    symbol: Option<String>,
     #[serde(default)]
     currency: Option<String>,
     #[serde(default, rename = "regularMarketPrice")]
@@ -138,7 +146,9 @@ struct YahooQuoteSummaryEnvelope {
 #[derive(Debug, Deserialize)]
 struct YahooQuoteSummaryResponse {
     #[serde(default)]
-    result: Vec<YahooQuoteSummaryResult>,
+    result: Option<Vec<YahooQuoteSummaryResult>>,
+    #[serde(default)]
+    error: Option<YahooChartError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,7 +174,9 @@ struct YahooQuoteEnvelope {
 #[derive(Debug, Deserialize)]
 struct YahooQuoteResponse {
     #[serde(default)]
-    result: Vec<YahooQuoteCalendar>,
+    result: Option<Vec<YahooQuoteCalendar>>,
+    #[serde(default)]
+    error: Option<YahooChartError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,14 +195,10 @@ struct YahooQuoteCalendar {
     pre_market_price: Option<f64>,
     #[serde(default, rename = "preMarketTime")]
     pre_market_time: Option<i64>,
-    #[serde(default, rename = "preMarketChangePercent")]
-    pre_market_change_percent: Option<f64>,
     #[serde(default, rename = "postMarketPrice")]
     post_market_price: Option<f64>,
     #[serde(default, rename = "postMarketTime")]
     post_market_time: Option<i64>,
-    #[serde(default, rename = "postMarketChangePercent")]
-    post_market_change_percent: Option<f64>,
     #[serde(default, rename = "marketState")]
     market_state: Option<String>,
     #[serde(default, rename = "exDividendDate")]
@@ -209,13 +217,16 @@ struct YahooEvents {
 
 #[derive(Debug, Deserialize)]
 struct YahooDividend {
-    amount: f64,
-    date: i64,
+    #[serde(default)]
+    amount: Option<f64>,
+    #[serde(default)]
+    date: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct YahooSplit {
-    date: i64,
+    #[serde(default)]
+    date: Option<i64>,
     #[serde(default)]
     numerator: Option<f64>,
     #[serde(default)]
@@ -260,6 +271,88 @@ fn valid_price(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value > 0.0)
 }
 
+fn valid_percent(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn valid_current_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
+    value.filter(|timestamp| {
+        *timestamp > 0 && *timestamp <= now.saturating_add(MAX_CLOCK_SKEW_SECONDS)
+    })
+}
+
+fn valid_market_timestamp(timestamp: i64, now: i64) -> bool {
+    timestamp >= MIN_MARKET_TIMESTAMP
+        && timestamp <= now.saturating_add(MAX_CLOCK_SKEW_SECONDS)
+}
+
+fn valid_event_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
+    value.filter(|timestamp| {
+        *timestamp >= MIN_MARKET_TIMESTAMP
+            && *timestamp <= now.saturating_add(MAX_EVENT_FUTURE_SECONDS)
+    })
+}
+
+fn valid_exchange_gmt_offset(value: Option<i32>) -> Option<i32> {
+    value.filter(|offset| offset.unsigned_abs() <= 18 * 60 * 60)
+}
+
+fn normalized_market_state(value: Option<&str>) -> Option<String> {
+    match value.unwrap_or("").trim().to_ascii_uppercase().as_str() {
+        "REGULAR" | "OPEN" => Some("REGULAR".into()),
+        "PRE" | "PREPRE" => Some("PRE".into()),
+        "POST" | "POSTPOST" => Some("POST".into()),
+        "CLOSED" => Some("CLOSED".into()),
+        _ => None,
+    }
+}
+
+fn regular_only_market_state(value: Option<&str>) -> Option<String> {
+    match normalized_market_state(value).as_deref() {
+        Some("PRE") | Some("POST") => Some("CLOSED".into()),
+        _ => normalized_market_state(value),
+    }
+}
+
+fn symbol_matches(returned: &str, requested: &str) -> bool {
+    !returned.trim().is_empty() && returned.trim().eq_ignore_ascii_case(requested.trim())
+}
+
+fn validate_chart_symbol(meta: &YahooChartMeta, requested: &str) -> Result<(), MarketError> {
+    let returned = meta
+        .symbol
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            MarketError(format!(
+                "Yahoo Finance returned history without a symbol for {requested}"
+            ))
+        })?;
+    if !symbol_matches(returned, requested) {
+        return Err(MarketError(format!(
+            "Yahoo Finance returned data for {returned} while Aureus requested {requested}"
+        )));
+    }
+    Ok(())
+}
+
+fn take_single_chart_result(
+    results: Option<Vec<YahooChartResult>>,
+    requested: &str,
+) -> Result<YahooChartResult, MarketError> {
+    let mut results = results.unwrap_or_default();
+    if results.len() != 1 {
+        return Err(MarketError(format!(
+            "Yahoo Finance returned an unexpected number of history results for {requested}"
+        )));
+    }
+    let result = results.pop().ok_or_else(|| {
+        MarketError(format!("Yahoo Finance returned no history for {requested}"))
+    })?;
+    validate_chart_symbol(&result.meta, requested)?;
+    Ok(result)
+}
+
 fn percent_change(current: Option<f64>, anchor: Option<f64>) -> Option<f64> {
     match (valid_price(current), valid_price(anchor)) {
         (Some(current), Some(anchor)) => Some((current - anchor) / anchor * 100.0),
@@ -269,25 +362,61 @@ fn percent_change(current: Option<f64>, anchor: Option<f64>) -> Option<f64> {
 
 fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, MarketError> {
     let timestamps = result.timestamp.clone().unwrap_or_default();
-    let closes = result
+    let quote_series = result
         .indicators
         .as_ref()
-        .and_then(|indicators| indicators.quote.first())
-        .map(|series| series.close.clone())
-        .unwrap_or_default();
+        .map(|indicators| indicators.quote.as_slice())
+        .unwrap_or(&[]);
 
-    let mut bars = timestamps
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, timestamp)| {
-            let close = closes.get(index).copied().flatten()?;
-            let close = valid_price(Some(close))?;
-            Some(YahooBar { timestamp, close })
-        })
-        .collect::<Vec<_>>();
+    if quote_series.len() != 1 {
+        return Err(MarketError(
+            "Yahoo Finance returned an unexpected price-history structure".into(),
+        ));
+    }
+    let closes = &quote_series[0].close;
+    if closes.len() != timestamps.len() {
+        return Err(MarketError(
+            "Yahoo Finance returned mismatched price-history timestamps and values".into(),
+        ));
+    }
+
+    let now = now_unix();
+    let mut bars = Vec::<YahooBar>::with_capacity(timestamps.len());
+    for (timestamp, close) in timestamps.into_iter().zip(closes.iter().copied()) {
+        // A null close is normal for a timestamp where Yahoo has no trade. A
+        // present-but-invalid price or timestamp is not: fail the refresh so
+        // cached history is preserved instead of silently reshaping the chart.
+        let Some(raw_close) = close else {
+            continue;
+        };
+        let close = valid_price(Some(raw_close)).ok_or_else(|| {
+            MarketError("Yahoo Finance returned an invalid history price".into())
+        })?;
+        if !valid_market_timestamp(timestamp, now) {
+            return Err(MarketError(
+                "Yahoo Finance returned an invalid history timestamp".into(),
+            ));
+        }
+        bars.push(YahooBar { timestamp, close });
+    }
     bars.sort_by_key(|bar| bar.timestamp);
-    bars.dedup_by_key(|bar| bar.timestamp);
-    Ok(bars)
+
+    let mut clean = Vec::<YahooBar>::with_capacity(bars.len());
+    for bar in bars {
+        if let Some(previous) = clean.last() {
+            if previous.timestamp == bar.timestamp {
+                let tolerance = previous.close.abs().max(bar.close.abs()).max(1.0) * 1e-9;
+                if (previous.close - bar.close).abs() > tolerance {
+                    return Err(MarketError(
+                        "Yahoo Finance returned conflicting prices for the same timestamp".into(),
+                    ));
+                }
+                continue;
+            }
+        }
+        clean.push(bar);
+    }
+    Ok(clean)
 }
 
 fn canonical_range_anchor(metadata_anchor: Option<f64>) -> Option<f64> {
@@ -299,61 +428,64 @@ fn canonical_range_anchor(metadata_anchor: Option<f64>) -> Option<f64> {
     valid_price(metadata_anchor)
 }
 
-fn freshest_regular_price(
+fn freshest_regular_snapshot(
     quote: Option<&Quote>,
     chart_price: Option<f64>,
     chart_timestamp: Option<i64>,
-) -> Option<f64> {
-    let chart_price = valid_price(chart_price);
-    let chart_timestamp = chart_timestamp.filter(|value| *value > 0);
+) -> Option<(f64, i64)> {
+    let now = now_unix();
+    let chart = valid_price(chart_price)
+        .zip(valid_current_timestamp(chart_timestamp, now));
+    let quote_snapshot = quote.and_then(|quote| {
+        valid_price(Some(quote.regular_close))
+            .zip(valid_current_timestamp(Some(quote.regular_timestamp), now))
+    });
 
-    match (quote, chart_price, chart_timestamp) {
-        // Extended-session timestamps must never make a PRE/POST price become
-        // the numerator for Yahoo's regular-session range returns. Compare only
-        // the quote's regular snapshot with the chart's regular snapshot.
-        (Some(quote), Some(chart), Some(chart_time))
-            if chart_time > quote.regular_timestamp =>
-        {
-            Some(chart)
-        }
-        (Some(quote), _, _) if quote.regular_timestamp > 0 => {
-            valid_price(Some(quote.regular_close))
-        }
-        (None, chart, _) => chart,
-        (Some(_), chart, _) => chart,
+    match (quote_snapshot, chart) {
+        // Equal timestamps deliberately prefer the dedicated quote response.
+        (Some(quote), Some(chart)) if chart.1 > quote.1 => Some(chart),
+        (Some(quote), _) => Some(quote),
+        (None, chart) => chart,
     }
 }
 
-fn freshest_display_price(
+fn freshest_display_snapshot(
     quote: Option<&Quote>,
     chart_price: Option<f64>,
     chart_timestamp: Option<i64>,
+    chart_market_state: Option<&str>,
 ) -> (Option<f64>, Option<i64>, Option<String>, Option<f64>) {
-    let chart_price = valid_price(chart_price);
-    let chart_timestamp = chart_timestamp.filter(|value| *value > 0);
+    let now = now_unix();
+    let chart = valid_price(chart_price)
+        .zip(valid_current_timestamp(chart_timestamp, now));
+    let quote_snapshot = quote.and_then(|quote| {
+        valid_price(Some(quote.close))
+            .zip(valid_current_timestamp(Some(quote.timestamp), now))
+            .map(|(price, timestamp)| {
+                (
+                    price,
+                    timestamp,
+                    normalized_market_state(quote.market_state.as_deref()),
+                    valid_percent(quote.extended_change_percent),
+                )
+            })
+    });
 
-    match (quote, chart_price, chart_timestamp) {
-        (Some(quote), Some(chart), Some(chart_time)) if chart_time > quote.timestamp => {
-            let state = match quote
-                .market_state
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_uppercase()
-                .as_str()
-            {
-                "PRE" | "PREPRE" | "POST" | "POSTPOST" => Some("CLOSED".into()),
-                _ => quote.market_state.clone(),
-            };
-            (Some(chart), Some(chart_time), state, None)
+    match (quote_snapshot, chart) {
+        (Some(quote), Some((chart_price, chart_time))) if chart_time > quote.1 => {
+            // Chart prices exclude extended hours. If Yahoo's chart state still
+            // says PRE/POST, do not attach that label to a regular-session price.
+            let state = regular_only_market_state(chart_market_state);
+            (Some(chart_price), Some(chart_time), state, None)
         }
-        (Some(quote), _, _) if quote.timestamp > 0 => (
-            valid_price(Some(quote.close)),
-            Some(quote.timestamp),
-            quote.market_state.clone(),
-            quote.extended_change_percent,
-        ),
-        (None, chart, timestamp) => (chart, timestamp, None, None),
-        (Some(_), chart, timestamp) => (chart, timestamp, None, None),
+        (Some((price, timestamp, state, extended)), _) => {
+            (Some(price), Some(timestamp), state, extended)
+        }
+        (None, Some((price, timestamp))) => {
+            let state = regular_only_market_state(chart_market_state);
+            (Some(price), Some(timestamp), state, None)
+        }
+        (None, None) => (None, None, None, None),
     }
 }
 
@@ -375,36 +507,96 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
-fn yahoo_crumb() -> Option<String> {
-    static CRUMB: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    let cache = CRUMB.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock() {
-        if let Some(crumb) = guard.as_ref() {
-            return Some(crumb.clone());
+#[derive(Clone, Debug)]
+struct CachedCrumb {
+    value: String,
+    fetched_at: i64,
+}
+
+fn crumb_cache() -> &'static Mutex<Option<CachedCrumb>> {
+    static CRUMB: OnceLock<Mutex<Option<CachedCrumb>>> = OnceLock::new();
+    CRUMB.get_or_init(|| Mutex::new(None))
+}
+
+fn invalidate_yahoo_crumb() {
+    if let Ok(mut guard) = crumb_cache().lock() {
+        *guard = None;
+    }
+}
+
+fn valid_crumb_text(value: &str) -> bool {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.contains('<')
+        && !lower.contains("too many requests")
+        && !lower.contains("rate limit")
+}
+
+fn rate_limit_error() -> MarketError {
+    MarketError(
+        "Yahoo Finance is temporarily rate-limiting requests. Cached prices are still available; try refreshing again in a few minutes.".into(),
+    )
+}
+
+fn is_rate_limit_error(error: &MarketError) -> bool {
+    let lower = error.0.to_ascii_lowercase();
+    lower.contains("rate-limiting")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+}
+
+fn yahoo_crumb() -> Result<Option<String>, MarketError> {
+    let now = now_unix();
+    if let Ok(guard) = crumb_cache().lock() {
+        if let Some(cached) = guard.as_ref() {
+            if now.saturating_sub(cached.fetched_at) <= CRUMB_CACHE_SECONDS
+                && valid_crumb_text(&cached.value)
+            {
+                return Ok(Some(cached.value.clone()));
+            }
         }
     }
 
-    // Yahoo quote-summary requests currently expect an anonymous Yahoo cookie
-    // plus a crumb. With ureq's cookie feature the shared Agent retains the
-    // cookie received from fc.yahoo.com for the subsequent crumb and summary
-    // requests, matching the basic request flow used by yfinance.
+    // Yahoo's v7 quote and quote-summary endpoints use a crumb associated with
+    // the Agent's Yahoo cookie. Never let a 429/error page become a cached crumb.
     let _ = agent().get(YAHOO_COOKIE_URL).call();
-    let mut response = agent()
+    let mut response = match agent()
         .get(YAHOO_CRUMB_URL)
         .header("Accept", "text/plain")
         .call()
-        .ok()?;
-    let crumb = response.body_mut().read_to_string().ok()?;
+    {
+        Ok(response) => response,
+        Err(error) if matches!(&error, ureq::Error::StatusCode(429)) => {
+            return Err(rate_limit_error());
+        }
+        Err(_) => return Ok(None),
+    };
+    let crumb = match response.body_mut().read_to_string() {
+        Ok(crumb) => crumb,
+        Err(_) => return Ok(None),
+    };
     let crumb = crumb.trim();
-    if crumb.is_empty() || crumb.contains('<') || crumb.eq_ignore_ascii_case("Too Many Requests") {
-        return None;
+    let lower = crumb.to_ascii_lowercase();
+    if lower.contains("too many requests") || lower.contains("rate limit") {
+        invalidate_yahoo_crumb();
+        return Err(rate_limit_error());
+    }
+    if !valid_crumb_text(crumb) {
+        invalidate_yahoo_crumb();
+        return Ok(None);
     }
 
     let crumb = crumb.to_string();
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(crumb.clone());
+    if let Ok(mut guard) = crumb_cache().lock() {
+        *guard = Some(CachedCrumb {
+            value: crumb.clone(),
+            fetched_at: now,
+        });
     }
-    Some(crumb)
+    Ok(Some(crumb))
 }
 
 fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, MarketError> {
@@ -414,16 +606,92 @@ fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, MarketError> {
         .call()
         .map_err(|error| {
             if matches!(&error, ureq::Error::StatusCode(429)) {
-                MarketError("Yahoo Finance is temporarily rate-limiting requests. Cached prices are still available; try refreshing again in a few minutes.".into())
+                rate_limit_error()
             } else {
                 MarketError(format!("Yahoo Finance request failed: {error}"))
             }
         })?;
 
-    response
+    // Parse through text first so HTTP-200 rate-limit/HTML/error pages cannot be
+    // mistaken for a valid API response. yfinance has had to guard against the
+    // same class of malformed and rate-limit responses.
+    let body = response
         .body_mut()
-        .read_json::<T>()
+        .read_to_string()
+        .map_err(|error| MarketError(format!("Could not read Yahoo Finance response: {error}")))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(MarketError("Yahoo Finance returned an empty response".into()));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("too many requests") || lower.contains("rate limit") {
+        return Err(rate_limit_error());
+    }
+    if trimmed.starts_with('<') || lower.contains("will be right back") {
+        return Err(MarketError(
+            "Yahoo Finance returned a non-data response; cached values are still available".into(),
+        ));
+    }
+
+    serde_json::from_str::<T>(trimmed)
         .map_err(|error| MarketError(format!("Could not read Yahoo Finance response: {error}")))
+}
+
+fn crumb_auth_error(error: &MarketError) -> bool {
+    let lower = error.0.to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid crumb")
+}
+
+fn quote_response_error(symbol: &str, error: &YahooChartError) -> MarketError {
+    let detail = if error.description.trim().is_empty() {
+        error.code.clone()
+    } else {
+        error.description.clone()
+    };
+    MarketError(format!("Yahoo Finance quote request failed for {symbol}: {detail}"))
+}
+
+fn authenticated_quote_response(symbol: &str) -> Result<YahooQuoteEnvelope, MarketError> {
+    let encoded = urlencoding::encode(symbol);
+    let mut last_auth_error = None;
+
+    for attempt in 0..2 {
+        let crumb = yahoo_crumb()?;
+        let had_crumb = crumb.is_some();
+        let mut url = format!("{QUOTE_URL}?symbols={encoded}&formatted=false");
+        if let Some(crumb) = crumb.as_deref() {
+            url.push_str("&crumb=");
+            url.push_str(&urlencoding::encode(crumb));
+        }
+
+        match get_json::<YahooQuoteEnvelope>(&url) {
+            Ok(response) => {
+                if let Some(error) = response.quote_response.error.as_ref() {
+                    let error = quote_response_error(symbol, error);
+                    if attempt == 0 && had_crumb && crumb_auth_error(&error) {
+                        invalidate_yahoo_crumb();
+                        last_auth_error = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+                return Ok(response);
+            }
+            Err(error) if attempt == 0 && had_crumb && crumb_auth_error(&error) => {
+                invalidate_yahoo_crumb();
+                last_auth_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_auth_error.unwrap_or_else(|| {
+        MarketError(format!("Yahoo Finance could not authenticate a quote request for {symbol}"))
+    }))
 }
 
 fn search_impl(query: &str) -> Result<Vec<SearchResult>, MarketError> {
@@ -439,7 +707,7 @@ fn search_impl(query: &str) -> Result<Vec<SearchResult>, MarketError> {
     let response: YahooSearchResponse = get_json(&url)?;
 
     let mut results = Vec::new();
-    for quote in response.quotes {
+    for quote in response.quotes.unwrap_or_default() {
         if !supported_quote_type(&quote.quote_type) || quote.symbol.trim().is_empty() {
             continue;
         }
@@ -469,12 +737,18 @@ fn search_impl(query: &str) -> Result<Vec<SearchResult>, MarketError> {
             name,
             asset_type,
             currency,
-            market_price: quote.regular_market_price,
-            change_percent: quote.regular_market_change_percent,
+            market_price: valid_price(quote.regular_market_price),
+            change_percent: valid_percent(quote.regular_market_change_percent),
         });
     }
 
     Ok(results)
+}
+
+fn same_exchange_day(left: i64, right: i64, gmt_offset: Option<i32>) -> bool {
+    let offset = i64::from(valid_exchange_gmt_offset(gmt_offset).unwrap_or(0));
+    left.saturating_add(offset).div_euclid(86_400)
+        == right.saturating_add(offset).div_euclid(86_400)
 }
 
 fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
@@ -484,82 +758,59 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     }
 
     let encoded = urlencoding::encode(symbol);
+    let now = now_unix();
 
     // Prefer Yahoo's dedicated quote response for the current market snapshot.
-    // Yahoo exposes exchange-aware marketState plus separate pre/regular/post
-    // prices. Let that state select the headline price instead of hard-coding
-    // exchange hours in Aureus.
-    let quote_url = format!("{QUOTE_URL}?symbols={encoded}");
-    if let Ok(response) = get_json::<YahooQuoteEnvelope>(&quote_url) {
-        if let Some(quote) = response
-            .quote_response
-            .result
-            .into_iter()
-            .find(|quote| quote.symbol.is_empty() || quote.symbol.eq_ignore_ascii_case(symbol))
-        {
-            if let Some(regular_close) = valid_price(quote.regular_market_price) {
-                let regular_timestamp = quote
-                    .regular_market_time
-                    .filter(|value| *value > 0)
-                    .unwrap_or(0);
-                let regular_change = percent_change(
-                    Some(regular_close),
-                    quote.regular_market_previous_close,
-                )
-                .or_else(|| {
-                    quote
-                        .regular_market_change_percent
-                        .filter(|value| value.is_finite())
-                });
+    // The v7 endpoint is crumb-authenticated; the helper retries once on an
+    // expired crumb but never amplifies a rate-limit response.
+    match authenticated_quote_response(symbol) {
+        Ok(response) => {
+            let mut quotes = response.quote_response.result.unwrap_or_default();
+            if quotes.len() == 1 && symbol_matches(&quotes[0].symbol, symbol) {
+                let quote = quotes.remove(0);
+                if let Some((regular_close, regular_timestamp)) = valid_price(quote.regular_market_price)
+                    .zip(valid_current_timestamp(quote.regular_market_time, now))
+                {
+                    let regular_change = percent_change(
+                        Some(regular_close),
+                        quote.regular_market_previous_close,
+                    )
+                    .or_else(|| valid_percent(quote.regular_market_change_percent));
+                    let state = normalized_market_state(quote.market_state.as_deref());
 
-                let state = quote
-                    .market_state
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_ascii_uppercase();
+                    let extended = match state.as_deref() {
+                        Some("PRE") => valid_price(quote.pre_market_price)
+                            .zip(valid_current_timestamp(quote.pre_market_time, now))
+                            .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                        Some("POST") => valid_price(quote.post_market_price)
+                            .zip(valid_current_timestamp(quote.post_market_time, now))
+                            .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                        _ => None,
+                    };
 
-                let extended = match state.as_str() {
-                    "PRE" | "PREPRE" => valid_price(quote.pre_market_price)
-                        .zip(quote.pre_market_time.filter(|value| *value > 0 && (regular_timestamp == 0 || *value > regular_timestamp)))
-                        .map(|(price, timestamp)| {
-                            let change = quote
-                                .pre_market_change_percent
-                                .filter(|value| value.is_finite())
-                                .or_else(|| percent_change(Some(price), Some(regular_close)));
-                            (price, timestamp, change)
-                        }),
-                    "POST" | "POSTPOST" => valid_price(quote.post_market_price)
-                        .zip(quote.post_market_time.filter(|value| *value > 0 && (regular_timestamp == 0 || *value > regular_timestamp)))
-                        .map(|(price, timestamp)| {
-                            let change = quote
-                                .post_market_change_percent
-                                .filter(|value| value.is_finite())
-                                .or_else(|| percent_change(Some(price), Some(regular_close)));
-                            (price, timestamp, change)
-                        }),
-                    _ => None,
-                };
+                    if let Some((close, timestamp)) = extended {
+                        // Derive the extended-hours move from the two prices in
+                        // this same quote response. This avoids trusting a second
+                        // percentage field whose semantics could drift.
+                        let extended_change_percent =
+                            percent_change(Some(close), Some(regular_close));
+                        return Ok(Quote {
+                            timestamp,
+                            close,
+                            regular_timestamp,
+                            regular_close,
+                            change_percent: regular_change,
+                            extended_change_percent,
+                            market_state: state,
+                        });
+                    }
 
-                if let Some((close, timestamp, extended_change_percent)) = extended {
-                    return Ok(Quote {
-                        timestamp,
-                        close,
-                        regular_timestamp,
-                        regular_close,
-                        change_percent: regular_change,
-                        extended_change_percent,
-                        market_state: quote.market_state,
-                    });
-                }
-
-                // If Yahoo says PRE/POST but does not provide a usable
-                // extended-session snapshot, keep showing the regular close and
-                // label that displayed price as closed rather than pretending the
-                // regular close is an extended-hours trade.
-                if regular_timestamp > 0 {
-                    let display_state = match state.as_str() {
-                        "PRE" | "PREPRE" | "POST" | "POSTPOST" => Some("CLOSED".into()),
-                        _ => quote.market_state,
+                    // If Yahoo advertises PRE/POST without a usable extended
+                    // price+timestamp pair, never label the regular close as an
+                    // extended-hours trade.
+                    let display_state = match state.as_deref() {
+                        Some("PRE") | Some("POST") => Some("CLOSED".into()),
+                        _ => state,
                     };
                     return Ok(Quote {
                         timestamp: regular_timestamp,
@@ -573,14 +824,13 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
                 }
             }
         }
+        Err(error) if is_rate_limit_error(&error) => return Err(error),
+        Err(_) => {}
     }
 
-    // If the dedicated quote response is unavailable, fall back to daily
-    // chart bars from one coherent response rather than mixing in search-cache
-    // data that may be on a different refresh cadence.
-
-    // Use adjacent daily bars
-    // only; never use chart-window previousClose as the daily anchor.
+    // If the dedicated quote response is unavailable or malformed, fall back to
+    // one coherent 5-day daily chart response. Do not mix an untimestamped meta
+    // price with a bar timestamp; choose the freshest complete snapshot instead.
     let url = format!(
         "{CHART_URL}/{encoded}?range=5d&interval=1d&includePrePost=false&events=div%2Csplits%2CcapitalGains"
     );
@@ -595,53 +845,36 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
         return Err(MarketError(format!("Yahoo Finance could not load {symbol}: {detail}")));
     }
 
-    let result = envelope
-        .chart
-        .result
-        .and_then(|mut items| items.drain(..).next())
-        .ok_or_else(|| MarketError(format!("Yahoo Finance returned no quote for {symbol}")))?;
+    let result = take_single_chart_result(envelope.chart.result, symbol)?;
+    let bars = yahoo_bars_from_result(&result)?;
 
-    let closes = result
-        .indicators
-        .as_ref()
-        .and_then(|indicators| indicators.quote.first())
-        .map(|series| {
-            series
-                .close
-                .iter()
-                .filter_map(|value| *value)
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let close = result
-        .meta
-        .regular_market_price
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .or_else(|| closes.last().copied())
-        .ok_or_else(|| MarketError(format!("Yahoo Finance returned no usable price for {symbol}")))?;
-
-    let previous_close = if closes.len() >= 2 {
-        closes.get(closes.len() - 2).copied()
-    } else {
-        result
-            .meta
-            .previous_close
-            .filter(|value| value.is_finite() && *value > 0.0)
+    let meta_snapshot = valid_price(result.meta.regular_market_price)
+        .zip(valid_current_timestamp(result.meta.regular_market_time, now));
+    let bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
+    let (close, timestamp) = match (meta_snapshot, bar_snapshot) {
+        (Some(meta), Some(bar)) if meta.1 >= bar.1 => meta,
+        (Some(meta), None) => meta,
+        (_, Some(bar)) => bar,
+        (None, None) => {
+            return Err(MarketError(format!(
+                "Yahoo Finance returned no usable price snapshot for {symbol}"
+            )))
+        }
     };
 
-    let change_percent = previous_close.map(|previous| (close - previous) / previous * 100.0);
-    let timestamp = result
-        .meta
-        .regular_market_time
-        .or_else(|| result.timestamp.as_ref().and_then(|items| items.last().copied()))
-        .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            MarketError(format!(
-                "Yahoo Finance returned a price without a usable market timestamp for {symbol}"
-            ))
-        })?;
+    // `previousClose` is the semantic daily anchor. If Yahoo omits it, derive
+    // the anchor from daily bars, taking care not to skip an extra session when
+    // the meta snapshot is newer than the chart's final daily bar.
+    let previous_close = valid_price(result.meta.previous_close).or_else(|| {
+        let last = bars.last()?;
+        if same_exchange_day(timestamp, last.timestamp, result.meta.gmtoffset) {
+            bars.get(bars.len().checked_sub(2)?).map(|bar| bar.close)
+        } else {
+            Some(last.close)
+        }
+    });
+    let change_percent = percent_change(Some(close), previous_close);
+    let market_state = regular_only_market_state(result.meta.market_state.as_deref());
 
     Ok(Quote {
         timestamp,
@@ -650,7 +883,7 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
         regular_close: close,
         change_percent,
         extended_change_percent: None,
-        market_state: result.meta.market_state,
+        market_state,
     })
 }
 
@@ -660,46 +893,86 @@ fn dividend_calendar(provider_symbol: &str) -> Result<Option<DividendCalendar>, 
         return Ok(None);
     }
     let encoded = urlencoding::encode(symbol);
+    let now = now_unix();
 
     // Yahoo's calendarEvents quote-summary module is the source used by
-    // yfinance for declared payment dates. The simpler v7 quote response often
-    // includes exDividendDate but omits dividendDate, which is why Aureus could
-    // show only ex-dividend cards even when a payment date was announced.
-    let mut summary_url = format!(
-        "{QUOTE_SUMMARY_URL}/{encoded}?modules=calendarEvents&corsDomain=finance.yahoo.com&formatted=false&symbol={encoded}"
-    );
-    if let Some(crumb) = yahoo_crumb() {
-        summary_url.push_str("&crumb=");
-        summary_url.push_str(&urlencoding::encode(&crumb));
-    }
-    if let Ok(response) = get_json::<YahooQuoteSummaryEnvelope>(&summary_url) {
-        if let Some(events) = response
-            .quote_summary
-            .result
-            .into_iter()
-            .next()
-            .and_then(|result| result.calendar_events)
-        {
-            let ex_dividend_date = events.ex_dividend_date.filter(|timestamp| *timestamp > 0);
-            let payment_date = events.dividend_date.filter(|timestamp| *timestamp > 0);
-            if ex_dividend_date.is_some() || payment_date.is_some() {
-                return Ok(Some(DividendCalendar {
-                    ex_dividend_date,
-                    payment_date,
-                }));
+    // yfinance for declared payment dates. Retry once only when the failure
+    // specifically looks like an expired/invalid crumb; rate limits and network
+    // failures are not amplified with immediate retries.
+    for attempt in 0..2 {
+        let crumb = yahoo_crumb()?;
+        let had_crumb = crumb.is_some();
+        let mut summary_url = format!(
+            "{QUOTE_SUMMARY_URL}/{encoded}?modules=calendarEvents&corsDomain=finance.yahoo.com&formatted=false&symbol={encoded}"
+        );
+        if let Some(crumb) = crumb.as_deref() {
+            summary_url.push_str("&crumb=");
+            summary_url.push_str(&urlencoding::encode(crumb));
+        }
+
+        match get_json::<YahooQuoteSummaryEnvelope>(&summary_url) {
+            Ok(response) => {
+                if let Some(error) = response.quote_summary.error {
+                    let detail = if error.description.trim().is_empty() {
+                        error.code
+                    } else {
+                        error.description
+                    };
+                    let error = MarketError(format!(
+                        "Yahoo Finance calendar request failed for {symbol}: {detail}"
+                    ));
+                    if attempt == 0 && had_crumb && crumb_auth_error(&error) {
+                        invalidate_yahoo_crumb();
+                        continue;
+                    }
+                    if is_rate_limit_error(&error) {
+                        return Err(error);
+                    }
+                    break;
+                }
+
+                if let Some(events) = response
+                    .quote_summary
+                    .result
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .and_then(|result| result.calendar_events)
+                {
+                    let ex_dividend_date = valid_event_timestamp(events.ex_dividend_date, now);
+                    let payment_date = valid_event_timestamp(events.dividend_date, now);
+                    if ex_dividend_date.is_some() || payment_date.is_some() {
+                        return Ok(Some(DividendCalendar {
+                            ex_dividend_date,
+                            payment_date,
+                        }));
+                    }
+                }
+                break;
             }
+            Err(error) if attempt == 0 && had_crumb && crumb_auth_error(&error) => {
+                invalidate_yahoo_crumb();
+            }
+            Err(error) if is_rate_limit_error(&error) => return Err(error),
+            Err(_) => break,
         }
     }
 
-    // Keep the lightweight quote endpoint as a fallback. It is still useful for
-    // symbols where quoteSummary is temporarily unavailable or rate-limited.
-    let url = format!("{QUOTE_URL}?symbols={encoded}");
-    let response: YahooQuoteEnvelope = get_json(&url)?;
-    let Some(calendar) = response.quote_response.result.into_iter().next() else {
+    // Keep the lightweight quote endpoint as a fallback. Require the symbol in
+    // Yahoo's result to match exactly so an unexpected multi-result response
+    // cannot attach another security's calendar to this holding.
+    let response = authenticated_quote_response(symbol)?;
+    let Some(calendar) = response
+        .quote_response
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .find(|quote| symbol_matches(&quote.symbol, symbol))
+    else {
         return Ok(None);
     };
-    let ex_dividend_date = calendar.ex_dividend_date.filter(|timestamp| *timestamp > 0);
-    let payment_date = calendar.dividend_date.filter(|timestamp| *timestamp > 0);
+    let ex_dividend_date = valid_event_timestamp(calendar.ex_dividend_date, now);
+    let payment_date = valid_event_timestamp(calendar.dividend_date, now);
     if ex_dividend_date.is_none() && payment_date.is_none() {
         Ok(None)
     } else {
@@ -740,50 +1013,90 @@ fn dividends_impl(provider_symbol: &str) -> Result<DividendHistory, MarketError>
         )));
     }
 
-    let result = envelope
-        .chart
-        .result
-        .and_then(|mut items| items.drain(..).next())
-        .ok_or_else(|| MarketError(format!("Yahoo Finance returned no data for {symbol}")))?;
+    let result = take_single_chart_result(envelope.chart.result, symbol)?;
 
-    let currency = result.meta.currency.clone();
+    let currency = result
+        .meta
+        .currency
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     let mut dividends = Vec::new();
     let mut splits = Vec::new();
     if let Some(events) = result.events {
-        dividends = events
-            .dividends
-            .into_values()
-            .filter_map(|dividend| {
-                if dividend.amount.is_finite() && dividend.amount > 0.0 && dividend.date > 0 {
-                    Some(DividendEvent {
-                        provider_symbol: symbol.to_ascii_uppercase(),
-                        timestamp: dividend.date,
-                        amount: dividend.amount,
-                        currency: currency.clone().unwrap_or_default(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        splits = events
-            .splits
-            .into_values()
-            .filter_map(|split| {
-                let ratio = yahoo_split_ratio(&split)?;
-                (split.date > 0 && ratio.is_finite() && ratio > 0.0 && (ratio - 1.0).abs() > 0.0000001)
-                    .then_some(SplitEvent {
-                        provider_symbol: symbol.to_ascii_uppercase(),
-                        timestamp: split.date,
-                        ratio,
-                    })
-            })
-            .collect();
+        for dividend in events.dividends.into_values() {
+            let amount = valid_price(dividend.amount).ok_or_else(|| {
+                MarketError(format!(
+                    "Yahoo Finance returned a malformed dividend amount for {symbol}"
+                ))
+            })?;
+            let timestamp = valid_event_timestamp(dividend.date, now).ok_or_else(|| {
+                MarketError(format!(
+                    "Yahoo Finance returned a malformed dividend date for {symbol}"
+                ))
+            })?;
+            dividends.push(DividendEvent {
+                provider_symbol: symbol.to_ascii_uppercase(),
+                timestamp,
+                amount,
+                currency: currency.clone().unwrap_or_default(),
+            });
+        }
+
+        for split in events.splits.into_values() {
+            let ratio = yahoo_split_ratio(&split).filter(|ratio| {
+                ratio.is_finite() && *ratio > 0.0 && (*ratio - 1.0).abs() > 0.0000001
+            }).ok_or_else(|| {
+                MarketError(format!(
+                    "Yahoo Finance returned a malformed split ratio for {symbol}"
+                ))
+            })?;
+            let timestamp = valid_event_timestamp(split.date, now).ok_or_else(|| {
+                MarketError(format!(
+                    "Yahoo Finance returned a malformed split date for {symbol}"
+                ))
+            })?;
+            splits.push(SplitEvent {
+                provider_symbol: symbol.to_ascii_uppercase(),
+                timestamp,
+                ratio,
+            });
+        }
     }
     dividends.sort_by_key(|event| event.timestamp);
-    dividends.dedup_by_key(|event| event.timestamp);
+    let mut clean_dividends = Vec::<DividendEvent>::with_capacity(dividends.len());
+    for event in dividends {
+        if let Some(previous) = clean_dividends.last() {
+            if previous.timestamp == event.timestamp {
+                let tolerance = previous.amount.abs().max(event.amount.abs()).max(1.0) * 1e-9;
+                if (previous.amount - event.amount).abs() > tolerance {
+                    return Err(MarketError(format!(
+                        "Yahoo Finance returned conflicting dividend amounts for {symbol}"
+                    )));
+                }
+                continue;
+            }
+        }
+        clean_dividends.push(event);
+    }
+    dividends = clean_dividends;
+
     splits.sort_by_key(|event| event.timestamp);
-    splits.dedup_by_key(|event| event.timestamp);
+    let mut clean_splits = Vec::<SplitEvent>::with_capacity(splits.len());
+    for event in splits {
+        if let Some(previous) = clean_splits.last() {
+            if previous.timestamp == event.timestamp {
+                let tolerance = previous.ratio.abs().max(event.ratio.abs()).max(1.0) * 1e-9;
+                if (previous.ratio - event.ratio).abs() > tolerance {
+                    return Err(MarketError(format!(
+                        "Yahoo Finance returned conflicting split ratios for {symbol}"
+                    )));
+                }
+                continue;
+            }
+        }
+        clean_splits.push(event);
+    }
+    splits = clean_splits;
 
     // Payment/ex-dividend calendar fields come from Yahoo calendar metadata rather
     // than chart events. Treat this as best-effort so a calendar endpoint
@@ -852,14 +1165,9 @@ fn history_from_url(
         )));
     }
 
-    let result = envelope
-        .chart
-        .result
-        .and_then(|mut items| items.drain(..).next())
-        .ok_or_else(|| MarketError(format!("Yahoo Finance returned no history for {symbol}")))?;
+    let result = take_single_chart_result(envelope.chart.result, symbol)?;
 
     let bars = yahoo_bars_from_result(&result)?;
-
     if bars.is_empty() {
         return Err(MarketError(format!(
             "Yahoo Finance returned no usable price history for {symbol}"
@@ -874,70 +1182,80 @@ fn history_from_url(
         })
         .collect::<Vec<_>>();
 
-    let chart_price = valid_price(result.meta.regular_market_price)
-        .or_else(|| points.last().map(|point| point.close));
-    let chart_timestamp = result
-        .meta
-        .regular_market_time
-        .or_else(|| points.last().map(|point| point.timestamp));
+    let now = now_unix();
+    let meta_snapshot = valid_price(result.meta.regular_market_price)
+        .zip(valid_current_timestamp(result.meta.regular_market_time, now));
+    let bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
+    let chart_snapshot = match (meta_snapshot, bar_snapshot) {
+        (Some(meta), Some(bar)) if meta.1 >= bar.1 => Some(meta),
+        (Some(meta), None) => Some(meta),
+        (_, Some(bar)) => Some(bar),
+        (None, None) => None,
+    };
+    let chart_price = chart_snapshot.map(|snapshot| snapshot.0);
+    let chart_timestamp = chart_snapshot.map(|snapshot| snapshot.1);
 
     // Quote and chart are independent Yahoo caches. Keep two notions of
     // "current" deliberately separate:
     // - headline/display price may be PRE/POST when Yahoo says that session is active;
     // - range-return numerator stays regular-session only.
     let quote_snapshot = range.and_then(|_| quote_impl(symbol).ok());
-    let regular_current_price = freshest_regular_price(
+    let regular_current_snapshot = freshest_regular_snapshot(
         quote_snapshot.as_ref(),
         chart_price,
         chart_timestamp,
     );
+    let regular_current_price = regular_current_snapshot.map(|snapshot| snapshot.0);
     let (current_price, display_timestamp, display_market_state, extended_change_percent) =
-        freshest_display_price(quote_snapshot.as_ref(), chart_price, chart_timestamp);
+        freshest_display_snapshot(
+            quote_snapshot.as_ref(),
+            chart_price,
+            chart_timestamp,
+            result.meta.market_state.as_deref(),
+        );
 
     // Keep the rolling-period boundary atomic with this exact Yahoo chart
-    // response. A separate period1/period2 lookup can land on a different
-    // rolling cutoff (timezone, holiday, or cache timing) and was the source of
-    // systematic range mismatches. The UI never derives a return from candles.
-    let range_anchor = range.and_then(|_| {
-        canonical_range_anchor(result.meta.chart_previous_close)
-    });
+    // response. The UI never derives a range return from sampled candles.
+    let range_anchor = range.and_then(|_| canonical_range_anchor(result.meta.chart_previous_close));
     let range_return_percent = percent_change(regular_current_price, range_anchor)
-        .filter(|value| value.is_finite());
+        .and_then(|value| valid_percent(Some(value)));
 
     let day_change_percent = match range {
         Some(_) => quote_snapshot
             .as_ref()
-            .and_then(|quote| quote.change_percent)
+            .and_then(|quote| valid_percent(quote.change_percent))
             .or_else(|| {
                 percent_change(
-                    result.meta.regular_market_price,
+                    valid_price(result.meta.regular_market_price)
+                        .or(regular_current_price),
                     result.meta.previous_close,
                 )
             })
-            .filter(|value| value.is_finite()),
+            .and_then(|value| valid_percent(Some(value))),
         None => None,
     };
 
-    let quote_timestamp = display_timestamp
-        .or(chart_timestamp)
-        .unwrap_or_else(now_unix);
+    // Missing timestamps are never replaced with the local clock. If Yahoo
+    // supplies a price without a usable timestamp, the snapshot helpers above
+    // reject that price instead of making it look freshly updated.
+    let quote_timestamp = display_timestamp.unwrap_or(0);
 
-    // Keep points ordered after deriving provider-specific return anchors. The
-    // provider-neutral display layer is responsible for trimming the wider 6M
-    // fetch to the actual visible range.
     points.sort_by_key(|point| point.timestamp);
     points.dedup_by_key(|point| point.timestamp);
 
     Ok(History {
         points,
-        currency: result.meta.currency,
+        currency: result
+            .meta
+            .currency
+            .filter(|value| !value.trim().is_empty()),
         current_price,
         quote_timestamp,
-        market_state: display_market_state.or(result.meta.market_state),
-        extended_change_percent,
+        market_state: display_market_state,
+        extended_change_percent: valid_percent(extended_change_percent),
         day_change_percent,
         range_return_percent,
-        exchange_gmt_offset: result.meta.gmtoffset,
+        exchange_gmt_offset: valid_exchange_gmt_offset(result.meta.gmtoffset),
     })
 }
 
@@ -1036,9 +1354,18 @@ mod tests {
             extended_change_percent: None,
             market_state: None,
         };
-        assert_eq!(freshest_regular_price(Some(&quote), Some(104.0), Some(199)), Some(105.0));
-        assert_eq!(freshest_regular_price(Some(&quote), Some(104.0), Some(200)), Some(105.0));
-        assert_eq!(freshest_regular_price(Some(&quote), Some(106.0), Some(201)), Some(106.0));
+        assert_eq!(
+            freshest_regular_snapshot(Some(&quote), Some(104.0), Some(199)),
+            Some((105.0, 200))
+        );
+        assert_eq!(
+            freshest_regular_snapshot(Some(&quote), Some(104.0), Some(200)),
+            Some((105.0, 200))
+        );
+        assert_eq!(
+            freshest_regular_snapshot(Some(&quote), Some(106.0), Some(201)),
+            Some((106.0, 201))
+        );
     }
 
     #[test]
@@ -1054,10 +1381,10 @@ mod tests {
         };
 
         assert_eq!(
-            freshest_regular_price(Some(&quote), Some(106.0), Some(201)),
-            Some(106.0)
+            freshest_regular_snapshot(Some(&quote), Some(106.0), Some(201)),
+            Some((106.0, 201))
         );
-        let display = freshest_display_price(Some(&quote), Some(106.0), Some(201));
+        let display = freshest_display_snapshot(Some(&quote), Some(106.0), Some(201), Some("REGULAR"));
         assert_eq!(display.0, Some(107.0));
         assert_eq!(display.1, Some(250));
         assert_eq!(display.2.as_deref(), Some("POST"));
@@ -1075,8 +1402,117 @@ mod tests {
             extended_change_percent: None,
             market_state: None,
         };
-        assert_eq!(freshest_regular_price(Some(&quote), Some(108.0), Some(200)), Some(108.0));
-        assert_eq!(freshest_regular_price(None, Some(108.0), Some(200)), Some(108.0));
+        assert_eq!(
+            freshest_regular_snapshot(Some(&quote), Some(108.0), Some(200)),
+            Some((108.0, 200))
+        );
+        assert_eq!(
+            freshest_regular_snapshot(None, Some(108.0), Some(200)),
+            Some((108.0, 200))
+        );
+        assert_eq!(freshest_regular_snapshot(None, Some(108.0), None), None);
+    }
+
+
+    #[test]
+    fn future_current_timestamps_are_rejected() {
+        let now = 1_800_000_000;
+        assert_eq!(valid_current_timestamp(Some(now), now), Some(now));
+        assert_eq!(
+            valid_current_timestamp(Some(now + MAX_CLOCK_SKEW_SECONDS + 1), now),
+            None
+        );
+        assert_eq!(valid_current_timestamp(Some(0), now), None);
+    }
+
+    #[test]
+    fn only_known_market_states_are_kept() {
+        assert_eq!(normalized_market_state(Some("regular")).as_deref(), Some("REGULAR"));
+        assert_eq!(normalized_market_state(Some("PREPRE")).as_deref(), Some("PRE"));
+        assert_eq!(normalized_market_state(Some("POSTPOST")).as_deref(), Some("POST"));
+        assert_eq!(normalized_market_state(Some("mystery")), None);
+    }
+
+    #[test]
+    fn rate_limit_text_is_never_cached_as_a_crumb() {
+        assert!(!valid_crumb_text("Too Many Requests"));
+        assert!(!valid_crumb_text("Edge: Too Many Requests"));
+        assert!(!valid_crumb_text("<html>consent</html>"));
+        assert!(valid_crumb_text("abc123.xYz"));
+    }
+
+    #[test]
+    fn malformed_chart_arrays_fail_closed() {
+        let result = YahooChartResult {
+            meta: YahooChartMeta::default(),
+            timestamp: Some(vec![100, 200]),
+            indicators: Some(YahooIndicators {
+                quote: vec![YahooQuoteSeries {
+                    close: vec![Some(10.0)],
+                }],
+            }),
+            events: None,
+        };
+        assert!(yahoo_bars_from_result(&result).is_err());
+    }
+
+    #[test]
+    fn conflicting_duplicate_bars_fail_closed() {
+        let result = YahooChartResult {
+            meta: YahooChartMeta::default(),
+            timestamp: Some(vec![100, 100]),
+            indicators: Some(YahooIndicators {
+                quote: vec![YahooQuoteSeries {
+                    close: vec![Some(10.0), Some(11.0)],
+                }],
+            }),
+            events: None,
+        };
+        assert!(yahoo_bars_from_result(&result).is_err());
+    }
+
+    #[test]
+    fn mismatched_or_missing_chart_symbol_is_rejected() {
+        let mismatched = YahooChartMeta {
+            symbol: Some("MSFT".into()),
+            ..YahooChartMeta::default()
+        };
+        assert!(validate_chart_symbol(&mismatched, "AAPL").is_err());
+        assert!(validate_chart_symbol(&YahooChartMeta::default(), "AAPL").is_err());
+    }
+
+    #[test]
+    fn multiple_chart_results_fail_closed() {
+        let make_result = || YahooChartResult {
+            meta: YahooChartMeta {
+                symbol: Some("AAPL".into()),
+                ..YahooChartMeta::default()
+            },
+            timestamp: None,
+            indicators: None,
+            events: None,
+        };
+        assert!(take_single_chart_result(Some(vec![make_result(), make_result()]), "AAPL").is_err());
+    }
+
+    #[test]
+    fn regular_only_fallback_never_claims_extended_hours() {
+        assert_eq!(regular_only_market_state(Some("PRE")).as_deref(), Some("CLOSED"));
+        assert_eq!(regular_only_market_state(Some("POST")).as_deref(), Some("CLOSED"));
+        assert_eq!(regular_only_market_state(Some("REGULAR")).as_deref(), Some("REGULAR"));
+    }
+
+    #[test]
+    fn nullable_quote_error_payload_still_parses_safely() {
+        let parsed = serde_json::from_str::<YahooQuoteEnvelope>(
+            r#"{"quoteResponse":{"result":null,"error":{"code":"Unauthorized","description":"Invalid Crumb"}}}"#,
+        )
+        .unwrap();
+        assert!(parsed.quote_response.result.is_none());
+        assert_eq!(
+            parsed.quote_response.error.as_ref().map(|error| error.code.as_str()),
+            Some("Unauthorized")
+        );
     }
 
     #[test]
