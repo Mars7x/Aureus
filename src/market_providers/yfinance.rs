@@ -135,6 +135,22 @@ struct YahooChartMeta {
     gmtoffset: Option<i32>,
     #[serde(default, rename = "marketState")]
     market_state: Option<String>,
+    #[serde(default, rename = "currentTradingPeriod")]
+    current_trading_period: Option<YahooCurrentTradingPeriod>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct YahooCurrentTradingPeriod {
+    #[serde(default)]
+    regular: Option<YahooTradingPeriod>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct YahooTradingPeriod {
+    #[serde(default)]
+    start: Option<i64>,
+    #[serde(default)]
+    end: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +300,13 @@ fn valid_current_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
 fn valid_market_timestamp(timestamp: i64, now: i64) -> bool {
     timestamp >= MIN_MARKET_TIMESTAMP
         && timestamp <= now.saturating_add(MAX_CLOCK_SKEW_SECONDS)
+}
+
+fn valid_session_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
+    value.filter(|timestamp| {
+        *timestamp >= MIN_MARKET_TIMESTAMP
+            && *timestamp <= now.saturating_add(2 * 24 * 60 * 60)
+    })
 }
 
 fn valid_event_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
@@ -454,10 +477,29 @@ fn freshest_display_snapshot(
     chart_price: Option<f64>,
     chart_timestamp: Option<i64>,
     chart_market_state: Option<&str>,
+    chart_includes_extended_hours: bool,
+    regular_reference_price: Option<f64>,
 ) -> (Option<f64>, Option<i64>, Option<String>, Option<f64>) {
     let now = now_unix();
     let chart = valid_price(chart_price)
-        .zip(valid_current_timestamp(chart_timestamp, now));
+        .zip(valid_current_timestamp(chart_timestamp, now))
+        .map(|(price, timestamp)| {
+            let normalized = normalized_market_state(chart_market_state);
+            if chart_includes_extended_hours
+                && matches!(normalized.as_deref(), Some("PRE") | Some("POST"))
+            {
+                let extended = percent_change(Some(price), regular_reference_price)
+                    .and_then(|value| valid_percent(Some(value)));
+                (price, timestamp, normalized, extended)
+            } else {
+                (
+                    price,
+                    timestamp,
+                    regular_only_market_state(chart_market_state),
+                    None,
+                )
+            }
+        });
     let quote_snapshot = quote.and_then(|quote| {
         valid_price(Some(quote.close))
             .zip(valid_current_timestamp(Some(quote.timestamp), now))
@@ -472,18 +514,14 @@ fn freshest_display_snapshot(
     });
 
     match (quote_snapshot, chart) {
-        (Some(quote), Some((chart_price, chart_time))) if chart_time > quote.1 => {
-            // Chart prices exclude extended hours. If Yahoo's chart state still
-            // says PRE/POST, do not attach that label to a regular-session price.
-            let state = regular_only_market_state(chart_market_state);
-            (Some(chart_price), Some(chart_time), state, None)
+        (Some(quote), Some(chart)) if chart.1 > quote.1 => {
+            (Some(chart.0), Some(chart.1), chart.2, chart.3)
         }
         (Some((price, timestamp, state, extended)), _) => {
             (Some(price), Some(timestamp), state, extended)
         }
-        (None, Some((price, timestamp))) => {
-            let state = regular_only_market_state(chart_market_state);
-            (Some(price), Some(timestamp), state, None)
+        (None, Some((price, timestamp, state, extended))) => {
+            (Some(price), Some(timestamp), state, extended)
         }
         (None, None) => (None, None, None, None),
     }
@@ -1112,18 +1150,36 @@ fn dividends_impl(provider_symbol: &str) -> Result<DividendHistory, MarketError>
 }
 
 fn history_window_impl(provider_symbol: &str, range: HistoryRange) -> Result<History, MarketError> {
+    history_window_mode_impl(provider_symbol, range, false)
+}
+
+fn history_window_with_extended_hours_impl(
+    provider_symbol: &str,
+    range: HistoryRange,
+) -> Result<History, MarketError> {
+    // Extended-hours candles are intentionally a 1D-only presentation feature.
+    // Larger ranges keep Yahoo's regular-session series exactly as before.
+    history_window_mode_impl(provider_symbol, range, range == HistoryRange::OneDay)
+}
+
+fn history_window_mode_impl(
+    provider_symbol: &str,
+    range: HistoryRange,
+    include_extended_hours: bool,
+) -> Result<History, MarketError> {
     let symbol = provider_symbol.trim();
     if symbol.is_empty() {
         return Err(MarketError("This holding has no Yahoo Finance symbol".into()));
     }
 
     let encoded = urlencoding::encode(symbol);
+    let include_pre_post = if include_extended_hours { "true" } else { "false" };
     let url = format!(
-        "{CHART_URL}/{encoded}?range={}&interval={}&includePrePost=false&events=div%2Csplits%2CcapitalGains",
+        "{CHART_URL}/{encoded}?range={}&interval={}&includePrePost={include_pre_post}&events=div%2Csplits%2CcapitalGains",
         yahoo_range(range),
         yahoo_interval(range)
     );
-    history_from_url(symbol, &url, Some(range))
+    history_from_url(symbol, &url, Some(range), include_extended_hours)
 }
 
 /// Daily history for report snapshots. The caller supplies the exact statement
@@ -1144,13 +1200,14 @@ fn daily_history_between_impl(
     let url = format!(
         "{CHART_URL}/{encoded}?period1={period1}&period2={period2}&interval=1d&includePrePost=false&events=div%2Csplits%2CcapitalGains"
     );
-    history_from_url(symbol, &url, None)
+    history_from_url(symbol, &url, None, false)
 }
 
 fn history_from_url(
     symbol: &str,
     url: &str,
     range: Option<HistoryRange>,
+    chart_includes_extended_hours: bool,
 ) -> Result<History, MarketError> {
     let envelope: YahooChartEnvelope = get_json(url)?;
 
@@ -1185,15 +1242,24 @@ fn history_from_url(
     let now = now_unix();
     let meta_snapshot = valid_price(result.meta.regular_market_price)
         .zip(valid_current_timestamp(result.meta.regular_market_time, now));
-    let bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
-    let chart_snapshot = match (meta_snapshot, bar_snapshot) {
-        (Some(meta), Some(bar)) if meta.1 >= bar.1 => Some(meta),
-        (Some(meta), None) => Some(meta),
-        (_, Some(bar)) => Some(bar),
-        (None, None) => None,
+    let latest_bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
+
+    // With includePrePost=true the final chart candle may be a pre-/post-market
+    // trade. Never feed that candle into the regular-session numerator used by
+    // canonical returns. Yahoo's regular-market metadata (or the dedicated
+    // quote response) remains the only regular snapshot in that mode.
+    let regular_chart_snapshot = if chart_includes_extended_hours {
+        meta_snapshot
+    } else {
+        match (meta_snapshot, latest_bar_snapshot) {
+            (Some(meta), Some(bar)) if meta.1 >= bar.1 => Some(meta),
+            (Some(meta), None) => Some(meta),
+            (_, Some(bar)) => Some(bar),
+            (None, None) => None,
+        }
     };
-    let chart_price = chart_snapshot.map(|snapshot| snapshot.0);
-    let chart_timestamp = chart_snapshot.map(|snapshot| snapshot.1);
+    let regular_chart_price = regular_chart_snapshot.map(|snapshot| snapshot.0);
+    let regular_chart_timestamp = regular_chart_snapshot.map(|snapshot| snapshot.1);
 
     // Quote and chart are independent Yahoo caches. Keep two notions of
     // "current" deliberately separate:
@@ -1202,16 +1268,29 @@ fn history_from_url(
     let quote_snapshot = range.and_then(|_| quote_impl(symbol).ok());
     let regular_current_snapshot = freshest_regular_snapshot(
         quote_snapshot.as_ref(),
-        chart_price,
-        chart_timestamp,
+        regular_chart_price,
+        regular_chart_timestamp,
     );
     let regular_current_price = regular_current_snapshot.map(|snapshot| snapshot.0);
+
+    let chart_state = normalized_market_state(result.meta.market_state.as_deref());
+    let display_chart_snapshot = if chart_includes_extended_hours
+        && matches!(chart_state.as_deref(), Some("PRE") | Some("REGULAR") | Some("POST"))
+    {
+        latest_bar_snapshot.or(regular_chart_snapshot)
+    } else {
+        regular_chart_snapshot
+    };
+    let display_chart_price = display_chart_snapshot.map(|snapshot| snapshot.0);
+    let display_chart_timestamp = display_chart_snapshot.map(|snapshot| snapshot.1);
     let (current_price, display_timestamp, display_market_state, extended_change_percent) =
         freshest_display_snapshot(
             quote_snapshot.as_ref(),
-            chart_price,
-            chart_timestamp,
+            display_chart_price,
+            display_chart_timestamp,
             result.meta.market_state.as_deref(),
+            chart_includes_extended_hours,
+            regular_current_price,
         );
 
     // Keep the rolling-period boundary atomic with this exact Yahoo chart
@@ -1243,6 +1322,17 @@ fn history_from_url(
     points.sort_by_key(|point| point.timestamp);
     points.dedup_by_key(|point| point.timestamp);
 
+    let regular_session = result
+        .meta
+        .current_trading_period
+        .as_ref()
+        .and_then(|periods| periods.regular.as_ref())
+        .and_then(|regular| {
+            valid_session_timestamp(regular.start, now)
+                .zip(valid_session_timestamp(regular.end, now))
+        })
+        .filter(|(start, end)| start < end);
+
     Ok(History {
         points,
         currency: result
@@ -1256,6 +1346,8 @@ fn history_from_url(
         day_change_percent,
         range_return_percent,
         exchange_gmt_offset: valid_exchange_gmt_offset(result.meta.gmtoffset),
+        regular_session_start: regular_session.map(|session| session.0),
+        regular_session_end: regular_session.map(|session| session.1),
     })
 }
 
@@ -1286,6 +1378,14 @@ impl MarketDataProvider for YfinanceProvider {
         range: HistoryRange,
     ) -> Result<History, MarketError> {
         history_window_impl(provider_symbol, range)
+    }
+
+    fn history_window_with_extended_hours(
+        &self,
+        provider_symbol: &str,
+        range: HistoryRange,
+    ) -> Result<History, MarketError> {
+        history_window_with_extended_hours_impl(provider_symbol, range)
     }
 
     fn daily_history_between(
@@ -1384,11 +1484,49 @@ mod tests {
             freshest_regular_snapshot(Some(&quote), Some(106.0), Some(201)),
             Some((106.0, 201))
         );
-        let display = freshest_display_snapshot(Some(&quote), Some(106.0), Some(201), Some("REGULAR"));
+        let display = freshest_display_snapshot(
+            Some(&quote),
+            Some(106.0),
+            Some(201),
+            Some("REGULAR"),
+            false,
+            Some(106.0),
+        );
         assert_eq!(display.0, Some(107.0));
         assert_eq!(display.1, Some(250));
         assert_eq!(display.2.as_deref(), Some("POST"));
         assert_eq!(display.3, Some(1.9));
+    }
+
+    #[test]
+    fn extended_chart_fallback_keeps_regular_reference_separate() {
+        let display = freshest_display_snapshot(
+            None,
+            Some(107.0),
+            Some(250),
+            Some("POST"),
+            true,
+            Some(105.0),
+        );
+        assert_eq!(display.0, Some(107.0));
+        assert_eq!(display.1, Some(250));
+        assert_eq!(display.2.as_deref(), Some("POST"));
+        assert!((display.3.unwrap() - 1.9047619048).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regular_only_chart_cannot_masquerade_as_extended_hours() {
+        let display = freshest_display_snapshot(
+            None,
+            Some(105.0),
+            Some(200),
+            Some("POST"),
+            false,
+            Some(105.0),
+        );
+        assert_eq!(display.0, Some(105.0));
+        assert_eq!(display.2.as_deref(), Some("CLOSED"));
+        assert_eq!(display.3, None);
     }
 
     #[test]

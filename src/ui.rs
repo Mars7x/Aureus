@@ -7427,6 +7427,17 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
     });
 }
 
+fn security_detail_history_cache_interval(range: HistoryRange) -> &'static str {
+    // 1D security-detail charts include pre-/post-market candles. Keep those
+    // points in a separate cache namespace so portfolio history and every
+    // regular-session consumer continue using the canonical 5m series.
+    if range == HistoryRange::OneDay {
+        "5m-ext"
+    } else {
+        range.interval()
+    }
+}
+
 fn load_watch_history_range(
     detail: WatchDetailRefs,
     range: HistoryRange,
@@ -7435,12 +7446,13 @@ fn load_watch_history_range(
 ) {
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
+    let cache_interval = security_detail_history_cache_interval(range);
     let cached = market_data::display_history_points(
         detail
             .app
             .state
             .database
-            .history_points(&detail.provider_symbol, range.interval(), minimum)
+            .history_points(&detail.provider_symbol, cache_interval, minimum)
             .unwrap_or_default(),
         range,
     );
@@ -7458,7 +7470,7 @@ fn load_watch_history_range(
             .history_needs_refresh(
                 &detail.provider_symbol,
                 range.key(),
-                range.interval(),
+                cache_interval,
                 range.cache_seconds(),
             )
             .unwrap_or(true)
@@ -7475,6 +7487,14 @@ fn load_watch_history_range(
                 &detail.app.state.database,
                 &detail.provider_symbol,
             );
+            let cached_regular_session = (range == HistoryRange::OneDay)
+                .then(|| {
+                    cached_history_regular_session(
+                        &detail.app.state.database,
+                        &detail.provider_symbol,
+                    )
+                })
+                .flatten();
             let cached_day_change = detail
                 .app
                 .state
@@ -7493,12 +7513,13 @@ fn load_watch_history_range(
             } else {
                 cached_provider_range_return
             };
-            detail.chart.set_points_with_market_offset(
+            detail.chart.set_points_with_market_session(
                 cached.clone(),
                 &detail.currency,
                 range,
                 cached_range_change,
                 cached_market_offset,
+                cached_regular_session,
             );
             if needs_refresh {
                 // The chart cache is useful immediately, but a persisted
@@ -7542,7 +7563,8 @@ fn load_watch_history_range(
     let symbol = detail.provider_symbol.clone();
     let (sender, receiver) = mpsc::channel::<WatchHistoryLoadResult>();
     std::thread::spawn(move || {
-        let result = market_data::history(&symbol, range).map_err(|error| error.to_string());
+        let result = market_data::history_with_extended_hours(&symbol, range)
+            .map_err(|error| error.to_string());
         let _ = sender.send(WatchHistoryLoadResult {
             generation,
             range,
@@ -7560,15 +7582,16 @@ fn load_watch_history_range(
         }
         match load.result {
             Ok(history) => {
+                let loaded_cache_interval = security_detail_history_cache_interval(load.range);
                 let _ = detail.app.state.database.save_history(
                     &detail.provider_symbol,
-                    load.range.interval(),
+                    loaded_cache_interval,
                     &history.points,
                 );
                 let _ = detail.app.state.database.set_history_fetched(
                     &detail.provider_symbol,
                     load.range.key(),
-                    load.range.interval(),
+                    loaded_cache_interval,
                 );
                 save_history_display_metadata(
                     &detail.app.state.database,
@@ -7605,12 +7628,15 @@ fn load_watch_history_range(
                         history.range_return_percent
                     }
                     .filter(|value| value.is_finite());
-                    detail.chart.set_points_with_market_offset(
+                    detail.chart.set_points_with_market_session(
                         history.points.clone(),
                         currency,
                         load.range,
                         range_change,
                         history.exchange_gmt_offset.unwrap_or(0),
+                        history
+                            .regular_session_start
+                            .zip(history.regular_session_end),
                     );
                     update_watch_history_summary(
                         &detail,
@@ -7700,6 +7726,13 @@ fn history_market_offset_cache_key(provider_symbol: &str) -> String {
     )
 }
 
+fn history_regular_session_cache_key(provider_symbol: &str) -> String {
+    format!(
+        "history-regular-session:{}",
+        provider_symbol.trim().to_ascii_uppercase()
+    )
+}
+
 fn cached_history_range_return(
     database: &Database,
     provider_symbol: &str,
@@ -7722,6 +7755,20 @@ fn cached_history_market_offset(database: &Database, provider_symbol: &str) -> i
         .unwrap_or(0)
 }
 
+fn cached_history_regular_session(
+    database: &Database,
+    provider_symbol: &str,
+) -> Option<(i64, i64)> {
+    let value = database
+        .setting(&history_regular_session_cache_key(provider_symbol))
+        .ok()
+        .flatten()?;
+    let (start, end) = value.split_once(':')?;
+    let start = start.parse::<i64>().ok()?;
+    let end = end.parse::<i64>().ok()?;
+    (start < end).then_some((start, end))
+}
+
 fn save_history_display_metadata(
     database: &Database,
     provider_symbol: &str,
@@ -7741,6 +7788,16 @@ fn save_history_display_metadata(
             &history_market_offset_cache_key(provider_symbol),
             &offset.to_string(),
         );
+    }
+    let session_key = history_regular_session_cache_key(provider_symbol);
+    if let Some((start, end)) = history
+        .regular_session_start
+        .zip(history.regular_session_end)
+        .filter(|(start, end)| start < end)
+    {
+        let _ = database.set_setting(&session_key, &format!("{start}:{end}"));
+    } else {
+        let _ = database.set_setting(&session_key, "");
     }
 }
 
@@ -8813,12 +8870,13 @@ fn load_history_range(
 ) {
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
+    let cache_interval = security_detail_history_cache_interval(range);
     let cached = market_data::display_history_points(
         detail
             .app
             .state
             .database
-            .history_points(&detail.provider_symbol, range.interval(), minimum)
+            .history_points(&detail.provider_symbol, cache_interval, minimum)
             .unwrap_or_default(),
         range,
     );
@@ -8836,7 +8894,7 @@ fn load_history_range(
             .history_needs_refresh(
                 &detail.provider_symbol,
                 range.key(),
-                range.interval(),
+                cache_interval,
                 range.cache_seconds(),
             )
             .unwrap_or(true)
@@ -8851,6 +8909,14 @@ fn load_history_range(
                 &detail.app.state.database,
                 &detail.provider_symbol,
             );
+            let cached_regular_session = (range == HistoryRange::OneDay)
+                .then(|| {
+                    cached_history_regular_session(
+                        &detail.app.state.database,
+                        &detail.provider_symbol,
+                    )
+                })
+                .flatten();
             let cached_day_change = detail
                 .app
                 .state
@@ -8865,12 +8931,13 @@ fn load_history_range(
             } else {
                 cached_provider_range_return
             };
-            detail.chart.set_points_with_market_offset(
+            detail.chart.set_points_with_market_session(
                 cached.clone(),
                 &detail.currency,
                 range,
                 cached_range_change,
                 cached_market_offset,
+                cached_regular_session,
             );
             if needs_refresh {
                 // Reuse cached points for an instant chart, but never display a
@@ -8926,7 +8993,8 @@ fn load_history_range(
     let symbol = detail.provider_symbol.clone();
     let (sender, receiver) = mpsc::channel::<HistoryLoadResult>();
     std::thread::spawn(move || {
-        let result = market_data::history(&symbol, range).map_err(|error| error.to_string());
+        let result = market_data::history_with_extended_hours(&symbol, range)
+            .map_err(|error| error.to_string());
         let _ = sender.send(HistoryLoadResult {
             generation,
             range,
@@ -8946,15 +9014,16 @@ fn load_history_range(
 
         match load.result {
             Ok(history) => {
+                let loaded_cache_interval = security_detail_history_cache_interval(load.range);
                 let _ = detail.app.state.database.save_history(
                     &detail.provider_symbol,
-                    load.range.interval(),
+                    loaded_cache_interval,
                     &history.points,
                 );
                 let _ = detail.app.state.database.set_history_fetched(
                     &detail.provider_symbol,
                     load.range.key(),
-                    load.range.interval(),
+                    loaded_cache_interval,
                 );
                 save_history_display_metadata(
                     &detail.app.state.database,
@@ -8989,12 +9058,15 @@ fn load_history_range(
                         history.range_return_percent
                     }
                     .filter(|value| value.is_finite());
-                    detail.chart.set_points_with_market_offset(
+                    detail.chart.set_points_with_market_session(
                         history.points.clone(),
                         currency,
                         load.range,
                         range_change,
                         history.exchange_gmt_offset.unwrap_or(0),
+                        history
+                            .regular_session_start
+                            .zip(history.regular_session_end),
                     );
                     update_history_summary(
                         &detail,

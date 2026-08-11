@@ -266,6 +266,11 @@ pub struct History {
     /// labels. Keeping this on provider-neutral history avoids hard-coding TSX/US
     /// timezone rules into the chart widget.
     pub exchange_gmt_offset: Option<i32>,
+    /// Provider-supplied regular-session boundaries for the current/latest
+    /// trading day. Security-detail 1D charts use these only to visually
+    /// de-emphasize pre-/post-market segments; calculations remain unchanged.
+    pub regular_session_start: Option<i64>,
+    pub regular_session_end: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +296,16 @@ pub trait MarketDataProvider {
         provider_symbol: &str,
         range: HistoryRange,
     ) -> Result<History, MarketError>;
+    /// Optional extended-session history for security-detail charts. Providers
+    /// that do not expose pre-/post-market candles can safely fall back to the
+    /// regular-session history contract.
+    fn history_window_with_extended_hours(
+        &self,
+        provider_symbol: &str,
+        range: HistoryRange,
+    ) -> Result<History, MarketError> {
+        self.history_window(provider_symbol, range)
+    }
     fn daily_history_between(
         &self,
         provider_symbol: &str,
@@ -370,6 +385,11 @@ fn valid_provider_timestamp(timestamp: i64, now: i64) -> bool {
 fn valid_history_timestamp(timestamp: i64, now: i64) -> bool {
     timestamp >= MIN_PROVIDER_TIMESTAMP
         && timestamp <= now.saturating_add(PROVIDER_CLOCK_SKEW_SECONDS)
+}
+
+fn valid_session_boundary(timestamp: i64, now: i64) -> bool {
+    timestamp >= MIN_PROVIDER_TIMESTAMP
+        && timestamp <= now.saturating_add(2 * 24 * 60 * 60)
 }
 
 fn valid_event_timestamp(timestamp: i64, now: i64) -> bool {
@@ -501,6 +521,24 @@ fn sanitize_history_result(
         .exchange_gmt_offset
         .filter(|offset| offset.unsigned_abs() <= 18 * 60 * 60);
 
+    let exchange_offset = i64::from(history.exchange_gmt_offset.unwrap_or(0));
+    let latest_history_day = history
+        .points
+        .last()
+        .map(|point| point.timestamp.saturating_add(exchange_offset).div_euclid(86_400));
+    let regular_session = history
+        .regular_session_start
+        .zip(history.regular_session_end)
+        .filter(|(start, end)| {
+            let session_day = (*start).saturating_add(exchange_offset).div_euclid(86_400);
+            *start < *end
+                && valid_session_boundary(*start, now)
+                && valid_session_boundary(*end, now)
+                && latest_history_day.map(|day| day == session_day).unwrap_or(false)
+        });
+    history.regular_session_start = regular_session.map(|session| session.0);
+    history.regular_session_end = regular_session.map(|session| session.1);
+
     let unknown_state = history
         .market_state
         .as_deref()
@@ -624,6 +662,30 @@ pub fn dividends(provider_symbol: &str) -> Result<DividendHistory, MarketError> 
 
 pub fn history(provider_symbol: &str, range: HistoryRange) -> Result<History, MarketError> {
     let mut result = history_window(provider_symbol, range)?;
+    result.points = display_history_points(result.points, range);
+    if result.points.is_empty() {
+        return Err(MarketError(format!(
+            "{} returned no usable price history for {provider_symbol}",
+            provider_name()
+        )));
+    }
+    Ok(result)
+}
+
+/// Security-detail history. Only 1D opts into provider extended-hours candles;
+/// every larger range deliberately stays on the regular-session series.
+pub fn history_with_extended_hours(
+    provider_symbol: &str,
+    range: HistoryRange,
+) -> Result<History, MarketError> {
+    if range != HistoryRange::OneDay {
+        return history(provider_symbol, range);
+    }
+
+    let history = with_provider(|provider| {
+        provider.history_window_with_extended_hours(provider_symbol, range)
+    })?;
+    let mut result = sanitize_history_result(provider_symbol, history)?;
     result.points = display_history_points(result.points, range);
     if result.points.is_empty() {
         return Err(MarketError(format!(
@@ -895,6 +957,8 @@ mod tests {
             day_change_percent: Some(f64::NAN),
             range_return_percent: Some(10.0),
             exchange_gmt_offset: Some(99 * 60 * 60),
+            regular_session_start: None,
+            regular_session_end: None,
         };
         let sanitized = sanitize_history_result("TEST", history).unwrap();
         assert_eq!(sanitized.points.len(), 2);

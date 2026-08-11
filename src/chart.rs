@@ -23,6 +23,7 @@ struct ChartState {
     inspect_index: Option<usize>,
     trend_override: Option<f64>,
     exchange_gmt_offset: i32,
+    regular_session: Option<(i64, i64)>,
     message: Option<String>,
     empty_message: String,
 }
@@ -53,6 +54,7 @@ impl PriceChart {
                 inspect_index: None,
                 trend_override: None,
                 exchange_gmt_offset: 0,
+                regular_session: None,
                 message: Some(initial_message.into()),
                 empty_message: empty_message.into(),
             }))
@@ -98,6 +100,26 @@ impl PriceChart {
             range,
             trend_override,
             exchange_gmt_offset,
+            None,
+        );
+    }
+
+    pub fn set_points_with_market_session(
+        &self,
+        points: Vec<PricePoint>,
+        currency: &str,
+        range: HistoryRange,
+        trend_override: Option<f64>,
+        exchange_gmt_offset: i32,
+        regular_session: Option<(i64, i64)>,
+    ) {
+        self.set_points_internal(
+            points,
+            currency,
+            range,
+            trend_override,
+            exchange_gmt_offset,
+            regular_session,
         );
     }
 
@@ -108,7 +130,7 @@ impl PriceChart {
         range: HistoryRange,
         trend_override: Option<f64>,
     ) {
-        self.set_points_internal(points, currency, range, trend_override, 0);
+        self.set_points_internal(points, currency, range, trend_override, 0, None);
     }
 
     fn set_points_internal(
@@ -118,6 +140,7 @@ impl PriceChart {
         range: HistoryRange,
         trend_override: Option<f64>,
         exchange_gmt_offset: i32,
+        regular_session: Option<(i64, i64)>,
     ) {
         let active = self.active.get();
         let reduced = reduce_points_for_display(points, 1200);
@@ -132,6 +155,7 @@ impl PriceChart {
             state.inspect_index = None;
             state.trend_override = trend_override;
             state.exchange_gmt_offset = exchange_gmt_offset;
+            state.regular_session = regular_session;
             state.message = None;
             drop(state);
             self.areas[active].queue_draw();
@@ -147,6 +171,7 @@ impl PriceChart {
             state.inspect_index = None;
             state.trend_override = trend_override;
             state.exchange_gmt_offset = exchange_gmt_offset;
+            state.regular_session = regular_session;
             state.message = None;
         }
         self.areas[next].queue_draw();
@@ -161,6 +186,7 @@ impl PriceChart {
         state.message = Some(message.into());
         state.inspect_index = None;
         state.trend_override = None;
+        state.regular_session = None;
         drop(state);
         self.areas[active].queue_draw();
     }
@@ -428,13 +454,45 @@ fn draw_chart(
     }
 
     context.set_line_width(2.0);
-    context.set_source_rgba(line_red, line_green, line_blue, 1.0);
+    let has_extended_segments = state.range == HistoryRange::OneDay && state.regular_session.is_some();
+    context.set_source_rgba(
+        line_red,
+        line_green,
+        line_blue,
+        if has_extended_segments { 0.48 } else { 1.0 },
+    );
     if let Some((first_x, first_y)) = coordinates.first().copied() {
         context.move_to(first_x, first_y);
         for (x, y) in coordinates.iter().skip(1) {
             context.line_to(*x, *y);
         }
         let _ = context.stroke();
+    }
+
+    // Overlay the regular-session portion at full opacity. The complete 1D
+    // path remains continuous, while pre-/post-market movement is subtly
+    // de-emphasized without introducing a second color or changing trend logic.
+    if let Some((regular_start, regular_end)) = state
+        .regular_session
+        .filter(|_| state.range == HistoryRange::OneDay)
+    {
+        context.set_source_rgba(line_red, line_green, line_blue, 1.0);
+        for index in 1..state.points.len() {
+            let previous = &state.points[index - 1];
+            let current = &state.points[index];
+            let midpoint = previous
+                .timestamp
+                .saturating_add(current.timestamp)
+                .div_euclid(2);
+            if midpoint < regular_start || midpoint > regular_end {
+                continue;
+            }
+            let (x0, y0) = coordinates[index - 1];
+            let (x1, y1) = coordinates[index];
+            context.move_to(x0, y0);
+            context.line_to(x1, y1);
+            let _ = context.stroke();
+        }
     }
 
     // Keep date labels intentionally sparse so the graph remains legible at
