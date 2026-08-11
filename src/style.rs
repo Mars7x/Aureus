@@ -28,6 +28,10 @@ const LAYOUT_CSS: &str = r#"
   padding: 12px 14px;
 }
 
+.upcoming-card:focus-visible {
+  outline: 2px solid @accent_color;
+}
+
 .range-toggle {
   min-width: 0;
   padding-left: 6px;
@@ -81,8 +85,18 @@ row.transaction-date-section:selected {
   border-radius: 8px;
 }
 
-.allocation-legend-row:hover {
+.allocation-legend-row:hover,
+.allocation-legend-row.allocation-hovered,
+.allocation-legend-row:focus-visible {
   background-color: alpha(@window_fg_color, 0.06);
+}
+
+.allocation-legend-row.allocation-selected {
+  background-color: alpha(@window_fg_color, 0.10);
+}
+
+.allocation-legend-row:focus-visible {
+  outline: 2px solid @accent_color;
 }
 
 row.search-keyboard-selected {

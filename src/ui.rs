@@ -2385,6 +2385,8 @@ fn upcoming_action_card(title: &str, subtitle: &str, detail: &str) -> GtkBox {
         .build();
     card.add_css_class("card");
     card.add_css_class("upcoming-card");
+    card.set_focusable(true);
+    card.set_accessible_role(gtk::AccessibleRole::Group);
     card.append(
         &Label::builder()
             .label(title)
@@ -3927,6 +3929,51 @@ fn rebuild_overview_list(
     }
 }
 
+fn allocation_display_percentages(slices: &[AllocationSlice]) -> Vec<f64> {
+    let total = slices
+        .iter()
+        .map(|slice| slice.value.max(0.0))
+        .sum::<f64>();
+    if total <= f64::EPSILON {
+        return vec![0.0; slices.len()];
+    }
+
+    // Allocate percentage tenths with the largest-remainder method. Independent
+    // rounding can visibly produce 100.1% or 99.9%; distributing the remaining
+    // tenths preserves one-decimal precision while guaranteeing exactly 100.0%.
+    let exact = slices
+        .iter()
+        .map(|slice| slice.value.max(0.0) / total * 1000.0)
+        .collect::<Vec<_>>();
+    let mut units = exact
+        .iter()
+        .map(|value| value.floor() as i32)
+        .collect::<Vec<_>>();
+    let assigned = units.iter().sum::<i32>();
+    let remaining = (1000 - assigned).max(0) as usize;
+
+    let mut order = (0..slices.len()).collect::<Vec<_>>();
+    order.sort_by(|a, b| {
+        let frac_a = exact[*a] - exact[*a].floor();
+        let frac_b = exact[*b] - exact[*b].floor();
+        frac_b
+            .partial_cmp(&frac_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                slices[*b]
+                    .value
+                    .partial_cmp(&slices[*a].value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.cmp(b))
+    });
+    for index in order.into_iter().take(remaining) {
+        units[index] += 1;
+    }
+
+    units.into_iter().map(|value| f64::from(value) / 10.0).collect()
+}
+
 fn rebuild_allocation(
     refs: &UiRefs,
     positions: &[Position],
@@ -3963,6 +4010,7 @@ fn rebuild_allocation(
             key,
             label,
             value,
+            display_percent: 0.0,
             color_index: 0,
             color: None,
             is_cash: false,
@@ -3986,6 +4034,7 @@ fn rebuild_allocation(
             key: "cash".into(),
             label: "Cash".into(),
             value: cash,
+            display_percent: 0.0,
             color_index: 0,
             color: None,
             is_cash: true,
@@ -4044,10 +4093,16 @@ fn rebuild_allocation(
         }
     }
 
+    let display_percentages = allocation_display_percentages(&slices);
+    for (slice, percent) in slices.iter_mut().zip(display_percentages) {
+        slice.display_percent = percent;
+    }
+
     refs.allocation_ring.set_slices(slices.clone(), base);
     clear_box(&refs.allocation_legend);
     let total = slices.iter().map(|slice| slice.value).sum::<f64>();
     if total <= f64::EPSILON {
+        refs.allocation_ring.clear_interaction_callback();
         refs.allocation_legend.append(
             &Label::builder()
                 .label("No holdings yet")
@@ -4058,21 +4113,44 @@ fn rebuild_allocation(
         return;
     }
 
+    let mut legend_rows = Vec::<GtkBox>::new();
     for (index, slice) in slices.into_iter().enumerate() {
-        refs.allocation_legend.append(&allocation_legend_row(
+        let row = allocation_legend_row(
             &slice,
             index,
-            total,
             base,
             &refs.allocation_ring,
-        ));
+        );
+        refs.allocation_legend.append(&row);
+        legend_rows.push(row);
     }
+
+    let row_weaks = legend_rows
+        .iter()
+        .map(|row| row.downgrade())
+        .collect::<Vec<_>>();
+    refs.allocation_ring.set_interaction_callback(move |selected, hovered| {
+        for (index, weak) in row_weaks.iter().enumerate() {
+            let Some(row) = weak.upgrade() else {
+                continue;
+            };
+            if selected == Some(index) {
+                row.add_css_class("allocation-selected");
+            } else {
+                row.remove_css_class("allocation-selected");
+            }
+            if hovered == Some(index) {
+                row.add_css_class("allocation-hovered");
+            } else {
+                row.remove_css_class("allocation-hovered");
+            }
+        }
+    });
 }
 
 fn allocation_legend_row(
     slice: &AllocationSlice,
     index: usize,
-    total: f64,
     base: &str,
     ring: &AllocationRing,
 ) -> GtkBox {
@@ -4081,6 +4159,8 @@ fn allocation_legend_row(
         .spacing(9)
         .css_classes(["allocation-legend-row"])
         .build();
+    row.set_focusable(true);
+    row.set_accessible_role(gtk::AccessibleRole::Button);
 
     let swatch = gtk::DrawingArea::builder()
         .width_request(10)
@@ -4130,7 +4210,7 @@ fn allocation_legend_row(
     );
     top_line.append(
         &Label::builder()
-            .label(&format!("{:.1}%", slice.value / total * 100.0))
+            .label(&format!("{:.1}%", slice.display_percent))
             .halign(Align::End)
             .valign(Align::Start)
             .build(),
@@ -4149,11 +4229,41 @@ fn allocation_legend_row(
     let click = gtk::GestureClick::new();
     {
         let ring = ring.clone();
+        let row = row.clone();
         click.connect_released(move |_, _, _, _| {
+            row.grab_focus();
             ring.toggle_index(index);
         });
     }
     row.add_controller(click);
+
+    let keys = EventControllerKey::new();
+    {
+        let ring = ring.clone();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk::gdk::Key::Return
+                && key != gtk::gdk::Key::KP_Enter
+                && key != gtk::gdk::Key::space
+            {
+                return glib::Propagation::Proceed;
+            }
+            ring.toggle_index(index);
+            glib::Propagation::Stop
+        });
+    }
+    row.add_controller(keys);
+
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let ring = ring.clone();
+        motion.connect_enter(move |_, _, _| ring.set_hover_index(Some(index)));
+    }
+    {
+        let ring = ring.clone();
+        motion.connect_leave(move |_| ring.set_hover_index(None));
+    }
+    row.add_controller(motion);
+
     row
 }
 

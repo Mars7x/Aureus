@@ -4,28 +4,33 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{DrawingArea, GestureClick};
+use gtk::{DrawingArea, EventControllerMotion, GestureClick};
 
 #[derive(Clone, Debug)]
 pub struct AllocationSlice {
     pub key: String,
     pub label: String,
     pub value: f64,
+    pub display_percent: f64,
     pub color_index: usize,
     pub color: Option<(f64, f64, f64)>,
     pub is_cash: bool,
 }
 
+type InteractionCallback = Rc<dyn Fn(Option<usize>, Option<usize>)>;
+
 #[derive(Clone)]
 pub struct AllocationRing {
     area: DrawingArea,
     state: Rc<RefCell<RingState>>,
+    interaction_callback: Rc<RefCell<Option<InteractionCallback>>>,
 }
 
 #[derive(Clone, Default)]
 struct RingState {
     slices: Vec<AllocationSlice>,
     selected_index: Option<usize>,
+    hover_index: Option<usize>,
     previous_selection: Option<usize>,
     transition_progress: f64,
     transition_generation: u64,
@@ -47,10 +52,12 @@ impl AllocationRing {
         let state = Rc::new(RefCell::new(RingState {
             slices: Vec::new(),
             selected_index: None,
+            hover_index: None,
             previous_selection: None,
             transition_progress: 1.0,
             transition_generation: 0,
         }));
+        let interaction_callback = Rc::new(RefCell::new(None));
 
         {
             let state = state.clone();
@@ -63,6 +70,7 @@ impl AllocationRing {
         {
             let area = area.clone();
             let state = state.clone();
+            let interaction_callback = interaction_callback.clone();
             click.connect_pressed(move |_, _, x, y| {
                 let hit = {
                     let current = state.borrow();
@@ -82,10 +90,39 @@ impl AllocationRing {
                         hit
                     }
                 };
-                begin_selection_transition(&area, &state, target);
+                begin_selection_transition(&area, &state, &interaction_callback, target);
             });
         }
         area.add_controller(click);
+
+        let motion = EventControllerMotion::new();
+        {
+            let area = area.clone();
+            let state = state.clone();
+            let interaction_callback = interaction_callback.clone();
+            motion.connect_motion(move |_, x, y| {
+                let next = {
+                    let current = state.borrow();
+                    slice_at_point(
+                        &current,
+                        f64::from(area.width()),
+                        f64::from(area.height()),
+                        x,
+                        y,
+                    )
+                };
+                set_hover_index_internal(&area, &state, &interaction_callback, next);
+            });
+        }
+        {
+            let area = area.clone();
+            let state = state.clone();
+            let interaction_callback = interaction_callback.clone();
+            motion.connect_leave(move |_| {
+                set_hover_index_internal(&area, &state, &interaction_callback, None);
+            });
+        }
+        area.add_controller(motion);
 
         let manager = adw::StyleManager::for_display(&area.display());
         {
@@ -97,7 +134,11 @@ impl AllocationRing {
             manager.connect_high_contrast_notify(move |_| area.queue_draw());
         }
 
-        Self { area, state }
+        Self {
+            area,
+            state,
+            interaction_callback,
+        }
     }
 
     pub fn widget(&self) -> &DrawingArea {
@@ -108,11 +149,35 @@ impl AllocationRing {
         let mut state = self.state.borrow_mut();
         state.slices = slices;
         state.selected_index = None;
+        state.hover_index = None;
         state.previous_selection = None;
         state.transition_progress = 1.0;
         state.transition_generation = state.transition_generation.wrapping_add(1);
         drop(state);
         self.area.queue_draw();
+        notify_interaction(&self.interaction_callback, &self.state);
+    }
+
+    pub fn set_interaction_callback<F>(&self, callback: F)
+    where
+        F: Fn(Option<usize>, Option<usize>) + 'static,
+    {
+        *self.interaction_callback.borrow_mut() = Some(Rc::new(callback));
+        notify_interaction(&self.interaction_callback, &self.state);
+    }
+
+    pub fn clear_interaction_callback(&self) {
+        self.interaction_callback.borrow_mut().take();
+    }
+
+    pub fn set_hover_index(&self, index: Option<usize>) {
+        let next = index.filter(|index| *index < self.state.borrow().slices.len());
+        set_hover_index_internal(
+            &self.area,
+            &self.state,
+            &self.interaction_callback,
+            next,
+        );
     }
 
     pub fn toggle_index(&self, index: usize) {
@@ -127,7 +192,12 @@ impl AllocationRing {
                 Some(index)
             }
         };
-        begin_selection_transition(&self.area, &self.state, target);
+        begin_selection_transition(
+            &self.area,
+            &self.state,
+            &self.interaction_callback,
+            target,
+        );
     }
 }
 
@@ -251,8 +321,9 @@ fn draw_ring(
         let sweep = (value / total) * PI * 2.0;
         let (red, green, blue) =
             allocation_color(slice.color_index, slice.color, slice.is_cash, dark);
-        let alpha = if state.selected_index.is_some() && state.selected_index != Some(index) {
-            0.46
+        let active_index = state.hover_index.or(state.selected_index);
+        let alpha = if active_index.is_some() && active_index != Some(index) {
+            0.42
         } else {
             0.96
         };
@@ -260,7 +331,11 @@ fn draw_ring(
         // the previous slice eases back while the new one eases outward, so
         // the emphasis follows the same 160 ms transition as the center text.
         let progress = state.transition_progress.clamp(0.0, 1.0);
-        let emphasis = if state.selected_index == Some(index) {
+        let emphasis = if state.hover_index == Some(index) {
+            1.0
+        } else if state.hover_index.is_some() {
+            0.0
+        } else if state.selected_index == Some(index) {
             progress
         } else if state.previous_selection == Some(index)
             && state.previous_selection != state.selected_index
@@ -277,7 +352,20 @@ fn draw_ring(
     }
 
     let progress = state.transition_progress.clamp(0.0, 1.0);
-    if progress < 1.0 && state.previous_selection != state.selected_index {
+    if let Some(hover_index) = state.hover_index {
+        draw_center_content(
+            context,
+            center_x,
+            center_y,
+            state,
+            Some(hover_index),
+            total,
+            foreground,
+            subdued,
+            1.0,
+            center_text_width,
+        );
+    } else if progress < 1.0 && state.previous_selection != state.selected_index {
         draw_center_content(
             context,
             center_x,
@@ -321,6 +409,7 @@ fn draw_ring(
 fn begin_selection_transition(
     area: &DrawingArea,
     state: &Rc<RefCell<RingState>>,
+    interaction_callback: &Rc<RefCell<Option<InteractionCallback>>>,
     target: Option<usize>,
 ) {
     let generation = {
@@ -336,6 +425,7 @@ fn begin_selection_transition(
     };
 
     area.queue_draw();
+    notify_interaction(interaction_callback, state);
     let area = area.clone();
     let state = state.clone();
     let started = Instant::now();
@@ -362,6 +452,39 @@ fn begin_selection_transition(
     });
 }
 
+fn notify_interaction(
+    callback: &Rc<RefCell<Option<InteractionCallback>>>,
+    state: &Rc<RefCell<RingState>>,
+) {
+    let callback = callback.borrow().clone();
+    let Some(callback) = callback else {
+        return;
+    };
+    let current = state.borrow();
+    callback(current.selected_index, current.hover_index);
+}
+
+fn set_hover_index_internal(
+    area: &DrawingArea,
+    state: &Rc<RefCell<RingState>>,
+    callback: &Rc<RefCell<Option<InteractionCallback>>>,
+    next: Option<usize>,
+) {
+    let changed = {
+        let mut current = state.borrow_mut();
+        if current.hover_index == next {
+            false
+        } else {
+            current.hover_index = next;
+            true
+        }
+    };
+    if changed {
+        area.queue_draw();
+        notify_interaction(callback, state);
+    }
+}
+
 fn draw_center_content(
     context: &gtk::cairo::Context,
     center_x: f64,
@@ -379,7 +502,11 @@ fn draw_center_content(
     }
     if let Some(index) = selection.filter(|index| *index < state.slices.len()) {
         let slice = &state.slices[index];
-        let percent = slice.value.max(0.0) / total * 100.0;
+        let percent = if slice.display_percent.is_finite() {
+            slice.display_percent.max(0.0)
+        } else {
+            slice.value.max(0.0) / total * 100.0
+        };
         draw_center_text(
             context,
             center_x,
@@ -393,18 +520,8 @@ fn draw_center_content(
             alpha,
         );
     } else {
-        draw_center_text(
-            context,
-            center_x,
-            center_y,
-            max_width,
-            "Portfolio",
-            "",
-            "",
-            foreground,
-            subdued,
-            alpha,
-        );
+        // Keep the center visually quiet until a slice is hovered or selected.
+        // The surrounding Allocation heading already provides the context.
     }
 }
 
