@@ -35,7 +35,6 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 
 ## Roadmap
 - Figure out a way to reliably fetch company icons and remove manually setting icons.
-- Support multiple APIs, not only yfinance
   
 ## Disclaimers
 - Aureus is for personal portfolio tracking and does not provide financial, investment, tax, or legal advice.
