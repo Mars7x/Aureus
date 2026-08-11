@@ -16,6 +16,13 @@ const LAYOUT_CSS: &str = r#"
   min-width: 108px;
 }
 
+/* The dividend total is the page's primary metric. Keep the standard title-1
+ * weight and hierarchy, but give it a small size lift without using the
+ * deprecated libadwaita large-title class. */
+.dividend-headline {
+  font-size: 22pt;
+}
+
 .detail-hero {
   padding: 18px 20px;
 }

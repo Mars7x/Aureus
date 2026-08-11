@@ -12,7 +12,7 @@ pub struct DividendChart {
 
 #[derive(Clone, Default)]
 struct ChartState {
-    values: Vec<(String, f64)>,
+    values: Vec<(String, f64, bool)>,
     currency: String,
     inspect_index: Option<usize>,
     message: Option<String>,
@@ -111,7 +111,7 @@ impl DividendChart {
         &self.area
     }
 
-    pub fn set_values(&self, values: Vec<(String, f64)>, currency: &str) {
+    pub fn set_values(&self, values: Vec<(String, f64, bool)>, currency: &str) {
         let mut state = self.state.borrow_mut();
         state.values = values;
         state.currency = currency.to_string();
@@ -153,7 +153,6 @@ fn draw_chart(
     let accent = manager.accent_color_rgba();
     let dark = manager.is_dark();
     let foreground = if dark { 0.93 } else { 0.12 };
-    let subdued = if dark { 0.58 } else { 0.42 };
 
     if let Some(message) = state.message.as_deref() {
         context.set_source_rgba(foreground, foreground, foreground, 0.72);
@@ -179,7 +178,7 @@ fn draw_chart(
     let max_value = state
         .values
         .iter()
-        .map(|(_, value)| *value)
+        .map(|(_, value, _)| *value)
         .fold(0.0_f64, f64::max);
     let scale_max = if max_value <= f64::EPSILON {
         1.0
@@ -187,30 +186,24 @@ fn draw_chart(
         max_value * 1.08
     };
 
-    context.set_line_width(1.0);
-    context.set_source_rgba(subdued, subdued, subdued, if dark { 0.18 } else { 0.14 });
-    for index in 0..=2 {
-        let fraction = index as f64 / 2.0;
-        let y = plot_top + fraction * (plot_bottom - plot_top);
-        context.move_to(plot_left, y);
-        context.line_to(plot_right, y);
-        let _ = context.stroke();
-    }
-
     let count = state.values.len();
     let slot = (plot_right - plot_left) / count as f64;
     let bar_width = (slot * 0.58).clamp(5.0, 34.0);
 
-    for (index, (_, value)) in state.values.iter().enumerate() {
+    for (index, (_, value, estimated)) in state.values.iter().enumerate() {
         let center = plot_left + slot * (index as f64 + 0.5);
         let bar_height = (*value / scale_max) * (plot_bottom - plot_top);
         let x = center - bar_width / 2.0;
         let y = plot_bottom - bar_height;
         context.rectangle(x, y, bar_width, bar_height.max(1.0));
-        let alpha = if state.inspect_index == Some(index) {
-            1.0
-        } else {
-            0.74
+        // Received/confirmed income stays at the normal accent strength.
+        // Future estimates use the same accent at lower opacity so the chart
+        // communicates certainty without inventing a second dividend color.
+        let alpha = match (state.inspect_index == Some(index), *estimated) {
+            (true, true) => 0.64,
+            (false, true) => 0.44,
+            (true, false) => 1.0,
+            (false, false) => 0.90,
         };
         context.set_source_rgba(
             f64::from(accent.red()),
@@ -226,27 +219,38 @@ fn draw_chart(
         gtk::cairo::FontSlant::Normal,
         gtk::cairo::FontWeight::Normal,
     );
-    context.set_font_size(10.5);
+    // Calendar-year views always show every month label. Scale the label text
+    // slightly at narrow widths rather than dropping alternating months, so the
+    // x-axis remains complete on phones as well as desktop.
+    let label_size = if count >= 12 {
+        (slot * 0.42).clamp(7.5, 10.5)
+    } else {
+        10.5
+    };
+    context.set_font_size(label_size);
     context.set_source_rgba(foreground, foreground, foreground, 0.58);
-    let label_every = if width < 430.0 { 3 } else { 2 };
-    for (index, (label, _)) in state.values.iter().enumerate() {
-        if index % label_every != 0 && index + 1 != count {
-            continue;
-        }
+    for (index, (label, _, _)) in state.values.iter().enumerate() {
         let center = plot_left + slot * (index as f64 + 0.5);
-        let estimated_width = label.chars().count() as f64 * 5.5;
-        context.move_to((center - estimated_width / 2.0).max(2.0), height - 8.0);
+        let x = context
+            .text_extents(label)
+            .map(|extents| center - extents.width() / 2.0 - extents.x_bearing())
+            .unwrap_or(center);
+        context.move_to(x.max(1.0), height - 8.0);
         let _ = context.show_text(label);
     }
 
     let Some(index) = state.inspect_index.filter(|index| *index < count) else {
         return;
     };
-    let (label, value) = &state.values[index];
+    let (label, value, estimated) = &state.values[index];
     let center = plot_left + slot * (index as f64 + 0.5);
     let bar_height = (*value / scale_max) * (plot_bottom - plot_top);
     let y = plot_bottom - bar_height;
-    let text = format!("{} · {}", label, format_currency(*value, &state.currency));
+    let text = if *estimated {
+        format!("{} · {} · estimated", label, format_currency(*value, &state.currency))
+    } else {
+        format!("{} · {}", label, format_currency(*value, &state.currency))
+    };
     let popup_width = (text.chars().count() as f64 * 7.0 + 20.0).clamp(110.0, 210.0);
     let popup_height = 32.0;
     let popup_x = (center - popup_width / 2.0)

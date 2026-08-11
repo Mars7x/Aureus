@@ -14,7 +14,7 @@ use adw::{
 use gtk::gio;
 use gtk::glib;
 use gtk::{
-    Align, Box as GtkBox, Button, EventControllerKey, FileDialog, GestureDrag, Image, Label, ListBox,
+    Align, Box as GtkBox, Button, DropDown, EventControllerKey, FileDialog, GestureDrag, Image, Label, ListBox,
     ListBoxRow, MenuButton, Orientation, Overlay, PolicyType, ProgressBar, Revealer, SearchEntry, SelectionMode, Spinner, Stack,
     StringList, ToggleButton,
 };
@@ -103,11 +103,14 @@ struct UiRefs {
     accounts_list: ListBox,
     watchlist_list: ListBox,
     dividend_list: ListBox,
+    dividend_recent_heading: Label,
     dividend_income: Label,
     dividend_yield: Label,
-    dividend_positions: Label,
     dividend_status: Label,
     dividend_chart: DividendChart,
+    dividend_period: DropDown,
+    dividend_period_options: Rc<RefCell<Vec<DividendPeriod>>>,
+    dividend_period_updating: Rc<Cell<bool>>,
     overview_stack: Stack,
     accounts_stack: Stack,
     dividends_stack: Stack,
@@ -1021,16 +1024,47 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     let accounts_list = positions_list();
     let watchlist_list = positions_list();
     let dividend_list = positions_list();
-    let dividend_income = metric_value_label();
-    let dividend_yield = metric_value_label();
-    let dividend_positions = metric_value_label();
+    // Dividend history should read like a light native history list rather than
+    // a second card competing with the chart. Keep only row separators.
+    dividend_list.remove_css_class("boxed-list");
+    dividend_list.set_show_separators(true);
+    let dividend_recent_heading = section_heading("Recent Distributions");
+    // The empty placeholder already says "No Recent Distributions". Hide the
+    // section heading until real rows exist so the empty state does not repeat
+    // the same idea twice.
+    dividend_recent_heading.set_visible(false);
+    let dividend_income = Label::builder()
+        .label("—")
+        .halign(Align::Center)
+        .css_classes(["title-1", "dividend-headline"])
+        .build();
+    let dividend_yield = Label::builder()
+        .label("—")
+        .halign(Align::Center)
+        .css_classes(["heading", "dim-label"])
+        .build();
     let dividend_status = Label::builder()
         .label("Loading dividend history")
-        .halign(Align::Start)
+        .halign(Align::Center)
         .wrap(true)
         .css_classes(["dim-label", "caption"])
         .build();
     let dividend_chart = DividendChart::new();
+    let dividend_period_model = StringList::new(&[]);
+    dividend_period_model.append("Annual");
+    let dividend_period = DropDown::builder()
+        .model(&dividend_period_model)
+        .selected(0)
+        .build();
+    dividend_period.set_halign(Align::Center);
+    dividend_period.set_size_request(138, -1);
+    dividend_period.set_tooltip_text(Some("Dividend chart period"));
+    // Annual is the current calendar year. Historical years are added only when
+    // they actually exist, so a brand-new portfolio does not show a redundant
+    // current-year option or an unnecessary period selector.
+    dividend_period.set_visible(false);
+    let dividend_period_options = Rc::new(RefCell::new(vec![DividendPeriod::Annual]));
+    let dividend_period_updating = Rc::new(Cell::new(false));
     let current_page = Rc::new(RefCell::new("overview".to_string()));
     let market_refresh_generation = Rc::new(Cell::new(0));
     let dividend_refresh_generation = Rc::new(Cell::new(0));
@@ -1202,11 +1236,14 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         accounts_list: accounts_list.clone(),
         watchlist_list: watchlist_list.clone(),
         dividend_list: dividend_list.clone(),
+        dividend_recent_heading: dividend_recent_heading.clone(),
         dividend_income: dividend_income.clone(),
         dividend_yield: dividend_yield.clone(),
-        dividend_positions: dividend_positions.clone(),
         dividend_status: dividend_status.clone(),
         dividend_chart: dividend_chart.clone(),
+        dividend_period: dividend_period.clone(),
+        dividend_period_options: dividend_period_options.clone(),
+        dividend_period_updating: dividend_period_updating.clone(),
         overview_stack: overview_stack.clone(),
         accounts_stack: accounts_stack.clone(),
         dividends_stack: dividends_stack.clone(),
@@ -1255,6 +1292,42 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     let dividends_page = build_dividends_page(&refs);
     let search_page = build_search_page(&refs);
     let watchlist_page = build_watchlist_page(&refs);
+
+    {
+        let refs = refs.clone();
+        let dividend_period = refs.dividend_period.clone();
+        dividend_period.connect_selected_notify(move |_| {
+            if refs.dividend_period_updating.get() {
+                return;
+            }
+            let positions = refs.state.database.load_positions().unwrap_or_default();
+            let base = base_currency(&refs.state);
+            let usd_cad = refs
+                .state
+                .database
+                .fx_rate(USD_CAD_PAIR)
+                .ok()
+                .flatten()
+                .map(|rate| rate.rate);
+
+            // Period changes are a visual data transition, not navigation. Fade the
+            // complete dividend result set out, rebuild it for the newly selected
+            // year, then fade it back in so Annual <-> historical switches match
+            // Aureus's other loaded-value transitions instead of snapping.
+            let widgets = vec![
+                refs.dividend_income.clone().upcast::<gtk::Widget>(),
+                refs.dividend_yield.clone().upcast::<gtk::Widget>(),
+                refs.dividend_chart.widget().clone().upcast::<gtk::Widget>(),
+                refs.dividend_status.clone().upcast::<gtk::Widget>(),
+                refs.dividend_recent_heading.clone().upcast::<gtk::Widget>(),
+                refs.dividend_list.clone().upcast::<gtk::Widget>(),
+            ];
+            let refs_for_update = refs.clone();
+            crossfade_loaded_widgets(widgets, move || {
+                rebuild_dividend_page(&refs_for_update, &positions, &base, usd_cad);
+            });
+        });
+    }
 
     content_pages.add_named(&overview_page, Some("overview"));
     content_pages.add_named(&dividends_page, Some("dividends"));
@@ -2260,7 +2333,6 @@ fn refresh_with_loaded_crossfade(refs: UiRefs) {
         refs.quote_note.clone(),
         refs.dividend_income.clone(),
         refs.dividend_yield.clone(),
-        refs.dividend_positions.clone(),
         refs.dividend_status.clone(),
     ];
     let before = labels
@@ -2800,30 +2872,78 @@ fn build_watchlist_page(refs: &UiRefs) -> gtk::Widget {
     refs.watchlist_stack.clone().upcast()
 }
 
+fn dividend_recent_empty_placeholder() -> GtkBox {
+    // Match Aureus's full-page empty states without turning this section into a
+    // card of its own. The ListBox drops its boxed background while empty, so the
+    // clock icon, title, and explanation sit directly on the page surface. Keep
+    // the geometry compact enough for phones and omit an action button because
+    // there is no useful direct action to take from an empty dividend history.
+    let icon = Image::from_icon_name("document-open-recent-symbolic");
+    icon.set_pixel_size(40);
+    icon.add_css_class("dim-label");
+
+    let title = Label::builder()
+        .label("No Recent Distributions")
+        .halign(Align::Center)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["title-3"])
+        .build();
+    let description = Label::builder()
+        .label("No dividend distributions were received in this period")
+        .halign(Align::Center)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label"])
+        .build();
+
+    let empty = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .hexpand(true)
+        .halign(Align::Fill)
+        .valign(Align::Center)
+        .margin_top(26)
+        .margin_bottom(26)
+        .margin_start(18)
+        .margin_end(18)
+        .build();
+    empty.append(&icon);
+    empty.append(&title);
+    empty.append(&description);
+    empty
+}
+
 fn build_dividends_page(refs: &UiRefs) -> gtk::Widget {
     let content = page_content_box();
 
-    let metrics = WrapBox::new();
-    metrics.set_child_spacing(12);
-    metrics.set_line_spacing(12);
-    metrics.set_natural_line_length(720);
-    metrics.set_line_homogeneous(true);
-    metrics.append(&metric_card("Estimated annual income", &refs.dividend_income));
-    metrics.append(&metric_card("Portfolio distribution yield", &refs.dividend_yield));
-    metrics.append(&metric_card("Income positions", &refs.dividend_positions));
-    content.append(&metrics);
-
-    content.append(&section_heading("Estimated Monthly Income"));
-    let chart_card = GtkBox::builder()
+    // Mirror Overview's hierarchy: one strong summary value, one compact
+    // secondary line, then the chart and its period control.
+    let dividend_summary = GtkBox::builder()
         .orientation(Orientation::Vertical)
-        .spacing(8)
-        .css_classes(["card", "chart-card"])
+        .spacing(2)
+        .halign(Align::Center)
         .build();
-    chart_card.append(refs.dividend_chart.widget());
-    chart_card.append(&refs.dividend_status);
-    content.append(&chart_card);
+    dividend_summary.append(&refs.dividend_income);
+    dividend_summary.append(&refs.dividend_yield);
+    content.append(&dividend_summary);
 
-    content.append(&section_heading("Recent Distributions"));
+    // Keep the dividend plot on the page surface. The old card background and
+    // horizontal guide rules made this chart visually heavier than Overview.
+    content.append(refs.dividend_chart.widget());
+
+    let period_row = GtkBox::builder()
+        .orientation(Orientation::Horizontal)
+        .halign(Align::Center)
+        .build();
+    period_row.append(&refs.dividend_period);
+    content.append(&period_row);
+    content.append(&refs.dividend_status);
+
+    content.append(&refs.dividend_recent_heading);
+    let recent_empty = dividend_recent_empty_placeholder();
+    refs.dividend_list.remove_css_class("boxed-list");
+    refs.dividend_list.set_placeholder(Some(&recent_empty));
     content.append(&refs.dividend_list);
 
     let scroller = page_scroller(&content, 900);
@@ -2841,6 +2961,12 @@ fn build_dividends_page(refs: &UiRefs) -> gtk::Widget {
     refs.dividends_stack.clone().upcast()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DividendPeriod {
+    Annual,
+    Year(i32),
+}
+
 #[derive(Clone)]
 struct RecentDistribution {
     timestamp: i64,
@@ -2851,15 +2977,236 @@ struct RecentDistribution {
     estimated_base_value: Option<f64>,
 }
 
+fn selected_dividend_period(refs: &UiRefs) -> DividendPeriod {
+    refs.dividend_period_options
+        .borrow()
+        .get(refs.dividend_period.selected() as usize)
+        .copied()
+        .unwrap_or(DividendPeriod::Annual)
+}
+
+fn sync_dividend_period_options(refs: &UiRefs, oldest_year: i32, current_year: i32) {
+    let oldest_year = oldest_year.min(current_year);
+    // "Annual" is the current calendar year. Only older years receive explicit
+    // labels, which avoids showing both "Annual" and "2026" for the same data.
+    let mut next = vec![DividendPeriod::Annual];
+    if oldest_year < current_year {
+        for year in (oldest_year..current_year).rev() {
+            next.push(DividendPeriod::Year(year));
+        }
+    }
+
+    let previous = selected_dividend_period(refs);
+    let selected = next
+        .iter()
+        .position(|period| *period == previous)
+        .unwrap_or(0);
+
+    if *refs.dividend_period_options.borrow() != next {
+        let labels = next
+            .iter()
+            .map(|period| match period {
+                DividendPeriod::Annual => "Annual".to_string(),
+                DividendPeriod::Year(year) => year.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let model = StringList::new(&[]);
+        for label in &labels {
+            model.append(label);
+        }
+
+        refs.dividend_period_updating.set(true);
+        *refs.dividend_period_options.borrow_mut() = next.clone();
+        refs.dividend_period.set_model(Some(&model));
+        refs.dividend_period.set_selected(selected as u32);
+        refs.dividend_period_updating.set(false);
+    }
+
+    // With no historical year to choose, the selector has no useful action and
+    // is hidden entirely, matching the rest of Aureus's adaptive controls.
+    refs.dividend_period.set_visible(next.len() > 1);
+}
+
+fn dividend_shares_held_at(
+    transactions: &[Transaction],
+    splits: &[SplitEvent],
+    provider_symbol: &str,
+    timestamp: i64,
+) -> f64 {
+    let mut timeline = Vec::<(i64, u8, i64, f64, Option<f64>)>::new();
+    for transaction in transactions.iter().filter(|transaction| {
+        transaction.provider_symbol.eq_ignore_ascii_case(provider_symbol)
+            && transaction.timestamp <= timestamp
+    }) {
+        let priority = match transaction.transaction_type.as_str() {
+            "OPEN" => 1,
+            "BUY" => 2,
+            "TRANSFER_IN" => 3,
+            "SELL" => 4,
+            "TRANSFER_OUT" => 5,
+            _ => 6,
+        };
+        let delta = match transaction.transaction_type.as_str() {
+            "BUY" | "OPEN" | "TRANSFER_IN" => transaction.shares,
+            "SELL" | "TRANSFER_OUT" => -transaction.shares,
+            _ => 0.0,
+        };
+        timeline.push((
+            transaction.timestamp,
+            priority,
+            transaction.id,
+            delta,
+            None,
+        ));
+    }
+    for split in splits
+        .iter()
+        .filter(|split| split.timestamp <= timestamp)
+    {
+        timeline.push((split.timestamp, 0, 0, 0.0, Some(split.ratio)));
+    }
+    timeline.sort_by(|left, right| (left.0, left.1, left.2).cmp(&(right.0, right.1, right.2)));
+
+    let mut shares = 0.0;
+    for (_, _, _, delta, split_ratio) in timeline {
+        if let Some(ratio) = split_ratio {
+            shares *= ratio;
+        } else {
+            shares += delta;
+        }
+    }
+    shares.max(0.0)
+}
+
+fn estimated_future_dividend_events(
+    refs: &UiRefs,
+    provider_symbol: &str,
+    events: &[DividendEvent],
+    holding_currency: &str,
+    now: i64,
+    horizon: i64,
+) -> Vec<(i64, f64, String)> {
+    if horizon <= now {
+        return Vec::new();
+    }
+
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|event| event.timestamp);
+    let fallback = sorted
+        .iter()
+        .rev()
+        .find(|event| event.timestamp <= now)
+        .or_else(|| sorted.last());
+    let fallback_amount = fallback.map(|event| event.amount).unwrap_or(0.0);
+    let fallback_currency = fallback
+        .map(|event| {
+            if event.currency.trim().is_empty() {
+                holding_currency.to_string()
+            } else {
+                event.currency.clone()
+            }
+        })
+        .unwrap_or_else(|| holding_currency.to_string());
+
+    let mut future = sorted
+        .iter()
+        .filter(|event| event.timestamp > now && event.timestamp <= horizon)
+        .map(|event| {
+            (
+                event.timestamp,
+                event.amount,
+                if event.currency.trim().is_empty() {
+                    holding_currency.to_string()
+                } else {
+                    event.currency.clone()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let calendar_ex = refs
+        .state
+        .database
+        .dividend_calendar(provider_symbol)
+        .ok()
+        .flatten()
+        .and_then(|(ex, _)| ex);
+    if let Some(ex_date) = calendar_ex.filter(|date| *date > now && *date <= horizon) {
+        let duplicate = future
+            .iter()
+            .any(|(timestamp, _, _)| (*timestamp - ex_date).abs() <= 2 * 24 * 60 * 60);
+        if !duplicate && fallback_amount > 0.0 {
+            future.push((ex_date, fallback_amount, fallback_currency.clone()));
+        }
+    }
+    future.sort_by_key(|event| event.0);
+
+    let past = sorted
+        .iter()
+        .filter(|event| event.timestamp <= now)
+        .collect::<Vec<_>>();
+    let cadence = if past.len() >= 2 {
+        let last = past[past.len() - 1].timestamp;
+        let previous = past[past.len() - 2].timestamp;
+        let gap = last.saturating_sub(previous);
+        (gap >= 20 * 24 * 60 * 60 && gap <= 400 * 24 * 60 * 60).then_some(gap)
+    } else {
+        None
+    };
+
+    if let Some(cadence) = cadence {
+        let mut anchor = future
+            .last()
+            .map(|event| event.0)
+            .or(calendar_ex)
+            .or_else(|| past.last().map(|event| event.timestamp));
+        while let Some(current) = anchor {
+            let next = current.saturating_add(cadence);
+            if next <= now {
+                anchor = Some(next);
+                continue;
+            }
+            if next > horizon {
+                break;
+            }
+            let duplicate = future
+                .iter()
+                .any(|(timestamp, _, _)| (*timestamp - next).abs() <= 7 * 24 * 60 * 60);
+            if !duplicate && fallback_amount > 0.0 {
+                let amount = sorted
+                    .iter()
+                    .rev()
+                    .find(|event| event.timestamp <= current)
+                    .map(|event| event.amount)
+                    .unwrap_or(fallback_amount);
+                future.push((next, amount, fallback_currency.clone()));
+                future.sort_by_key(|event| event.0);
+            }
+            anchor = Some(next);
+        }
+    }
+
+    future
+}
+
 fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_cad: Option<f64>) {
     clear_list(&refs.dividend_list);
+    refs.dividend_recent_heading.set_visible(false);
+    // `clear_list()` also removes GtkListBox's placeholder widget because the
+    // placeholder is a child of the list. Reinstall it after every rebuild. While
+    // empty, remove the boxed-list class so the placeholder uses the same plain
+    // page surface as Aureus's Overview empty state instead of a gray card.
+    refs.dividend_list.remove_css_class("boxed-list");
+    let recent_empty = dividend_recent_empty_placeholder();
+    refs.dividend_list.set_placeholder(Some(&recent_empty));
+
     if positions.is_empty() {
         refs.dividends_stack.set_visible_child_name("empty");
         refs.dividend_income.set_label("—");
         refs.dividend_yield.set_label("—");
-        refs.dividend_positions.set_label("0");
         refs.dividend_status.set_label("No holdings yet");
-        refs.dividend_chart.set_message("Add a holding to see dividend estimates");
+        refs.dividend_chart
+            .set_message("Add a holding to see dividend estimates");
         return;
     }
     refs.dividends_stack.set_visible_child_name("portfolio");
@@ -2870,37 +3217,59 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
         name: String,
         currency: String,
         shares: f64,
-        position_count: usize,
     }
 
-    let mut holdings: HashMap<String, GroupedHolding> = HashMap::new();
+    let mut holdings = HashMap::<String, GroupedHolding>::new();
     for position in positions {
         let key = position.provider_symbol.to_ascii_uppercase();
         holdings
             .entry(key)
-            .and_modify(|holding| {
-                holding.shares += position.shares;
-                holding.position_count += 1;
-            })
+            .and_modify(|holding| holding.shares += position.shares)
             .or_insert_with(|| GroupedHolding {
                 code: position.code.clone(),
                 name: position.name.clone(),
                 currency: position.currency.clone(),
                 shares: position.shares,
-                position_count: 1,
             });
     }
 
     let now = current_unix_timestamp();
-    let ttm_cutoff = now.saturating_sub(366 * 24 * 60 * 60);
-    let month_keys = trailing_months(now, 12);
-    let mut month_values = vec![0.0_f64; month_keys.len()];
-    let mut estimated_annual = 0.0_f64;
-    let mut annual_complete = true;
-    let mut paying_positions = 0usize;
-    let mut recent = Vec::<RecentDistribution>::new();
-    let mut found_any = false;
+    let current_year = local_date_parts().0;
+    let transactions = refs.state.database.load_transactions().unwrap_or_default();
+    let active_symbols = holdings.keys().cloned().collect::<HashSet<_>>();
+    let oldest_year = transactions
+        .iter()
+        .filter(|transaction| {
+            active_symbols.contains(&transaction.provider_symbol.to_ascii_uppercase())
+                && matches!(
+                    transaction.transaction_type.as_str(),
+                    "BUY" | "OPEN" | "TRANSFER_IN"
+                )
+        })
+        .filter_map(|transaction| timestamp_year_month(transaction.timestamp).map(|(year, _)| year))
+        .min()
+        .unwrap_or(current_year);
+    sync_dividend_period_options(refs, oldest_year, current_year);
+    let selected_period = selected_dividend_period(refs);
+    let selected_year = match selected_period {
+        DividendPeriod::Annual => current_year,
+        DividendPeriod::Year(year) => year,
+    };
+
+    let mut splits = HashMap::<String, Vec<SplitEvent>>::new();
+    for symbol in holdings.keys() {
+        splits.insert(
+            symbol.clone(),
+            refs.state.database.split_events(symbol).unwrap_or_default(),
+        );
+    }
+
     let mut fetched_symbols = 0usize;
+    let mut found_any = false;
+    let mut recent = Vec::<RecentDistribution>::new();
+    let mut by_month = HashMap::<(i32, u32), f64>::new();
+    let mut estimated_months = HashSet::<(i32, u32)>::new();
+    let mut incomplete_years = HashSet::<i32>::new();
 
     for (symbol, holding) in &holdings {
         if refs
@@ -2913,60 +3282,115 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
         {
             fetched_symbols += 1;
         }
-        let events = refs.state.database.dividend_events(symbol).unwrap_or_default();
+
+        let mut events = refs.state.database.dividend_events(symbol).unwrap_or_default();
+        events.sort_by_key(|event| event.timestamp);
         if events.is_empty() {
             continue;
         }
         found_any = true;
-        let ttm = events
-            .iter()
-            .filter(|event| event.timestamp >= ttm_cutoff && event.timestamp <= now)
-            .map(|event| event.amount)
-            .sum::<f64>();
-        if ttm > 0.0 {
-            paying_positions += holding.position_count;
-            let native = ttm * holding.shares;
-            match convert_currency(native, &holding.currency, base, usd_cad) {
-                Some(value) => estimated_annual += value,
-                None => annual_complete = false,
-            }
-        }
 
+        let symbol_splits = splits.get(symbol).map(Vec::as_slice).unwrap_or(&[]);
         for event in events.iter().filter(|event| event.timestamp <= now) {
+            let shares = dividend_shares_held_at(
+                &transactions,
+                symbol_splits,
+                symbol,
+                event.timestamp,
+            );
+            // Provider history can predate the user's ownership by years. Those
+            // distributions are not part of this portfolio and must not appear
+            // in Recent Distributions or historical chart totals.
+            if shares <= 0.0000001 {
+                continue;
+            }
+
             let event_currency = if event.currency.trim().is_empty() {
                 holding.currency.as_str()
             } else {
                 event.currency.as_str()
             };
-            let estimated_native = event.amount * holding.shares;
-            let estimated_base = convert_currency(estimated_native, event_currency, base, usd_cad);
+            let native_value = event.amount * shares;
+            let base_value = convert_currency(native_value, event_currency, base, usd_cad);
             if let Some((year, month)) = timestamp_year_month(event.timestamp) {
-                if let Some(index) = month_keys
-                    .iter()
-                    .position(|(key_year, key_month)| *key_year == year && *key_month == month)
-                {
-                    if let Some(value) = estimated_base {
-                        month_values[index] += value;
+                match base_value {
+                    Some(value) => *by_month.entry((year, month)).or_insert(0.0) += value,
+                    None => {
+                        incomplete_years.insert(year);
                     }
                 }
             }
+
             recent.push(RecentDistribution {
                 timestamp: event.timestamp,
                 code: holding.code.clone(),
                 name: holding.name.clone(),
                 amount_per_share: event.amount,
                 native_currency: event_currency.to_string(),
-                estimated_base_value: estimated_base,
+                estimated_base_value: base_value,
             });
+        }
+
+        // The current Annual view is a Jan–Dec calendar-year forecast. Keep
+        // already-paid months tied to the shares actually held at each event,
+        // then fill the remaining months with announced/cadence estimates using
+        // today's share count. Historical years never receive forecast values.
+        let year_end = parse_trade_date(&format!("{current_year}-12-31"))
+            .unwrap_or(now)
+            .saturating_add(24 * 60 * 60 - 1);
+        for (timestamp, amount, currency) in estimated_future_dividend_events(
+            refs,
+            symbol,
+            &events,
+            &holding.currency,
+            now,
+            year_end,
+        ) {
+            let Some((year, month)) = timestamp_year_month(timestamp) else {
+                continue;
+            };
+            if year != current_year {
+                continue;
+            }
+            estimated_months.insert((year, month));
+            match convert_currency(amount * holding.shares, &currency, base, usd_cad) {
+                Some(value) => *by_month.entry((year, month)).or_insert(0.0) += value,
+                None => {
+                    incomplete_years.insert(year);
+                }
+            }
         }
     }
 
-    if annual_complete {
+    // Every period is a Jan–Dec view. "Annual" is simply the current year;
+    // explicit year options are historical years only.
+    let chart_values = (1..=12)
+        .map(|month| {
+            (
+                month_name(month).to_string(),
+                by_month
+                    .get(&(selected_year, month))
+                    .copied()
+                    .unwrap_or(0.0),
+                estimated_months.contains(&(selected_year, month)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let selected_total = chart_values
+        .iter()
+        .map(|(_, value, _)| *value)
+        .sum::<f64>();
+    let selected_complete = !incomplete_years.contains(&selected_year);
+
+    // The headline is derived from the exact same twelve buckets as the chart,
+    // so changing the period can never leave a stale forward run-rate above a
+    // smaller set of bars.
+    if selected_complete {
         refs.dividend_income
-            .set_label(&format_currency(estimated_annual, base));
-    } else if estimated_annual > 0.0 {
+            .set_label(&format_currency(selected_total, base));
+    } else if selected_total > 0.0 {
         refs.dividend_income
-            .set_label(&format!("{}+", format_currency(estimated_annual, base)));
+            .set_label(&format!("{}+", format_currency(selected_total, base)));
     } else {
         refs.dividend_income.set_label("—");
     }
@@ -2978,31 +3402,37 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
         base,
         usd_cad,
     );
-    match (portfolio_market, annual_complete) {
+    let yield_text = match (portfolio_market, selected_complete) {
         (Some(market), true) if market > f64::EPSILON => {
-            refs.dividend_yield
-                .set_label(&format!("{:.2}%", estimated_annual / market * 100.0));
+            format!("{:.2}% yield", selected_total / market * 100.0)
         }
-        _ => refs.dividend_yield.set_label("—"),
-    }
-    refs.dividend_positions
-        .set_label(&paying_positions.to_string());
+        _ => "— yield".to_string(),
+    };
+    let monthly_text = if selected_complete {
+        format!("{} avg/mo", format_currency(selected_total / 12.0, base))
+    } else {
+        "—/mo".to_string()
+    };
+    refs.dividend_yield
+        .set_label(&format!("{yield_text} · {monthly_text}"));
 
-    let chart_values = month_keys
-        .iter()
-        .zip(month_values.iter())
-        .map(|((year, month), value)| (format_month_label(*year, *month), *value))
-        .collect::<Vec<_>>();
-    if chart_values.iter().any(|(_, value)| *value > 0.0) {
+    if chart_values.iter().any(|(_, value, _)| *value > 0.0) {
         refs.dividend_chart.set_values(chart_values, base);
     } else if fetched_symbols == holdings.len() {
         refs.dividend_chart
-            .set_message("No distributions found in the last 12 months");
+            .set_message("No distributions while held in this period");
     } else {
-        refs.dividend_chart
-            .set_message("Checking dividend history");
+        refs.dividend_chart.set_message("Checking dividend history");
     }
 
+    // Recent Distributions follows the same period selector as the chart. The
+    // ListBox placeholder supplies the HIG-style empty state when nothing was
+    // actually received in that calendar year.
+    recent.retain(|distribution| {
+        timestamp_year_month(distribution.timestamp)
+            .map(|(year, _)| year == selected_year)
+            .unwrap_or(false)
+    });
     recent.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
     recent.truncate(16);
     for distribution in recent {
@@ -3015,7 +3445,10 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
             .subtitle(&format!(
                 "{} · {} per share",
                 distribution.name,
-                format_currency(distribution.amount_per_share, &distribution.native_currency)
+                format_currency(
+                    distribution.amount_per_share,
+                    &distribution.native_currency
+                )
             ))
             .build();
         row.set_activatable(false);
@@ -3033,32 +3466,51 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
         refs.dividend_list.append(&row);
     }
 
-    append_dividend_history_summaries(refs, positions, base, usd_cad);
+    append_dividend_history_summaries(refs, positions, base, usd_cad, selected_year);
 
+    // Keep Recent Distributions on the page surface in both states. Real rows
+    // are separated by native ListBox separators; an empty section shows only
+    // the centered placeholder. This avoids introducing a second heavy card.
+    refs.dividend_list.remove_css_class("boxed-list");
+    refs.dividend_recent_heading
+        .set_visible(refs.dividend_list.row_at_index(0).is_some());
+
+    // The selector already names historical years, so do not repeat the same
+    // year immediately below it. Annual names the current year because its
+    // selector label intentionally describes the mode rather than the year.
+    let period_note = match selected_period {
+        DividendPeriod::Annual => format!("{current_year} · received + estimated"),
+        DividendPeriod::Year(_) => "Received while held".to_string(),
+    };
     let mut note = if fetched_symbols < holdings.len() {
-        "Using cached data · updating".to_string()
+        format!("{period_note} · updating cached dividend data")
     } else if found_any {
-        "Trailing 12 months · estimated at current shares".to_string()
+        period_note
     } else {
         "No distributions found".to_string()
     };
-    if !annual_complete {
+    if !selected_complete {
         note.push_str(" · unsupported currencies excluded from totals");
     }
     refs.dividend_status.set_label(&note);
 }
-
 
 fn append_dividend_history_summaries(
     refs: &UiRefs,
     positions: &[Position],
     base: &str,
     usd_cad: Option<f64>,
+    selected_year: i32,
 ) {
     let cash_entries = refs.state.database.load_cash_entries().unwrap_or_default();
     let paid = cash_entries
         .into_iter()
-        .filter(|entry| entry.kind == "DIVIDEND")
+        .filter(|entry| {
+            entry.kind == "DIVIDEND"
+                && timestamp_year_month(entry.occurred_at)
+                    .map(|(year, _)| year == selected_year)
+                    .unwrap_or(false)
+        })
         .collect::<Vec<_>>();
     if paid.is_empty() {
         return;
@@ -12293,20 +12745,6 @@ fn market_status_text(positions: &[Position], base: &str, fx: Option<&FxRate>) -
     parts.join(" · ")
 }
 
-fn trailing_months(timestamp: i64, count: usize) -> Vec<(i32, u32)> {
-    let (year, month) = timestamp_year_month(timestamp).unwrap_or((1970, 1));
-    let absolute = i64::from(year) * 12 + i64::from(month.saturating_sub(1));
-    (0..count)
-        .rev()
-        .map(|offset| {
-            let value = absolute - offset as i64;
-            let year = value.div_euclid(12) as i32;
-            let month = value.rem_euclid(12) as u32 + 1;
-            (year, month)
-        })
-        .collect()
-}
-
 #[derive(Clone)]
 struct DateChooser {
     row: ActionRow,
@@ -12462,10 +12900,6 @@ fn format_distribution_date(timestamp: i64) -> String {
     }
     let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
     format!("{} {day}, {year}", month_name(month))
-}
-
-fn format_month_label(_year: i32, month: u32) -> String {
-    month_name(month).to_string()
 }
 
 fn month_name(month: u32) -> &'static str {
