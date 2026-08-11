@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -10,6 +10,7 @@ use crate::model::PricePoint;
 pub struct Sparkline {
     area: DrawingArea,
     points: Rc<RefCell<Vec<PricePoint>>>,
+    trend_override: Rc<Cell<Option<f64>>>,
 }
 
 impl Sparkline {
@@ -22,23 +23,40 @@ impl Sparkline {
         area.set_accessible_role(gtk::AccessibleRole::Img);
 
         let points = Rc::new(RefCell::new(Vec::new()));
+        let trend_override = Rc::new(Cell::new(None));
         {
             let points = points.clone();
+            let trend_override = trend_override.clone();
             area.set_draw_func(move |_, context, width, height| {
-                draw_sparkline(context, width, height, &points.borrow());
+                draw_sparkline(
+                    context,
+                    width,
+                    height,
+                    &points.borrow(),
+                    trend_override.get(),
+                );
             });
         }
 
-        Self { area, points }
+        Self {
+            area,
+            points,
+            trend_override,
+        }
     }
 
     pub fn widget(&self) -> &DrawingArea {
         &self.area
     }
 
-    pub fn set_points(&self, points: Vec<PricePoint>) {
+    pub fn set_points_with_trend(
+        &self,
+        points: Vec<PricePoint>,
+        trend_override: Option<f64>,
+    ) {
         self.area.set_visible(points.len() >= 2);
         *self.points.borrow_mut() = points;
+        self.trend_override.set(trend_override.filter(|trend| trend.is_finite()));
         self.area.queue_draw();
     }
 }
@@ -48,6 +66,7 @@ fn draw_sparkline(
     width: i32,
     height: i32,
     points: &[PricePoint],
+    trend_override: Option<f64>,
 ) {
     if points.len() < 2 {
         return;
@@ -83,14 +102,18 @@ fn draw_sparkline(
     high += padding;
     let price_span = (high - low).max(f64::EPSILON);
 
-    // Match Aureus's full-size price charts: the sparkline color describes
-    // the plotted period itself, not the user's UI accent. A non-negative
-    // first-to-last move is green; a negative move is red.
-    let rising = points
-        .last()
-        .zip(points.first())
-        .map(|(last, first)| last.close >= first.close)
-        .unwrap_or(true);
+    // When the caller provides a canonical percentage, use that as the
+    // direction so the sparkline color agrees with the value shown beside it.
+    // Fall back to the plotted points only when no canonical return is available.
+    let rising = trend_override
+        .map(|trend| trend >= 0.0)
+        .unwrap_or_else(|| {
+            points
+                .last()
+                .zip(points.first())
+                .map(|(last, first)| last.close >= first.close)
+                .unwrap_or(true)
+        });
     let (line_red, line_green, line_blue) = if rising {
         (46.0 / 255.0, 194.0 / 255.0, 126.0 / 255.0)
     } else {

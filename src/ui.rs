@@ -4556,7 +4556,7 @@ fn rebuild_watchlist_list(refs: &UiRefs, items: &[WatchlistItem]) {
                 .unwrap_or_default(),
             range,
         );
-        sparkline.set_points(points);
+        sparkline.set_points_with_trend(points, item.day_change_percent);
         content.append(sparkline.widget());
 
         row.set_child(Some(&content));
