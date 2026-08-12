@@ -11965,11 +11965,13 @@ fn present_edit_transaction_dialog(
         .halign(Align::Fill)
         .hexpand(true)
         .build();
+    let form_scroller = dialog_scroller(&body, 560);
+    form_scroller.set_vexpand(true);
     let page = GtkBox::builder()
         .orientation(Orientation::Vertical)
         .spacing(8)
         .build();
-    page.append(&body);
+    page.append(&form_scroller);
     let actions = dialog_bottom_action(&save);
     page.append(&actions);
 
@@ -11980,7 +11982,7 @@ fn present_edit_transaction_dialog(
     let dialog = Dialog::builder()
         .title("Edit Transaction")
         .content_width(520)
-        .content_height(640)
+        .content_height(620)
         .child(&toolbar)
         .build();
     install_escape_to_close(&dialog);
