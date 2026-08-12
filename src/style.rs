@@ -166,7 +166,7 @@ pub fn install() {
     gtk::style_context_add_provider_for_display(
         &display,
         &theme_provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
     THEME_PROVIDER.with(|slot| {
         *slot.borrow_mut() = Some(theme_provider);
