@@ -5756,7 +5756,7 @@ fn present_reports_dialog(parent: &ApplicationWindow, refs: UiRefs) {
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 560);
+    let scroller = dialog_bottom_form_scroller(&body, 560);
     scroller.set_vexpand(true);
     let actions = dialog_bottom_action(&export);
     let page = GtkBox::builder()
@@ -5773,7 +5773,7 @@ fn present_reports_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     let dialog = Dialog::builder()
         .title("Reports")
         .content_width(560)
-        .content_height(410)
+        .content_height(BOTTOM_PILL_DIALOG_REPORTS_HEIGHT)
         .child(&toolbar)
         .build();
     install_escape_to_close(&dialog);
@@ -9673,8 +9673,7 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 480);
-    scroller.set_vexpand(true);
+    let content = dialog_fixed_body(&body, 480);
 
     let add = Button::builder()
         .label("Add Account")
@@ -9688,7 +9687,7 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
         .orientation(Orientation::Vertical)
         .spacing(8)
         .build();
-    page.append(&scroller);
+    page.append(&content);
     page.append(&actions);
 
     let header = HeaderBar::new();
@@ -9700,7 +9699,7 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     let dialog = Dialog::builder()
         .title("Add Account")
         .content_width(480)
-        .content_height(320)
+        .content_height(BOTTOM_PILL_DIALOG_ACCOUNT_ADD_HEIGHT)
         .child(&toolbar)
         .build();
 
@@ -9928,11 +9927,7 @@ fn present_withdraw_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, accoun
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 480);
-    // GtkScrolledWindow does not propagate its child's natural height by default.
-    // In this fixed-height dialog that left the form at its minimum allocation,
-    // clipping the balance subtitle and hiding Amount/Date while the rest of the
-    // dialog remained empty. Let the form own the available vertical space.
+    let scroller = dialog_bottom_form_scroller(&body, 480);
     scroller.set_vexpand(true);
     let withdraw = Button::builder()
         .label("Withdraw Cash")
@@ -9952,7 +9947,7 @@ fn present_withdraw_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, accoun
     let dialog = Dialog::builder()
         .title("Withdraw Cash")
         .content_width(480)
-        .content_height(350)
+        .content_height(BOTTOM_PILL_DIALOG_CASH_HEIGHT)
         .child(&toolbar)
         .build();
 
@@ -10010,10 +10005,7 @@ fn present_add_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, account: Ac
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 480);
-    // Keep the complete form visible above the bottom action. Without vexpand,
-    // GtkScrolledWindow collapses to its minimum height and the dialog shows the
-    // exact broken layout where only the account row is visible.
+    let scroller = dialog_bottom_form_scroller(&body, 480);
     scroller.set_vexpand(true);
 
     let save = Button::builder()
@@ -10037,7 +10029,7 @@ fn present_add_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, account: Ac
     let dialog = Dialog::builder()
         .title("Add Cash")
         .content_width(480)
-        .content_height(350)
+        .content_height(BOTTOM_PILL_DIALOG_CASH_HEIGHT)
         .child(&toolbar)
         .build();
 
@@ -10153,7 +10145,7 @@ fn present_transfer_dialog(parent: &ApplicationWindow, refs: UiRefs, from_accoun
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 520);
+    let scroller = dialog_bottom_form_scroller(&body, 520);
     scroller.set_vexpand(true);
 
     let save = Button::builder()
@@ -10178,7 +10170,7 @@ fn present_transfer_dialog(parent: &ApplicationWindow, refs: UiRefs, from_accoun
     let dialog = Dialog::builder()
         .title("Transfer")
         .content_width(520)
-        .content_height(430)
+        .content_height(BOTTOM_PILL_DIALOG_TRANSFER_HEIGHT)
         .child(&toolbar)
         .build();
     install_escape_to_close(&dialog);
@@ -10330,8 +10322,7 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
 
     let body = dialog_body();
     body.append(&group);
-    let scroller = dialog_scroller(&body, 480);
-    scroller.set_vexpand(true);
+    let content = dialog_fixed_body(&body, 480);
 
     let save = Button::builder()
         .label("Save")
@@ -10344,7 +10335,7 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
         .orientation(Orientation::Vertical)
         .spacing(8)
         .build();
-    page.append(&scroller);
+    page.append(&content);
     page.append(&actions);
 
     let header = HeaderBar::new();
@@ -10355,7 +10346,7 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
     let dialog = Dialog::builder()
         .title("Edit Account")
         .content_width(480)
-        .content_height(340)
+        .content_height(BOTTOM_PILL_DIALOG_ACCOUNT_EDIT_HEIGHT)
         .child(&toolbar)
         .build();
 
@@ -11442,7 +11433,7 @@ fn present_add_activity_dialog_with_context(
         .build();
     let form_body = dialog_body();
     form_body.append(&activity_group);
-    let form_scroller = dialog_scroller(&form_body, 560);
+    let form_scroller = dialog_bottom_form_scroller(&form_body, 560);
     form_scroller.set_vexpand(true);
     let form_page = GtkBox::builder()
         .orientation(Orientation::Vertical)
@@ -11482,7 +11473,7 @@ fn present_add_activity_dialog_with_context(
     let dialog = Dialog::builder()
         .title("Add Activity")
         .content_width(560)
-        .content_height(570)
+        .content_height(BOTTOM_PILL_DIALOG_FULL_HEIGHT)
         .child(&toolbar)
         .build();
     install_escape_to_close(&dialog);
@@ -11965,7 +11956,7 @@ fn present_edit_transaction_dialog(
         .halign(Align::Fill)
         .hexpand(true)
         .build();
-    let form_scroller = dialog_scroller(&body, 560);
+    let form_scroller = dialog_bottom_form_scroller(&body, 560);
     form_scroller.set_vexpand(true);
     let page = GtkBox::builder()
         .orientation(Orientation::Vertical)
@@ -11982,7 +11973,7 @@ fn present_edit_transaction_dialog(
     let dialog = Dialog::builder()
         .title("Edit Transaction")
         .content_width(520)
-        .content_height(620)
+        .content_height(BOTTOM_PILL_DIALOG_FULL_HEIGHT)
         .child(&toolbar)
         .build();
     install_escape_to_close(&dialog);
@@ -12148,6 +12139,65 @@ fn accounts_icon_name() -> &'static str {
     // the visually different smart-card device icon on systems where Icon
     // Library extras are not installed.
     "aureus-credit-card-symbolic"
+}
+
+// Keep the Record/Add Activity sheet as the vertical-rhythm reference.
+// Shorter forms use content-sized heights so their top breathing room and
+// form-to-pill gap visually match Record instead of leaving dead space.
+const BOTTOM_PILL_DIALOG_REPORTS_HEIGHT: i32 = 390;
+const BOTTOM_PILL_DIALOG_ACCOUNT_ADD_HEIGHT: i32 = 365;
+const BOTTOM_PILL_DIALOG_ACCOUNT_EDIT_HEIGHT: i32 = 375;
+const BOTTOM_PILL_DIALOG_CASH_HEIGHT: i32 = 350;
+const BOTTOM_PILL_DIALOG_TRANSFER_HEIGHT: i32 = 460;
+const BOTTOM_PILL_DIALOG_FULL_HEIGHT: i32 = 570;
+
+fn dialog_fixed_body(body: &GtkBox, maximum_size: i32) -> GtkBox {
+    // Short bottom-pill forms use the same vertical slot as Record, but without
+    // a scroller. The expanding spacer keeps the form anchored to the bottom of
+    // the content area so the form-to-pill gap is identical across dialogs.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(maximum_size)
+        .tightening_threshold(400)
+        .child(body)
+        .build();
+    let spacer = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .vexpand(true)
+        .build();
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .vexpand(true)
+        .build();
+    content.append(&spacer);
+    content.append(&clamp);
+    content
+}
+
+fn dialog_bottom_form_scroller(body: &GtkBox, maximum_size: i32) -> gtk::ScrolledWindow {
+    // Bottom-pill dialogs share one vertical rhythm: the form settles at the
+    // bottom of its content slot so the form-to-pill gap stays identical. Dialog
+    // height is selected separately from three content-size tiers; taller forms
+    // can still scroll when the available window height genuinely requires it.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(maximum_size)
+        .tightening_threshold(400)
+        .child(body)
+        .build();
+    let spacer = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .vexpand(true)
+        .build();
+    let content = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .vexpand(true)
+        .build();
+    content.append(&spacer);
+    content.append(&clamp);
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .child(&content)
+        .build()
 }
 
 fn dialog_bottom_action(button: &Button) -> GtkBox {
