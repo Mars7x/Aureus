@@ -30,8 +30,8 @@ const LAYOUT_CSS: &str = r#"
 
 .range-toggle {
   min-width: 0;
-  padding-left: 6px;
-  padding-right: 6px;
+  padding-left: 2px;
+  padding-right: 2px;
 }
 
 /* Keep the narrow view switcher visually continuous with the page.

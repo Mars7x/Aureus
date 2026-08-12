@@ -2255,7 +2255,7 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
 
     let history_ranges = GtkBox::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
+        .spacing(4)
         .homogeneous(true)
         .build();
     let mut first_history_range: Option<ToggleButton> = None;
@@ -7460,7 +7460,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
 
     let range_box = GtkBox::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
+        .spacing(4)
         .homogeneous(true)
         .build();
     let active_range = Rc::new(Cell::new(HistoryRange::OneDay));
@@ -8717,7 +8717,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
 
     let range_box = GtkBox::builder()
         .orientation(Orientation::Horizontal)
-        .spacing(6)
+        .spacing(4)
         .homogeneous(true)
         .build();
     let active_range = Rc::new(Cell::new(HistoryRange::OneDay));
@@ -11958,23 +11958,32 @@ fn present_edit_transaction_dialog(
     let body = dialog_body();
     body.append(&security_group);
     body.append(&group);
-    let scroller = dialog_scroller(&body, 520);
 
     let save = Button::builder()
         .label("Save")
-        .css_classes(["suggested-action"])
+        .css_classes(["suggested-action", "pill"])
+        .halign(Align::Fill)
+        .hexpand(true)
         .build();
+    let page = GtkBox::builder()
+        .orientation(Orientation::Vertical)
+        .spacing(8)
+        .build();
+    page.append(&body);
+    let actions = dialog_bottom_action(&save);
+    page.append(&actions);
+
     let header = HeaderBar::new();
-    header.pack_end(&save);
     let toolbar = ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&scroller));
+    toolbar.set_content(Some(&page));
     let dialog = Dialog::builder()
         .title("Edit Transaction")
         .content_width(520)
-        .content_height(560)
+        .content_height(640)
         .child(&toolbar)
         .build();
+    install_escape_to_close(&dialog);
 
     {
         let settle_cash = settle_cash.clone();
