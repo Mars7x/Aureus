@@ -35,6 +35,8 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 
 ## Roadmap
 - Figure out a way to reliably fetch company icons and remove manually setting icons.
+- Windows support
+- Android support
   
 ## Disclaimers
 - Aureus is for personal portfolio tracking and does not provide financial, investment, tax, or legal advice.
