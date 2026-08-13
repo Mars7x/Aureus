@@ -34,7 +34,7 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 - Used [Planify](https://flathub.org/apps/io.github.alainm23.planify) colour scheme for libadwaita colours
 
 ## Roadmap
-- Figure out a way to reliably fetch company icons and remove manually setting icons.
+- Fetch brand logos
 - Windows support
 - Android support
   
