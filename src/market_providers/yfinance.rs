@@ -34,7 +34,7 @@ impl YfinanceProvider {
 
 fn yahoo_range(range: HistoryRange) -> &'static str {
     match range {
-        HistoryRange::OneDay => "1d",
+        HistoryRange::OneDay => "5d",
         HistoryRange::FiveDays => "5d",
         HistoryRange::OneMonth => "1mo",
         HistoryRange::SixMonths => "6mo",
@@ -1769,7 +1769,7 @@ mod tests {
     #[test]
     fn every_supported_range_has_an_explicit_yahoo_request_mapping() {
         let cases = [
-            (HistoryRange::OneDay, "1d", "5m"),
+            (HistoryRange::OneDay, "5d", "5m"),
             (HistoryRange::FiveDays, "5d", "15m"),
             (HistoryRange::OneMonth, "1mo", "1d"),
             (HistoryRange::SixMonths, "6mo", "1d"),

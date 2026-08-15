@@ -36,7 +36,7 @@ const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
 const PORTFOLIO_HISTORY_RANGE_KEY: &str = "portfolio-history-range";
 const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
-const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v12-exact-range-meta";
+const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v13-portfolio-boundaries";
 const USD_CAD_PAIR: &str = "USDCAD";
 const USD_CAD_HISTORY_SYMBOL: &str = "CAD=X";
 const QUOTE_CACHE_SECONDS: i64 = 15 * 60;
@@ -12314,19 +12314,26 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         symbols.insert(transaction.provider_symbol.to_ascii_uppercase());
     }
 
+    // Keep both the full cached window and the visible chart window. The wider
+    // cache is required for an exact pre-range valuation (most importantly the
+    // previous regular-session close for 1D); trimming it before calculating
+    // performance silently changes the return boundary to the first visible bar.
+    let mut raw_histories = HashMap::<String, Vec<PricePoint>>::new();
     let mut histories = HashMap::<String, Vec<PricePoint>>::new();
     let mut missing = 0usize;
     for symbol in &symbols {
-        let points = market_data::display_history_points(
-            refs.state
-                .database
-                .history_points(symbol, range.interval(), minimum)
-                .unwrap_or_default(),
-            range,
-        );
+        let mut raw = refs
+            .state
+            .database
+            .history_points(symbol, range.interval(), minimum)
+            .unwrap_or_default();
+        raw.sort_by_key(|point| point.timestamp);
+        raw.dedup_by_key(|point| point.timestamp);
+        let points = market_data::display_history_points(raw.clone(), range);
         if points.is_empty() {
             missing += 1;
         } else {
+            raw_histories.insert(symbol.clone(), raw);
             histories.insert(symbol.clone(), points);
         }
     }
@@ -12405,7 +12412,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         (transactions.clone(), cash_entries.clone())
     };
 
-    let points = build_portfolio_value_points(
+    let mut points = build_portfolio_value_points(
         &history_transactions,
         &history_cash_entries,
         &split_events,
@@ -12416,6 +12423,19 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         visible_maximum,
     );
 
+    // All-time performance must end at the portfolio value Aureus is showing
+    // now, not at the value reconstructed from a coarse monthly chart candle.
+    // Updating the chart endpoint as well keeps the visual and headline amount
+    // internally consistent.
+    let current_all_value = (range == HistoryRange::All)
+        .then(|| current_portfolio_value(refs, &base))
+        .flatten();
+    if let Some(value) = current_all_value {
+        if let Some(last) = points.last_mut() {
+            last.close = value;
+        }
+    }
+
     if points.len() >= 2 {
         let investment_return = if range == HistoryRange::OneDay {
             visible_maximum.and_then(|session_end| {
@@ -12423,21 +12443,40 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                     &transactions,
                     &cash_entries,
                     &split_events,
-                    &histories,
+                    &raw_histories,
                     fx_points.as_deref(),
                     &base,
                     visible_minimum,
                     session_end,
                 )
             })
+        } else if range == HistoryRange::All {
+            current_all_value.and_then(|current_value| {
+                portfolio_all_investment_return(
+                    current_value,
+                    &transactions,
+                    &cash_entries,
+                    fx_points.as_deref(),
+                    &base,
+                )
+            })
         } else {
-            portfolio_range_investment_return(
-                &points,
-                &history_transactions,
-                &history_cash_entries,
-                fx_points.as_deref(),
-                &base,
-            )
+            let range_start = histories
+                .values()
+                .filter_map(|history| history.first().map(|point| point.timestamp))
+                .max();
+            range_start.and_then(|range_start| {
+                portfolio_range_investment_return(
+                    &points,
+                    &transactions,
+                    &cash_entries,
+                    &split_events,
+                    &raw_histories,
+                    fx_points.as_deref(),
+                    &base,
+                    range_start,
+                )
+            })
         };
         refs.portfolio_history_chart
             .set_points_with_trend(points, &base, range, investment_return);
@@ -12519,6 +12558,22 @@ fn portfolio_one_day_investment_return(
             return Some(amount);
         }
         let rate = historical_fx_at(fx_points, timestamp)?;
+        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
+            Some(amount * rate)
+        } else if currency.eq_ignore_ascii_case("CAD")
+            && base.eq_ignore_ascii_case("USD")
+            && rate > 0.0
+        {
+            Some(amount / rate)
+        } else {
+            None
+        }
+    };
+    let convert_before = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
+        if currency.eq_ignore_ascii_case(base) {
+            return Some(amount);
+        }
+        let rate = historical_fx_before(fx_points, timestamp)?;
         if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
             Some(amount * rate)
         } else if currency.eq_ignore_ascii_case("CAD")
@@ -12630,11 +12685,14 @@ fn portfolio_one_day_investment_return(
         }
 
         let history = histories.get(&symbol)?;
-        let opening_price = historical_close_at(Some(history.as_slice()), session_start)?;
+        // A brokerage-style day change is measured from the previous regular
+        // close. The first intraday candle is already part of today's move and
+        // must never be used as the opening baseline.
+        let opening_price = historical_close_before(Some(history.as_slice()), session_start)?;
         let closing_price = historical_close_at(Some(history.as_slice()), session_end)?;
         let currency = currencies.get(&symbol).map(String::as_str).unwrap_or(base);
 
-        opening_market += convert_at(opening_count * opening_price, currency, session_start)?;
+        opening_market += convert_before(opening_count * opening_price, currency, session_start)?;
         closing_market += convert_at(closing_count * closing_price, currency, session_end)?;
     }
 
@@ -12662,7 +12720,7 @@ fn portfolio_one_day_investment_return(
 
     let mut opening_cash_value = 0.0;
     for ((_, currency), amount) in &opening_cash {
-        opening_cash_value += convert_at(*amount, currency, session_start)?;
+        opening_cash_value += convert_before(*amount, currency, session_start)?;
     }
     let mut closing_cash_value = 0.0;
     for ((_, currency), amount) in &closing_cash {
@@ -12693,16 +12751,170 @@ fn portfolio_one_day_investment_return(
     gain.is_finite().then_some(gain)
 }
 
-fn portfolio_range_investment_return(
-    points: &[PricePoint],
+fn current_portfolio_value(refs: &UiRefs, base: &str) -> Option<f64> {
+    let positions = refs.state.database.load_positions().ok()?;
+    let accounts = refs.state.database.load_accounts().ok()?;
+    let usd_cad = refs
+        .state
+        .database
+        .fx_rate(USD_CAD_PAIR)
+        .ok()
+        .flatten()
+        .map(|rate| rate.rate);
+
+    let holdings = if positions.is_empty() {
+        Some(0.0)
+    } else {
+        sum_optional_converted(
+            positions
+                .iter()
+                .map(|position| (position.market_value(), position.currency.as_str())),
+            base,
+            usd_cad,
+        )
+    }?;
+    let cash = sum_converted(
+        accounts
+            .iter()
+            .map(|account| (account.cash, account.currency.as_str())),
+        base,
+        usd_cad,
+    )?;
+    let value = holdings + cash;
+    value.is_finite().then_some(value)
+}
+
+fn portfolio_all_investment_return(
+    current_value: f64,
     transactions: &[Transaction],
     cash_entries: &[CashEntry],
     fx_points: Option<&[PricePoint]>,
     base: &str,
 ) -> Option<f64> {
+    let convert_at = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
+        if currency.eq_ignore_ascii_case(base) {
+            return Some(amount);
+        }
+        let rate = historical_fx_at(fx_points, timestamp)?;
+        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
+            Some(amount * rate)
+        } else if currency.eq_ignore_ascii_case("CAD")
+            && base.eq_ignore_ascii_case("USD")
+            && rate > 0.0
+        {
+            Some(amount / rate)
+        } else {
+            None
+        }
+    };
+
+    // Lifetime return is a ledger calculation, not a chart-candle calculation:
+    // current tracked wealth minus net wealth contributed from outside Aureus.
+    // This makes the very first purchase use its actual execution price and fee
+    // instead of an unrelated monthly market candle.
+    let mut external_flow = 0.0;
+    for entry in cash_entries.iter().filter(|entry| entry.kind == "DEPOSIT") {
+        external_flow += convert_at(entry.amount, &entry.currency, entry.occurred_at)?;
+    }
+
+    for transaction in transactions.iter().filter(|transaction| !transaction.settle_cash) {
+        let native_flow = match transaction.transaction_type.as_str() {
+            "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
+            "SELL" => -(transaction.shares * transaction.price - transaction.fees),
+            "TRANSFER_IN" | "TRANSFER_OUT" => continue,
+            _ => continue,
+        };
+        external_flow += convert_at(
+            native_flow,
+            &transaction.currency,
+            transaction.timestamp,
+        )?;
+    }
+
+    let gain = current_value - external_flow;
+    gain.is_finite().then_some(gain)
+}
+
+fn portfolio_opening_value_before_session(
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+    split_events: &[SplitEvent],
+    histories: &HashMap<String, Vec<PricePoint>>,
+    fx_points: Option<&[PricePoint]>,
+    base: &str,
+    session_start: i64,
+) -> Option<(i64, f64)> {
+    let session_day = session_start.div_euclid(86_400);
+    let (year, month, day) = civil_from_days(session_day);
+    let session_date = format!("{year:04}-{month:02}-{day:02}");
+    let opening_timestamp = session_day
+        .saturating_mul(86_400)
+        .saturating_sub(1);
+
+    // Aureus activity is date-only. Exclude activity recorded for the first
+    // visible trading date so the opening snapshot is the previous session's
+    // portfolio, then let those trades/cash flows enter during the range.
+    let opening_transactions = transactions
+        .iter()
+        .filter(|transaction| transaction.trade_date.as_str() < session_date.as_str())
+        .cloned()
+        .collect::<Vec<_>>();
+    let opening_cash_entries = cash_entries
+        .iter()
+        .filter(|entry| entry.occurred_at.div_euclid(86_400) < session_day)
+        .cloned()
+        .collect::<Vec<_>>();
+    let opening_splits = split_events
+        .iter()
+        .filter(|split| split.timestamp.div_euclid(86_400) < session_day)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if opening_transactions.is_empty() && opening_cash_entries.is_empty() {
+        return Some((opening_timestamp, 0.0));
+    }
+
+    let points = build_portfolio_value_points(
+        &opening_transactions,
+        &opening_cash_entries,
+        &opening_splits,
+        histories,
+        fx_points,
+        base,
+        opening_timestamp,
+        Some(opening_timestamp),
+    );
+    let value = points.last()?.close;
+    value.is_finite().then_some((opening_timestamp, value))
+}
+
+fn portfolio_range_investment_return(
+    points: &[PricePoint],
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+    split_events: &[SplitEvent],
+    histories: &HashMap<String, Vec<PricePoint>>,
+    fx_points: Option<&[PricePoint]>,
+    base: &str,
+    range_start: i64,
+) -> Option<f64> {
     let first = points.first()?;
     let last = points.last()?;
-    if last.timestamp <= first.timestamp {
+    let (opening_timestamp, opening_value) = portfolio_opening_value_before_session(
+        transactions,
+        cash_entries,
+        split_events,
+        histories,
+        fx_points,
+        base,
+        range_start,
+    )
+    // Some provider windows begin exactly at the visible boundary and contain
+    // no earlier candle. Preserve the previous first-point behavior in that
+    // case instead of blanking the range while still using the exact pre-range
+    // snapshot whenever the backing cache contains one.
+    .unwrap_or((first.timestamp, first.close));
+    if last.timestamp <= opening_timestamp {
         return None;
     }
 
@@ -12723,14 +12935,13 @@ fn portfolio_range_investment_return(
         }
     };
 
-    // Portfolio value includes account cash, so deposits/withdrawals and trades
-    // funded outside the account must be removed from the raw value change.
-    // Internal cash settlement, dividends, and account-to-account transfers stay
-    // in performance because they do not add or remove wealth from the portfolio.
+    // Remove only external money movement after the pre-range snapshot. Trade
+    // settlement against tracked account cash, dividends, and transfers between
+    // Aureus accounts remain part of portfolio performance.
     let mut external_flow = 0.0;
     for entry in cash_entries.iter().filter(|entry| {
         entry.kind == "DEPOSIT"
-            && entry.occurred_at > first.timestamp
+            && entry.occurred_at > opening_timestamp
             && entry.occurred_at <= last.timestamp
     }) {
         external_flow += convert_at(entry.amount, &entry.currency, entry.occurred_at)?;
@@ -12738,17 +12949,12 @@ fn portfolio_range_investment_return(
 
     for transaction in transactions.iter().filter(|transaction| {
         !transaction.settle_cash
-            && transaction.timestamp > first.timestamp
+            && transaction.timestamp > opening_timestamp
             && transaction.timestamp <= last.timestamp
     }) {
         let native_flow = match transaction.transaction_type.as_str() {
-            // A non-cash-funded buy/opening position brings an asset into the
-            // tracked portfolio from outside it, so treat its cost as a contribution.
             "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
-            // A non-cash-settled sale removes the net proceeds from the tracked
-            // portfolio, so it is an external withdrawal.
             "SELL" => -(transaction.shares * transaction.price - transaction.fees),
-            // Holding transfers are paired internal movements between accounts.
             "TRANSFER_IN" | "TRANSFER_OUT" => continue,
             _ => continue,
         };
@@ -12759,7 +12965,7 @@ fn portfolio_range_investment_return(
         )?;
     }
 
-    let gain = last.close - first.close - external_flow;
+    let gain = last.close - opening_value - external_flow;
     gain.is_finite().then_some(gain)
 }
 
@@ -13095,8 +13301,18 @@ fn historical_close_at(points: Option<&[PricePoint]>, timestamp: i64) -> Option<
     index.checked_sub(1).map(|index| points[index].close)
 }
 
+fn historical_close_before(points: Option<&[PricePoint]>, timestamp: i64) -> Option<f64> {
+    let points = points?;
+    let index = points.partition_point(|point| point.timestamp < timestamp);
+    index.checked_sub(1).map(|index| points[index].close)
+}
+
 fn historical_fx_at(points: Option<&[PricePoint]>, timestamp: i64) -> Option<f64> {
     historical_close_at(points, timestamp)
+}
+
+fn historical_fx_before(points: Option<&[PricePoint]>, timestamp: i64) -> Option<f64> {
+    historical_close_before(points, timestamp)
 }
 
 fn transaction_price_at(
@@ -13323,7 +13539,10 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let mut histories = Vec::new();
         let mut failures = 0usize;
         for symbol in to_fetch {
-            match market_data::history(&symbol, range) {
+            // Portfolio performance needs the provider's backing window so it
+            // can value the instant immediately before the visible range. The
+            // UI trims this cache only when drawing the chart.
+            match market_data::history_window(&symbol, range) {
                 Ok(history) => histories.push((symbol, history)),
                 Err(_) => failures += 1,
             }
