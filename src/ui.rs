@@ -12275,6 +12275,70 @@ fn update_portfolio_range_return_label(
     });
 }
 
+fn portfolio_history_fetch_key(range: HistoryRange) -> String {
+    if matches!(range, HistoryRange::OneDay | HistoryRange::All) {
+        range.key().to_string()
+    } else {
+        // Portfolio performance needs wider backing data than a normal stock
+        // detail chart. Keep its fetch freshness separate so a recently loaded
+        // detail chart cannot make an insufficient portfolio cache look fresh.
+        format!("portfolio-anchor-v1-{}", range.key())
+    }
+}
+
+fn portfolio_visible_range_start(
+    range: HistoryRange,
+    histories: &HashMap<String, Vec<PricePoint>>,
+    fx_points: Option<&[PricePoint]>,
+) -> Option<i64> {
+    let fx_visible = || {
+        fx_points.map(|points| market_data::display_history_points(points.to_vec(), range))
+    };
+
+    if range == HistoryRange::FiveDays {
+        // Define portfolio 5D on one shared calendar: the latest five market
+        // dates on which at least one tracked security traded. This avoids one
+        // exchange holiday making another symbol silently shift the whole
+        // portfolio to a different start date. Securities closed on the first
+        // selected date are naturally carried at their previous close.
+        let mut days = BTreeSet::<i64>::new();
+        for points in histories.values() {
+            for point in points {
+                days.insert(point.timestamp.div_euclid(86_400));
+            }
+        }
+        if days.is_empty() {
+            if let Some(points) = fx_visible() {
+                for point in points {
+                    days.insert(point.timestamp.div_euclid(86_400));
+                }
+            }
+        }
+        let start_day = days.iter().rev().nth(4).copied().or_else(|| days.first().copied())?;
+        return histories
+            .values()
+            .flat_map(|points| points.iter())
+            .filter(|point| point.timestamp.div_euclid(86_400) == start_day)
+            .map(|point| point.timestamp)
+            .min()
+            .or_else(|| {
+                fx_visible().and_then(|points| {
+                    points
+                        .iter()
+                        .filter(|point| point.timestamp.div_euclid(86_400) == start_day)
+                        .map(|point| point.timestamp)
+                        .min()
+                })
+            });
+    }
+
+    histories
+        .values()
+        .filter_map(|history| history.first().map(|point| point.timestamp))
+        .min()
+        .or_else(|| fx_visible().and_then(|points| points.first().map(|point| point.timestamp)))
+}
+
 fn update_portfolio_history_from_cache(refs: &UiRefs) {
     let range = refs.portfolio_history_range.get();
     let base = base_currency(&refs.state);
@@ -12325,7 +12389,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         let mut raw = refs
             .state
             .database
-            .history_points(symbol, range.interval(), minimum)
+            .history_points(symbol, range.portfolio_interval(), minimum)
             .unwrap_or_default();
         raw.sort_by_key(|point| point.timestamp);
         raw.dedup_by_key(|point| point.timestamp);
@@ -12349,7 +12413,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         refs
             .state
             .database
-            .history_points(USD_CAD_HISTORY_SYMBOL, range.interval(), minimum)
+            .history_points(USD_CAD_HISTORY_SYMBOL, range.portfolio_interval(), minimum)
             .unwrap_or_default()
     });
     let fx_missing = needs_fx
@@ -12377,8 +12441,11 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                     .and_then(|points| points.first().map(|point| point.timestamp))
             })
             .unwrap_or_else(|| now.saturating_sub(24 * 60 * 60))
-    } else {
+    } else if range == HistoryRange::All {
         minimum
+    } else {
+        portfolio_visible_range_start(range, &histories, fx_points.as_deref())
+            .unwrap_or(minimum)
     };
     let visible_maximum = if range == HistoryRange::OneDay {
         // Do not append a synthetic "now" point after the market has closed.
@@ -12421,6 +12488,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         &base,
         visible_minimum,
         visible_maximum,
+        matches!(range, HistoryRange::OneDay | HistoryRange::All),
     );
 
     // All-time performance must end at the portfolio value Aureus is showing
@@ -12461,22 +12529,19 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                 )
             })
         } else {
-            let range_start = histories
-                .values()
-                .filter_map(|history| history.first().map(|point| point.timestamp))
-                .max();
-            range_start.and_then(|range_start| {
-                portfolio_range_investment_return(
-                    &points,
-                    &transactions,
-                    &cash_entries,
-                    &split_events,
-                    &raw_histories,
-                    fx_points.as_deref(),
-                    &base,
-                    range_start,
-                )
-            })
+            // `visible_minimum` is the selected range's real first market
+            // session. The cache intentionally starts earlier only so the
+            // opening valuation can use the genuine previous close.
+            portfolio_range_investment_return(
+                &points,
+                &transactions,
+                &cash_entries,
+                &split_events,
+                &raw_histories,
+                fx_points.as_deref(),
+                &base,
+                visible_minimum,
+            )
         };
         refs.portfolio_history_chart
             .set_points_with_trend(points, &base, range, investment_return);
@@ -12883,6 +12948,7 @@ fn portfolio_opening_value_before_session(
         base,
         opening_timestamp,
         Some(opening_timestamp),
+        false,
     );
     let value = points.last()?.close;
     value.is_finite().then_some((opening_timestamp, value))
@@ -12898,7 +12964,6 @@ fn portfolio_range_investment_return(
     base: &str,
     range_start: i64,
 ) -> Option<f64> {
-    let first = points.first()?;
     let last = points.last()?;
     let (opening_timestamp, opening_value) = portfolio_opening_value_before_session(
         transactions,
@@ -12908,12 +12973,7 @@ fn portfolio_range_investment_return(
         fx_points,
         base,
         range_start,
-    )
-    // Some provider windows begin exactly at the visible boundary and contain
-    // no earlier candle. Preserve the previous first-point behavior in that
-    // case instead of blanking the range while still using the exact pre-range
-    // snapshot whenever the backing cache contains one.
-    .unwrap_or((first.timestamp, first.close));
+    )?;
     if last.timestamp <= opening_timestamp {
         return None;
     }
@@ -13078,6 +13138,7 @@ fn build_portfolio_value_points(
     base: &str,
     minimum: i64,
     maximum: Option<i64>,
+    allow_transaction_price_fallback: bool,
 ) -> Vec<PricePoint> {
     if transactions.is_empty() && cash_entries.is_empty() {
         return Vec::new();
@@ -13231,9 +13292,12 @@ fn build_portfolio_value_points(
                 complete = false;
                 break;
             };
-            let Some(price) = historical_close_at(Some(symbol_history.as_slice()), timestamp)
-                .or_else(|| transaction_price_at(&sorted_transactions, symbol, timestamp))
-            else {
+            let price = historical_close_at(Some(symbol_history.as_slice()), timestamp).or_else(|| {
+                allow_transaction_price_fallback
+                    .then(|| transaction_price_at(&sorted_transactions, symbol, timestamp))
+                    .flatten()
+            });
+            let Some(price) = price else {
                 complete = false;
                 break;
             };
@@ -13473,6 +13537,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
     }
 
     let range = refs.portfolio_history_range.get();
+    let fetch_key = portfolio_history_fetch_key(range);
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
     let mut symbols = HashSet::<String>::new();
@@ -13485,13 +13550,13 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let cached_empty = refs
             .state
             .database
-            .history_points(&symbol, range.interval(), minimum)
+            .history_points(&symbol, range.portfolio_interval(), minimum)
             .map(|points| points.is_empty())
             .unwrap_or(true);
         let stale = refs
             .state
             .database
-            .history_needs_refresh(&symbol, range.key(), range.interval(), range.cache_seconds())
+            .history_needs_refresh(&symbol, &fetch_key, range.portfolio_interval(), range.cache_seconds())
             .unwrap_or(true);
         if cached_empty || stale {
             to_fetch.push(symbol);
@@ -13507,7 +13572,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let cached_fx = refs
             .state
             .database
-            .history_points(USD_CAD_HISTORY_SYMBOL, range.interval(), minimum)
+            .history_points(USD_CAD_HISTORY_SYMBOL, range.portfolio_interval(), minimum)
             .unwrap_or_default();
         let cached_empty = cached_fx.is_empty();
         let one_day_window_too_short = range == HistoryRange::OneDay
@@ -13519,7 +13584,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let stale = refs
             .state
             .database
-            .history_needs_refresh(USD_CAD_HISTORY_SYMBOL, range.key(), range.interval(), range.cache_seconds())
+            .history_needs_refresh(USD_CAD_HISTORY_SYMBOL, &fetch_key, range.portfolio_interval(), range.cache_seconds())
             .unwrap_or(true);
         cached_empty || stale || one_day_window_too_short
     } else {
@@ -13542,7 +13607,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
             // Portfolio performance needs the provider's backing window so it
             // can value the instant immediately before the visible range. The
             // UI trims this cache only when drawing the chart.
-            match market_data::history_window(&symbol, range) {
+            match market_data::portfolio_history_window(&symbol, range) {
                 Ok(history) => histories.push((symbol, history)),
                 Err(_) => failures += 1,
             }
@@ -13550,7 +13615,7 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
         let fx_history = if fetch_fx {
             // Keep the full OneDay backing window for conversion. Securities
             // themselves are trimmed to their latest market session.
-            match market_data::history_window(USD_CAD_HISTORY_SYMBOL, range) {
+            match market_data::portfolio_history_window(USD_CAD_HISTORY_SYMBOL, range) {
                 Ok(history) => Some(history),
                 Err(_) => {
                     failures += 1;
@@ -13578,26 +13643,27 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
             return glib::ControlFlow::Break;
         }
 
+        let fetch_key = portfolio_history_fetch_key(result.range);
         for (symbol, history) in &result.histories {
             let _ = refs
                 .state
                 .database
-                .save_history(symbol, result.range.interval(), &history.points);
+                .save_history(symbol, result.range.portfolio_interval(), &history.points);
             let _ = refs.state.database.set_history_fetched(
                 symbol,
-                result.range.key(),
-                result.range.interval(),
+                &fetch_key,
+                result.range.portfolio_interval(),
             );
         }
         if let Some(history) = &result.fx_history {
             let _ = refs
                 .state
                 .database
-                .save_history(USD_CAD_HISTORY_SYMBOL, result.range.interval(), &history.points);
+                .save_history(USD_CAD_HISTORY_SYMBOL, result.range.portfolio_interval(), &history.points);
             let _ = refs.state.database.set_history_fetched(
                 USD_CAD_HISTORY_SYMBOL,
-                result.range.key(),
-                result.range.interval(),
+                &fetch_key,
+                result.range.portfolio_interval(),
             );
         }
 

@@ -112,6 +112,16 @@ impl HistoryRange {
         }
     }
 
+    /// Portfolio performance uses daily 5Y backing data so its opening dollar
+    /// value is anchored to the actual previous market close rather than a
+    /// sampled weekly candle. The chart renderer will downsample as needed.
+    pub fn portfolio_interval(self) -> &'static str {
+        match self {
+            Self::FiveYears => "1d",
+            _ => self.interval(),
+        }
+    }
+
     pub fn cache_seconds(self) -> i64 {
         match self {
             Self::OneDay => 2 * 60,
@@ -301,6 +311,17 @@ pub trait MarketDataProvider {
         provider_symbol: &str,
         range: HistoryRange,
     ) -> Result<History, MarketError>;
+    /// Wider backing history used by portfolio performance. The visible chart
+    /// is still trimmed to `range`; this contract only guarantees enough data
+    /// before the visible boundary to value the portfolio at the prior market
+    /// close. Providers that already return a wider window may use the default.
+    fn portfolio_history_window(
+        &self,
+        provider_symbol: &str,
+        range: HistoryRange,
+    ) -> Result<History, MarketError> {
+        self.history_window(provider_symbol, range)
+    }
     /// Optional extended-session history for security-detail charts. Providers
     /// that do not expose pre-/post-market candles can safely fall back to the
     /// regular-session history contract.
@@ -733,6 +754,14 @@ pub fn history_with_extended_hours(
 
 pub fn history_window(provider_symbol: &str, range: HistoryRange) -> Result<History, MarketError> {
     let history = with_provider(|provider| provider.history_window(provider_symbol, range))?;
+    sanitize_history_result(provider_symbol, history)
+}
+
+pub fn portfolio_history_window(
+    provider_symbol: &str,
+    range: HistoryRange,
+) -> Result<History, MarketError> {
+    let history = with_provider(|provider| provider.portfolio_history_window(provider_symbol, range))?;
     sanitize_history_result(provider_symbol, history)
 }
 

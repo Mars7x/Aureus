@@ -1491,6 +1491,39 @@ fn history_window_impl(provider_symbol: &str, range: HistoryRange) -> Result<His
     history_window_mode_impl(provider_symbol, range, false)
 }
 
+fn portfolio_history_window_impl(
+    provider_symbol: &str,
+    range: HistoryRange,
+) -> Result<History, MarketError> {
+    // 1D already uses Yahoo's wider five-day 5-minute response so the previous
+    // regular close is present. All already uses `max`, and its headline return
+    // is ledger-based rather than candle-based. Leave both paths unchanged.
+    if matches!(range, HistoryRange::OneDay | HistoryRange::All) {
+        return history_window_impl(provider_symbol, range);
+    }
+
+    let symbol = provider_symbol.trim();
+    if symbol.is_empty() {
+        return Err(MarketError("This holding has no Yahoo Finance symbol".into()));
+    }
+
+    // Portfolio ranges need one genuine market close before the visible range.
+    // Yahoo's named windows (5d/1mo/6mo/ytd/1y/5y) normally start *inside* the
+    // requested period, so use an explicit, deliberately wider period instead.
+    // HistoryRange::minimum_timestamp() already includes a holiday/weekend
+    // buffer appropriate for each range. The UI later trims these points back to
+    // exactly 5D/1M/6M/YTD/1Y/5Y for display.
+    let now = now_unix();
+    let period1 = range.minimum_timestamp(now).max(0);
+    let period2 = now.saturating_add(2 * 24 * 60 * 60);
+    let encoded = urlencoding::encode(symbol);
+    let url = format!(
+        "{CHART_URL}/{encoded}?period1={period1}&period2={period2}&interval={}&includePrePost=false&events=div%2Csplits%2CcapitalGains",
+        range.portfolio_interval()
+    );
+    history_from_url(symbol, &url, None, false)
+}
+
 fn history_window_with_extended_hours_impl(
     provider_symbol: &str,
     range: HistoryRange,
@@ -1728,6 +1761,14 @@ impl MarketDataProvider for YfinanceProvider {
         range: HistoryRange,
     ) -> Result<History, MarketError> {
         history_window_impl(provider_symbol, range)
+    }
+
+    fn portfolio_history_window(
+        &self,
+        provider_symbol: &str,
+        range: HistoryRange,
+    ) -> Result<History, MarketError> {
+        portfolio_history_window_impl(provider_symbol, range)
     }
 
     fn history_window_with_extended_hours(
