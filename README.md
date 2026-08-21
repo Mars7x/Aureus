@@ -1,6 +1,6 @@
 # Aureus 
 
-Aureus is a GTK4 and libadwaita portfolio tracker built for Linux desktop and mobile devices.
+Aureus is simple portfolio tracker built for Linux desktop and mobile devices.
 
 ## Features
 - Multiple accounts
