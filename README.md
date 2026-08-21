@@ -11,10 +11,17 @@ Aureus is a GTK4 and libadwaita portfolio tracker built for Linux desktop and mo
 - Reports available as a PDF export
 
 ## Screenshots
-<p align="center"><img width="1110" height="770" alt="Screenshot From 2026-08-10 22-18-40" src="https://github.com/user-attachments/assets/c64b9cd6-fa68-4ea6-a166-fbeb287cc783" />
-<img width="1110" height="770" alt="Screenshot From 2026-08-10 22-20-35" src="https://github.com/user-attachments/assets/e9f461f9-2b72-4945-8221-250a5fc91d69" />
-<p align="center"><img width="410" height="784" alt="Screenshot From 2026-08-10 22-21-54" src="https://github.com/user-attachments/assets/3f65b835-b7ec-434c-b41d-914c661d7a77" />
-<img width="410" height="784" alt="Screenshot From 2026-08-10 22-21-47" src="https://github.com/user-attachments/assets/0edb57f7-4bd4-4b5e-9e2d-79c8d9915dc2" />
+<div align="center">
+  <img width="1183" alt="Screenshot From 2026-08-21 14-22-51" src="https://github.com/user-attachments/assets/d379c477-b03b-45ce-8f4e-5a998c46fb94" style="background: transparent;" />
+
+  <img width="1183" alt="Screenshot From 2026-08-21 14-23-00" src="https://github.com/user-attachments/assets/fdbaa30b-0146-4844-ad06-1a1acb247ec7" style="background: transparent;" />
+
+  <br />
+
+  <img width="410" alt="Screenshot From 2026-08-21 14-23-16" src="https://github.com/user-attachments/assets/bb636df6-bd4c-4cb0-b43f-6d4733b732f3" />
+  &nbsp;&nbsp;
+  <img width="410" alt="Screenshot From 2026-08-21 14-23-21" src="https://github.com/user-attachments/assets/c7f1e319-8c32-4b7c-94d7-4a4fa17c917e" />
+</div>
 
 ## Build
 
