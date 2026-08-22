@@ -44,6 +44,7 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 - Fetch brand logos
 - Windows support
 - Android support
+- iOS support
   
 ## Disclaimers
 - Aureus is for personal portfolio tracking and does not provide financial, investment, tax, or legal advice.
