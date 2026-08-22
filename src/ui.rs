@@ -7911,8 +7911,11 @@ fn load_watch_history_range(
     detail: WatchDetailRefs,
     range: HistoryRange,
     announce: bool,
-    _force_refresh: bool,
+    force_refresh: bool,
 ) {
+    if force_refresh {
+        market_data::invalidate_security_detail_snapshot(&detail.provider_symbol);
+    }
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
     let cache_interval = security_detail_history_cache_interval(range);
@@ -9334,8 +9337,11 @@ fn load_history_range(
     detail: DetailRefs,
     range: HistoryRange,
     announce: bool,
-    _force_refresh: bool,
+    force_refresh: bool,
 ) {
+    if force_refresh {
+        market_data::invalidate_security_detail_snapshot(&detail.provider_symbol);
+    }
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
     let cache_interval = security_detail_history_cache_interval(range);

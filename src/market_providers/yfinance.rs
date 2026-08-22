@@ -29,6 +29,7 @@ const MAX_CLOCK_SKEW_SECONDS: i64 = 10 * 60;
 const MAX_EVENT_FUTURE_SECONDS: i64 = 3 * 366 * 24 * 60 * 60;
 const MIN_MARKET_TIMESTAMP: i64 = -2_208_988_800; // 1900-01-01 UTC
 const CRUMB_CACHE_SECONDS: i64 = 30 * 60;
+const RANGE_BADGE_CACHE_SECONDS: i64 = 60;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct YfinanceProvider;
@@ -499,6 +500,12 @@ struct YahooQuotePageRangeBadges {
     all: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CachedYahooQuotePageRangeBadges {
+    badges: YahooQuotePageRangeBadges,
+    fetched_at: i64,
+}
+
 impl YahooQuotePageRangeBadges {
     fn for_range(self, range: HistoryRange) -> Option<f64> {
         match range {
@@ -701,6 +708,26 @@ fn parse_quote_page_range_badges(html: &str) -> Option<YahooQuotePageRangeBadges
     None
 }
 
+fn range_badge_cache() -> &'static Mutex<HashMap<String, CachedYahooQuotePageRangeBadges>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedYahooQuotePageRangeBadges>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clear the short-lived, in-memory Yahoo range-bar snapshot for a security.
+/// Security-detail manual refreshes call this before fetching so refresh always
+/// reaches Yahoo, while ordinary range switches can reuse the same coherent set
+/// of 5D/1M/6M/YTD/1Y/5Y/All percentages.
+pub fn invalidate_security_detail_snapshot(provider_symbol: &str) {
+    let key = provider_symbol.trim().to_ascii_uppercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = range_badge_cache().lock() {
+        cache.remove(&key);
+    }
+}
+
 fn get_yahoo_quote_page_html(symbol: &str) -> Result<String, MarketError> {
     let encoded = urlencoding::encode(symbol);
     let url = format!("{YAHOO_QUOTE_PAGE_URL}/{encoded}/?p={encoded}&lang=en-US&region=US");
@@ -734,6 +761,40 @@ fn get_yahoo_quote_page_html(symbol: &str) -> Result<String, MarketError> {
     Ok(body)
 }
 
+fn yahoo_quote_page_range_badges(
+    symbol: &str,
+) -> Result<YahooQuotePageRangeBadges, MarketError> {
+    let key = symbol.trim().to_ascii_uppercase();
+    let now = now_unix();
+    if let Ok(cache) = range_badge_cache().lock() {
+        if let Some(cached) = cache.get(&key) {
+            if now.saturating_sub(cached.fetched_at) <= RANGE_BADGE_CACHE_SECONDS
+                && cached.badges.complete()
+            {
+                return Ok(cached.badges);
+            }
+        }
+    }
+
+    let html = get_yahoo_quote_page_html(symbol)?;
+    let badges = parse_quote_page_range_badges(&html).ok_or_else(|| {
+        MarketError(format!(
+            "Yahoo Finance did not provide a complete quote-page range bar for {symbol}"
+        ))
+    })?;
+
+    if let Ok(mut cache) = range_badge_cache().lock() {
+        cache.insert(
+            key,
+            CachedYahooQuotePageRangeBadges {
+                badges,
+                fetched_at: now,
+            },
+        );
+    }
+    Ok(badges)
+}
+
 /// Exact quote-page range parity is intentionally treated as a separate market
 /// datum from chart OHLC. Yahoo's chart metadata (`chartPreviousClose`) is not
 /// the value displayed by the quote page for every symbol/window; sparse
@@ -745,12 +806,7 @@ fn yahoo_quote_page_range_return(symbol: &str, range: HistoryRange) -> Result<Op
     if range == HistoryRange::OneDay {
         return Ok(None);
     }
-    let html = get_yahoo_quote_page_html(symbol)?;
-    let badges = parse_quote_page_range_badges(&html).ok_or_else(|| {
-        MarketError(format!(
-            "Yahoo Finance did not provide a complete quote-page range bar for {symbol}"
-        ))
-    })?;
+    let badges = yahoo_quote_page_range_badges(symbol)?;
     Ok(badges.for_range(range))
 }
 
@@ -1973,6 +2029,22 @@ fn history_from_url(
     range: Option<HistoryRange>,
     chart_includes_extended_hours: bool,
 ) -> Result<History, MarketError> {
+    // Larger security-detail ranges need three independent Yahoo products:
+    // chart candles, a current quote, and the quote-page range bar. Start the
+    // two auxiliary requests before the chart request so network latency is
+    // overlapped instead of paid sequentially. Keep 1D on its existing path;
+    // extended-hours eligibility can trigger a second chart request there and
+    // 1D is already the lightweight/fast path.
+    let parallel_auxiliary_requests = range.filter(|range| *range != HistoryRange::OneDay);
+    let quote_worker = parallel_auxiliary_requests.map(|_| {
+        let symbol = symbol.to_string();
+        std::thread::spawn(move || quote_impl(&symbol))
+    });
+    let range_badges_worker = parallel_auxiliary_requests.map(|_| {
+        let symbol = symbol.to_string();
+        std::thread::spawn(move || yahoo_quote_page_range_badges(&symbol))
+    });
+
     let envelope: YahooChartEnvelope = get_json(url)?;
 
     if let Some(error) = envelope.chart.error {
@@ -2047,7 +2119,10 @@ fn history_from_url(
     // "current" deliberately separate:
     // - headline/display price may be PRE/POST when Yahoo says that session is active;
     // - range-return numerator stays regular-session only.
-    let quote_snapshot = range.and_then(|_| quote_impl(symbol).ok());
+    let quote_snapshot = match quote_worker {
+        Some(worker) => worker.join().ok().and_then(Result::ok),
+        None => range.and_then(|_| quote_impl(symbol).ok()),
+    };
     let regular_current_snapshot = freshest_regular_snapshot(
         quote_snapshot.as_ref(),
         regular_chart_price,
@@ -2097,9 +2172,16 @@ fn history_from_url(
     // closed if it is unavailable; never fall back to a guessed denominator.
     let range_return_percent = match range {
         Some(HistoryRange::OneDay) => day_change_percent,
-        Some(named_range) => yahoo_quote_page_range_return(symbol, named_range)
-            .ok()
-            .flatten(),
+        Some(named_range) => match range_badges_worker {
+            Some(worker) => worker
+                .join()
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|badges| badges.for_range(named_range)),
+            None => yahoo_quote_page_range_return(symbol, named_range)
+                .ok()
+                .flatten(),
+        },
         None => None,
     };
 

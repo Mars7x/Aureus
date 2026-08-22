@@ -735,6 +735,16 @@ pub fn quote(provider_symbol: &str) -> Result<Quote, MarketError> {
     validate_quote_result(provider_symbol, quote)
 }
 
+/// Invalidate provider-local, short-lived data used only by security-detail
+/// range switching. This does not clear persisted quote/history fallback data.
+pub fn invalidate_security_detail_snapshot(provider_symbol: &str) {
+    match active_config().provider {
+        MarketProviderKind::Yfinance => {
+            crate::market_providers::yfinance::invalidate_security_detail_snapshot(provider_symbol)
+        }
+    }
+}
+
 pub fn dividends(provider_symbol: &str) -> Result<DividendHistory, MarketError> {
     let history = with_provider(|provider| provider.dividends(provider_symbol))?;
     sanitize_dividend_history(provider_symbol, history)
