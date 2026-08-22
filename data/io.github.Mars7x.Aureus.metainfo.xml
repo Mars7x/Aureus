@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>io.github.Mars7x.Aureus</id>
   <name>Aureus</name>
-  <summary>A clean portfolio tracker that just works</summary>
+  <summary>Simple portfolio tracker</summary>
 
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
@@ -13,94 +13,17 @@
 
   <description>
     <p>
-      Aureus is a native GTK4 and libadwaita portfolio tracker for Linux. Track
-      multiple investment accounts, holdings, trades, cash activity, dividends,
-      portfolio performance, and watchlists in an adaptive interface.
-    </p>
-    <p>
-      Aureus supports 25 account and portfolio currencies, historical
-      exchange-rate-aware performance, stock search, PDF reports, and local
-      portfolio backups. Market data is provided by Yahoo Finance, with Bank of
-      Canada data used for supported exchange-rate history and reference rates.
+      Aureus is a simple portfolio tracker built for Linux desktop and mobile devices.
     </p>
   </description>
 
   <url type="homepage">https://github.com/Mars7x/Aureus</url>
-  <url type="bugtracker">https://github.com/Mars7x/Aureus/issues</url>
-  <url type="vcs-browser">https://github.com/Mars7x/Aureus</url>
-
-  <keywords>
-    <keyword>portfolio</keyword>
-    <keyword>stocks</keyword>
-    <keyword>investments</keyword>
-    <keyword>dividends</keyword>
-    <keyword>finance</keyword>
-  </keywords>
 
   <launchable type="desktop-id">io.github.Mars7x.Aureus.desktop</launchable>
-  <provides>
-    <binary>aureus</binary>
-  </provides>
-
-  <screenshots>
-    <screenshot type="default">
-      <image>https://github.com/user-attachments/assets/d379c477-b03b-45ce-8f4e-5a998c46fb94</image>
-      <caption>Portfolio overview</caption>
-    </screenshot>
-    <screenshot>
-      <image>https://github.com/user-attachments/assets/fdbaa30b-0146-4844-ad06-1a1acb247ec7</image>
-      <caption>Portfolio activity and analysis</caption>
-    </screenshot>
-    <screenshot>
-      <image>https://github.com/user-attachments/assets/bb636df6-bd4c-4cb0-b43f-6d4733b732f3</image>
-      <caption>Adaptive portfolio view</caption>
-    </screenshot>
-    <screenshot>
-      <image>https://github.com/user-attachments/assets/c7f1e319-8c32-4b7c-94d7-4a4fa17c917e</image>
-      <caption>Adaptive stock view</caption>
-    </screenshot>
-  </screenshots>
 
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release type="stable" version="1.2.0" date="2026-08-22">
-      <description>
-        <p>Aureus 1.2.0 adds full multi-currency portfolio support and major market-data accuracy improvements.</p>
-        <ul>
-          <li>Support 25 account and portfolio currencies with a configurable Portfolio Currency.</li>
-          <li>Use historical exchange rates for portfolio performance, dividends, and reports.</li>
-          <li>Preserve native account, transaction, settlement, and fee currencies for cross-currency activity.</li>
-          <li>Match Yahoo Finance range performance for 5D, 1M, 6M, YTD, 1Y, 5Y, and All.</li>
-          <li>Keep persisted quotes as last-known fallback values while requesting live prices during normal use.</li>
-          <li>Improve portfolio range stability, refresh behavior, theme enforcement, and toast presentation.</li>
-        </ul>
-      </description>
-    </release>
-    <release type="stable" version="1.1.1" date="2026-08-11">
-      <description>
-        <p>Polishes dialogs and adaptive layouts, standardizes bottom action forms, fixes narrow-window scaling, and remembers the selected Overview chart range between launches.</p>
-      </description>
-    </release>
-    <release type="stable" version="1.1.0" date="2026-08-11">
-      <description>
-        <p>Adds session-aware market pricing, extended-hours 1D charts, automatic stock-split handling, dividend cash credits, improved Yahoo Finance resilience, and Allocation refinements.</p>
-      </description>
-    </release>
-    <release type="stable" version="1.0.2" date="2026-08-10">
-      <description>
-        <p>Improves Dividends, Allocation, pull-to-refresh, account removal, Watchlist sparklines, adaptive dialogs, and general interface polish.</p>
-      </description>
-    </release>
-    <release type="stable" version="1.0.1" date="2026-08-10">
-      <description>
-        <p>Fixes same-day 1D portfolio return calculations and adds Bank of Canada attribution for exchange-rate data.</p>
-      </description>
-    </release>
-    <release type="stable" version="1.0.0" date="2026-08-10">
-      <description>
-        <p>Initial release with portfolio tracking, accounts, cash activity, dividends, interactive history charts, reporting, backups, stock search, and watchlists.</p>
-      </description>
-    </release>
+    <release version="1.2.0" date="2026-08-22" />
   </releases>
 </component>
