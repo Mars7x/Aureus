@@ -8,7 +8,7 @@ Aureus is a simple native portfolio tracker built for Linux desktop and mobile d
 
 Current repository anchors at the time this document was written:
 
-- Version: `1.2.0`
+- Version: `1.2.1`
 - App ID: `io.github.Mars7x.Aureus`
 - Binary/package: `aureus`
 - Author: Mars7x
@@ -374,6 +374,9 @@ Current intended policy:
 - Watchlist/portfolio navigation and startup refresh paths request live data as designed.
 - Persisted quote fields are a last-known/offline fallback only.
 - Never treat a recently persisted security quote as permission to skip a live quote request.
+- Security-detail non-1D requests overlap the Yahoo chart, quote, and range-bar fetches to reduce range-switch latency.
+- A complete Yahoo range bar may be reused in memory for up to 60 seconds while its published two-decimal percentages remain coherent with the newest live regular-session quote.
+- Manual refresh invalidates that short-lived range-bar snapshot so it reaches Yahoo.
 - Historical chart data can use range-specific caches.
 - FX reference/history data can be cached.
 - Dividend history uses its own longer cache window.

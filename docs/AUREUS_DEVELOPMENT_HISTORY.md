@@ -385,3 +385,13 @@ The current source tree always wins.
 When the user explicitly supplies a new base source and says it is current/authoritative, that source supersedes earlier checkpoints. Re-read the current code before carrying an old implementation assumption forward.
 
 Keep this history file for decisions and regressions, but update `AUREUS_PROJECT_CONTEXT.md` whenever the intended current behavior changes.
+
+## 17. 1.2.1 range-switch performance
+
+Version 1.2.1 improves security-detail range-switch latency without changing the established Yahoo range-percentage semantics.
+
+For non-1D ranges, Aureus now overlaps the independent Yahoo chart, live-quote, and quote-page range-bar requests. A complete range-bar snapshot can also be reused briefly across ordinary range switches while its published two-decimal values remain coherent with the newest regular-session quote.
+
+Manual refresh explicitly invalidates the short-lived snapshot so it still reaches Yahoo. The cache is in-memory only and does not replace persisted chart history or the live-quote freshness policy. If the range bar cannot be validated, Aureus continues to fail closed rather than reconstructing an approximate percentage.
+
+The concise public release note is: improved performance when switching security chart ranges.
