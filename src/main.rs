@@ -1,5 +1,6 @@
 mod allocation_ring;
 mod chart;
+mod currency;
 mod database;
 mod dividend_chart;
 mod fx;

@@ -19,9 +19,9 @@
   </provides>
   <content_rating type="oars-1.1" />
   <releases>
-    <release version="1.1.2" date="2026-08-14">
+    <release version="1.1.2" date="2026-08-21">
       <description>
-        <p>Improves portfolio performance accuracy across all ranges with correct market-boundary anchoring, previous-close 1D calculations, ledger-based lifetime returns, and more precise long-range historical backing data. Also strengthens the built-in Aureus theme so it overrides custom GTK styling while enabled and refines toast styling.</p>
+        <p>Expands Aureus to 25 supported account and portfolio currencies with a user-selectable Portfolio Currency, Yahoo Finance current exchange rates, Bank of Canada historical and reference rates, cross-currency portfolio valuation, historical FX-aware performance and reports, normalized Yahoo quote sub-units, and safer account-currency handling. Also improves portfolio range accuracy, strengthens Aureus theme enforcement, and refines toast styling.</p>
       </description>
     </release>
     <release version="1.1.1" date="2026-08-11">

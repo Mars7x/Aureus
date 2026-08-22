@@ -21,13 +21,14 @@ use gtk::{
 
 use crate::allocation_ring::{allocation_color, AllocationRing, AllocationSlice};
 use crate::chart::PriceChart;
+use crate::currency;
 use crate::database::Database;
 use crate::dividend_chart::DividendChart;
 use crate::fx::{self, FxQuote};
 use crate::market_data::{self, DividendHistory, History, HistoryRange, Quote, SearchResult};
 use crate::sparkline::Sparkline;
 use crate::model::{
-    convert_currency, Account, CashEntry, DividendEvent, FxRate, NewAccount, NewTransaction, NewWatchlistItem,
+    convert_currency, Account, CashEntry, DividendEvent, FxRates, NewAccount, NewTransaction, NewWatchlistItem,
     Position, PricePoint, SplitEvent, Transaction, WatchlistItem,
 };
 
@@ -36,11 +37,11 @@ const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
 const PORTFOLIO_HISTORY_RANGE_KEY: &str = "portfolio-history-range";
 const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
-const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v13-portfolio-boundaries";
-const USD_CAD_PAIR: &str = "USDCAD";
-const USD_CAD_HISTORY_SYMBOL: &str = "CAD=X";
-const QUOTE_CACHE_SECONDS: i64 = 15 * 60;
-const FX_CACHE_SECONDS: i64 = 12 * 60 * 60;
+const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v20-yahoo-quote-range-bar";
+// Quotes are persisted only as last-known display/offline fallback values. They
+// never suppress a live quote request. FX observations retain a short TTL
+// because central-bank/reference rates do not change tick-by-tick.
+const FX_CACHE_SECONDS: i64 = 15 * 60;
 const DIVIDEND_CACHE_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone)]
@@ -403,7 +404,7 @@ struct DetailRefs {
     market_value: Label,
     total_gain: Label,
     base_currency: String,
-    usd_cad: Option<f64>,
+    fx_rates: FxRates,
     range_return: Label,
     range_high_low: Label,
     history_status: Label,
@@ -424,7 +425,11 @@ struct HistoryLoadResult {
 struct WatchDetailRefs {
     app: UiRefs,
     provider_symbol: String,
-    currency: String,
+    name: String,
+    exchange: String,
+    currency: Rc<RefCell<String>>,
+    hero_metadata: Label,
+    currency_value: Label,
     chart: PriceChart,
     current_price: Label,
     day_change: Label,
@@ -807,8 +812,7 @@ impl UiRefs {
         };
 
         let base = base_currency(&self.state);
-        let fx_rate = self.state.database.fx_rate(USD_CAD_PAIR).ok().flatten();
-        let usd_cad = fx_rate.as_ref().map(|rate| rate.rate);
+        let fx_rates = current_fx_rates(&self.state);
         let transactions = match self.state.database.load_transactions() {
             Ok(transactions) => transactions,
             Err(error) => {
@@ -830,13 +834,41 @@ impl UiRefs {
         self.watchlist_stack
             .set_visible_child_name(if has_watchlist { "watchlist" } else { "empty" });
 
+        let split_events = match self.state.database.all_split_events() {
+            Ok(events) => events,
+            Err(error) => {
+                self.toast_overlay
+                    .add_toast(Toast::new(&format!("Could not load stock splits: {error}")));
+                return;
+            }
+        };
+        let portfolio_ledger = if has_transactions {
+            investment_ledger_in_currency(&transactions, &split_events, &base, &fx_rates)
+        } else {
+            Some((HashMap::new(), 0.0))
+        };
+
         // Only rebuild the visible page. Hidden pages are refreshed when they
         // become visible, which avoids repeatedly destroying and recreating
         // every row in the application after a single quote or cache update.
         match current_page.as_str() {
             "overview" => {
-                rebuild_overview_list(&self.overview_list, &positions, &accounts, &base, usd_cad);
-                rebuild_allocation(self, &positions, &accounts, &base, usd_cad);
+                rebuild_overview_list(
+                    &self.overview_list,
+                    &positions,
+                    &accounts,
+                    &base,
+                    &fx_rates,
+                    portfolio_ledger.as_ref().map(|(ledgers, _)| ledgers),
+                );
+                rebuild_allocation(
+                    self,
+                    &positions,
+                    &accounts,
+                    &base,
+                    &fx_rates,
+                    portfolio_ledger.as_ref().map(|(ledgers, _)| ledgers),
+                );
                 rebuild_upcoming_actions(self, &positions);
                 update_portfolio_history_from_cache(self);
             }
@@ -845,21 +877,27 @@ impl UiRefs {
                 &accounts,
                 &positions,
                 &base,
-                usd_cad,
+                &fx_rates,
             ),
             "watchlist" => rebuild_watchlist_list(self, &watchlist),
-            "dividends" => rebuild_dividend_page(self, &positions, &base, usd_cad),
+            "dividends" => rebuild_dividend_page(self, &positions, &base, &fx_rates),
             _ => {}
         }
 
+        // Cost basis is an account-ledger concept, not simply the security's
+        // native execution price translated at today's FX rate. Using the
+        // settlement-aware ledger preserves the brokerage's actual FX spread
+        // and fees for cross-currency holdings while still presenting the total
+        // in Portfolio Currency.
         let basis = if has_positions {
-            sum_converted(
-                positions
-                    .iter()
-                    .map(|position| (position.cost_basis(), position.currency.as_str())),
-                &base,
-                usd_cad,
-            )
+            portfolio_ledger.as_ref().and_then(|(ledgers, _)| {
+                let mut total = 0.0;
+                for position in &positions {
+                    let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+                    total += ledgers.get(&key)?.cost_basis;
+                }
+                Some(total)
+            })
         } else {
             Some(0.0)
         };
@@ -869,7 +907,7 @@ impl UiRefs {
                     .iter()
                     .map(|position| (position.market_value(), position.currency.as_str())),
                 &base,
-                usd_cad,
+                &fx_rates,
             )
         } else {
             Some(0.0)
@@ -880,7 +918,7 @@ impl UiRefs {
                 .iter()
                 .map(|account| (account.cash, account.currency.as_str())),
             &base,
-            usd_cad,
+            &fx_rates,
         );
         let portfolio_value = match (market, cash_total) {
             (Some(market), Some(cash)) => Some(market + cash),
@@ -908,16 +946,8 @@ impl UiRefs {
             }
         }
 
-        let split_events = match self.state.database.all_split_events() {
-            Ok(events) => events,
-            Err(error) => {
-                self.toast_overlay
-                    .add_toast(Toast::new(&format!("Could not load stock splits: {error}")));
-                return;
-            }
-        };
         let realized = if has_transactions {
-            realized_gain_from_transactions(&transactions, &split_events, &base, usd_cad)
+            portfolio_ledger.as_ref().map(|(_, realized)| *realized)
         } else {
             None
         };
@@ -934,7 +964,7 @@ impl UiRefs {
         }
 
         let quote_note = if has_positions {
-            market_status_text(&positions, &base, fx_rate.as_ref())
+            market_status_text(&self.state, &positions, &base, &fx_rates)
         } else if has_cash {
             "Cash balance".into()
         } else if has_transactions {
@@ -961,16 +991,10 @@ impl UiRefs {
         let accounts = self.state.database.load_accounts().unwrap_or_default();
         let watchlist = self.state.database.load_watchlist().unwrap_or_default();
         let base = base_currency(&self.state);
-        let usd_cad = self
-            .state
-            .database
-            .fx_rate(USD_CAD_PAIR)
-            .ok()
-            .flatten()
-            .map(|rate| rate.rate);
+        let fx_rates = current_fx_rates(&self.state);
 
-        rebuild_accounts_list(&self.accounts_list, &accounts, &positions, &base, usd_cad);
-        rebuild_dividend_page(self, &positions, &base, usd_cad);
+        rebuild_accounts_list(&self.accounts_list, &accounts, &positions, &base, &fx_rates);
+        rebuild_dividend_page(self, &positions, &base, &fx_rates);
         rebuild_watchlist_list(self, &watchlist);
     }
 }
@@ -1374,13 +1398,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
             }
             let positions = refs.state.database.load_positions().unwrap_or_default();
             let base = base_currency(&refs.state);
-            let usd_cad = refs
-                .state
-                .database
-                .fx_rate(USD_CAD_PAIR)
-                .ok()
-                .flatten()
-                .map(|rate| rate.rate);
+            let fx_rates = current_fx_rates(&refs.state);
 
             // Period changes are a visual data transition, not navigation. Fade the
             // complete dividend result set out, rebuild it for the newly selected
@@ -1396,7 +1414,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
             ];
             let refs_for_update = refs.clone();
             crossfade_loaded_widgets(widgets, move || {
-                rebuild_dividend_page(&refs_for_update, &positions, &base, usd_cad);
+                rebuild_dividend_page(&refs_for_update, &positions, &base, &fx_rates);
             });
         });
     }
@@ -1899,7 +1917,6 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     {
         let refs = refs.clone();
         let dividends_checked = Rc::new(Cell::new(false));
-        let watchlist_checked = Rc::new(Cell::new(false));
         pages.connect_visible_child_name_notify(move |stack| {
             match stack.visible_child_name().as_deref() {
                 Some("dividends")
@@ -1920,14 +1937,24 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                         refresh_dividends_async(refs.clone(), stale, false);
                     }
                 }
-                Some("watchlist") if !watchlist_checked.replace(true) => {
-                    let stale = refs
-                        .state
-                        .database
-                        .watchlist_needing_refresh(QUOTE_CACHE_SECONDS)
-                        .unwrap_or_default();
-                    if !stale.is_empty() {
-                        refresh_watchlist_async(refs.clone(), stale, false);
+                Some("watchlist") => {
+                    // Stored quotes make the page instantaneous/offline-capable,
+                    // but entering the page always asks the provider for current
+                    // prices instead of treating a 15-minute-old quote as fresh.
+                    let items = refs.state.database.load_watchlist().unwrap_or_default();
+                    if !items.is_empty() {
+                        refresh_watchlist_async(refs.clone(), items, false);
+                    }
+                }
+                Some("overview") | Some("accounts") => {
+                    let positions = refs.state.database.load_positions().unwrap_or_default();
+                    if !positions.is_empty() {
+                        let fetch_fx = portfolio_fx_needs_refresh(
+                            &refs.state,
+                            &positions,
+                            &base_currency(&refs.state),
+                        );
+                        refresh_market_async(refs.clone(), positions, fetch_fx, false);
                     }
                 }
                 _ => {}
@@ -1956,17 +1983,12 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         }
 
         let positions = state.database.load_positions().unwrap_or_default();
-        let stale_quotes = state
-            .database
-            .positions_needing_refresh(QUOTE_CACHE_SECONDS)
-            .unwrap_or_default();
-        let fetch_fx = portfolio_needs_fx_with_cash(&state, &positions, &base_currency(&state))
-            && state
-                .database
-                .fx_rate_needs_refresh(USD_CAD_PAIR, FX_CACHE_SECONDS)
-                .unwrap_or(true);
-        if !stale_quotes.is_empty() || fetch_fx {
-            refresh_market_async(refs.clone(), stale_quotes, fetch_fx, false);
+        let fetch_fx = portfolio_fx_needs_refresh(&state, &positions, &base_currency(&state));
+        // Persisted quotes are last-known values only. Always attempt a live
+        // quote refresh on launch; if it fails, the already-rendered database
+        // value remains available as the explicit offline/stale fallback.
+        if !positions.is_empty() || fetch_fx {
+            refresh_market_async(refs.clone(), positions.clone(), fetch_fx, false);
         }
         let stale_actions = state
             .database
@@ -2011,7 +2033,7 @@ fn build_setup_page(
 
     let currency = ComboRow::new();
     currency.set_title("Currency");
-    let currency_model = string_model(&["CAD", "USD"]);
+    let currency_model = supported_currency_model();
     currency.set_model(Some(&currency_model));
     currency.set_selected(u32::MAX);
 
@@ -2120,7 +2142,7 @@ fn build_setup_page(
         let create_for_callback = create.clone();
         create.connect_clicked(move |_| {
             let account_name = name.text().trim().to_string();
-            if account_name.is_empty() || currency.selected() > 1 {
+            if account_name.is_empty() || !valid_currency_selection(currency.selected()) {
                 return;
             }
 
@@ -2195,7 +2217,7 @@ fn build_setup_page(
 }
 
 fn sync_setup_create_button(create: &Button, name: &EntryRow, currency: &ComboRow) {
-    create.set_sensitive(!name.text().trim().is_empty() && currency.selected() <= 1);
+    create.set_sensitive(!name.text().trim().is_empty() && valid_currency_selection(currency.selected()));
 }
 
 pub fn build_error_window(app: &Application, error: &str) -> ApplicationWindow {
@@ -3335,7 +3357,7 @@ fn estimated_future_dividend_events(
     future
 }
 
-fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_cad: Option<f64>) {
+fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_rates: &FxRates) {
     clear_list(&refs.dividend_list);
     refs.dividend_recent_heading.set_visible(false);
     // `clear_list()` also removes GtkListBox's placeholder widget because the
@@ -3457,7 +3479,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
                 event.currency.as_str()
             };
             let native_value = event.amount * shares;
-            let base_value = convert_currency(native_value, event_currency, base, usd_cad);
+            let base_value = convert_currency(native_value, event_currency, base, fx_rates);
             if let Some((year, month)) = timestamp_year_month(event.timestamp) {
                 match base_value {
                     Some(value) => *by_month.entry((year, month)).or_insert(0.0) += value,
@@ -3499,7 +3521,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
                 continue;
             }
             estimated_months.insert((year, month));
-            match convert_currency(amount * holding.shares, &currency, base, usd_cad) {
+            match convert_currency(amount * holding.shares, &currency, base, fx_rates) {
                 Some(value) => *by_month.entry((year, month)).or_insert(0.0) += value,
                 None => {
                     incomplete_years.insert(year);
@@ -3550,7 +3572,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
             .iter()
             .map(|position| (position.market_value(), position.currency.as_str())),
         base,
-        usd_cad,
+        &fx_rates,
     );
     let yield_text = match (portfolio_market, selected_complete) {
         (Some(market), true) if market > f64::EPSILON => {
@@ -3616,7 +3638,7 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, usd_
         refs.dividend_list.append(&row);
     }
 
-    append_dividend_history_summaries(refs, positions, base, usd_cad, selected_year);
+    append_dividend_history_summaries(refs, positions, base, fx_rates, selected_year);
 
     // Use the normal libadwaita boxed-list treatment only when there are real
     // rows. The empty placeholder remains directly on the page surface.
@@ -3653,7 +3675,7 @@ fn append_dividend_history_summaries(
     refs: &UiRefs,
     positions: &[Position],
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
     selected_year: i32,
 ) {
     let cash_entries = refs.state.database.load_cash_entries().unwrap_or_default();
@@ -3692,7 +3714,7 @@ fn append_dividend_history_summaries(
             }
         }),
         base,
-        usd_cad,
+        &fx_rates,
     );
 
     let mut by_year: HashMap<i32, f64> = HashMap::new();
@@ -3704,7 +3726,7 @@ fn append_dividend_history_summaries(
             .get(&entry.account_id)
             .map(|value| value.as_str())
             .unwrap_or(entry.currency.as_str());
-        let Some(value) = convert_currency(entry.amount, currency, base, usd_cad) else {
+        let Some(value) = convert_currency(entry.amount, currency, base, fx_rates) else {
             continue;
         };
         if let Some((year, month)) = timestamp_year_month(entry.occurred_at) {
@@ -4015,7 +4037,8 @@ fn rebuild_overview_list(
     positions: &[Position],
     accounts: &[Account],
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
+    ledgers: Option<&HashMap<String, InvestmentLedgerState>>,
 ) {
     #[derive(Clone)]
     enum HoldingRow {
@@ -4026,17 +4049,18 @@ fn rebuild_overview_list(
     clear_list(list);
     let mut rows = Vec::<HoldingRow>::new();
     for position in positions {
-        let value = converted_market_value(position, base, usd_cad)
-            .or_else(|| position.market_value())
-            .unwrap_or(0.0);
+        // Sorting cannot compare unlike currencies without an FX rate. Keep an
+        // unavailable conversion at the end rather than treating the native
+        // amount as though it were already in the portfolio base currency.
+        let value = converted_market_value(position, base, fx_rates).unwrap_or(0.0);
         rows.push(HoldingRow::Position(position.clone(), value));
     }
     for account in accounts {
         if account.cash.abs() <= 0.005 {
             continue;
         }
-        let value = convert_currency(account.cash, &account.currency, base, usd_cad)
-            .unwrap_or(account.cash);
+        let value = convert_currency(account.cash, &account.currency, base, fx_rates)
+            .unwrap_or(0.0);
         rows.push(HoldingRow::Cash(account.clone(), value));
     }
     rows.sort_by(|a, b| {
@@ -4056,10 +4080,22 @@ fn rebuild_overview_list(
     for holding in rows {
         match holding {
             HoldingRow::Position(position, _) => {
-                list.append(&position_row(&position, base, usd_cad, false));
+                let gain_override = ledgers.and_then(|ledgers| {
+                    let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+                    let basis = ledgers.get(&key)?.cost_basis;
+                    let market = converted_market_value(&position, base, fx_rates)?;
+                    let gain = market - basis;
+                    let percent = if basis.abs() < f64::EPSILON {
+                        0.0
+                    } else {
+                        gain / basis * 100.0
+                    };
+                    Some((gain, percent))
+                });
+                list.append(&position_row(&position, base, fx_rates, false, gain_override));
             }
             HoldingRow::Cash(account, _) => {
-                list.append(&cash_holding_row(&account, base, usd_cad));
+                list.append(&cash_holding_row(&account, base, fx_rates));
             }
         }
     }
@@ -4115,17 +4151,27 @@ fn rebuild_allocation(
     positions: &[Position],
     accounts: &[Account],
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
+    ledgers: Option<&HashMap<String, InvestmentLedgerState>>,
 ) {
     let mut by_security = HashMap::<String, (String, String, f64)>::new();
+    let mut missing_fx = false;
     for position in positions {
         // Quotes normally provide current market value. Until a quote exists,
-        // keep the holding represented with its cost basis rather than making
-        // an asset disappear from the allocation ring altogether.
-        let native_value = position.market_value().unwrap_or_else(|| position.cost_basis());
-        let value = convert_currency(native_value, &position.currency, base, usd_cad)
-            .unwrap_or(native_value)
-            .max(0.0);
+        // use the settlement-aware portfolio basis when possible so a foreign
+        // holding does not lose the broker FX spread/fees merely because its
+        // latest market quote is temporarily unavailable.
+        let value = if let Some(native_value) = position.market_value() {
+            convert_currency(native_value, &position.currency, base, fx_rates)
+        } else {
+            let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+            ledgers.and_then(|ledgers| ledgers.get(&key).map(|state| state.cost_basis))
+        };
+        let Some(value) = value else {
+            missing_fx = true;
+            continue;
+        };
+        let value = value.max(0.0);
         if value <= f64::EPSILON {
             continue;
         }
@@ -4153,18 +4199,17 @@ fn rebuild_allocation(
         })
         .collect::<Vec<_>>();
 
-    let cash = accounts
-        .iter()
-        .filter_map(|account| {
-            if account.cash <= 0.005 {
-                return None;
-            }
-            Some(
-                convert_currency(account.cash, &account.currency, base, usd_cad)
-                    .unwrap_or(account.cash),
-            )
-        })
-        .sum::<f64>();
+    let mut cash = 0.0;
+    for account in accounts {
+        if account.cash <= 0.005 {
+            continue;
+        }
+        let Some(value) = convert_currency(account.cash, &account.currency, base, fx_rates) else {
+            missing_fx = true;
+            continue;
+        };
+        cash += value;
+    }
     if cash > 0.005 {
         raw.push(AllocationSlice {
             key: "cash".into(),
@@ -4175,6 +4220,20 @@ fn rebuild_allocation(
             color: None,
             is_cash: true,
         });
+    }
+
+    if missing_fx {
+        refs.allocation_ring.set_slices(Vec::new(), base);
+        refs.allocation_ring.clear_interaction_callback();
+        clear_box(&refs.allocation_legend);
+        refs.allocation_legend.append(
+            &Label::builder()
+                .label("Waiting for exchange rates")
+                .halign(Align::Center)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        return;
     }
 
     // Keep every security visible. Small positions are intentionally not
@@ -4388,39 +4447,15 @@ fn allocation_legend_row(
 }
 
 fn format_allocation_currency(value: f64, currency: &str) -> String {
-    let prefix = match currency {
-        "CAD" => "C$",
-        "USD" => "US$",
-        "EUR" => "€",
-        "GBP" => "£",
-        _ => "",
-    };
-    let sign = if value.is_sign_negative() { "−" } else { "" };
-    let raw = format!("{:.2}", value.abs());
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
-    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
-    let first = whole.len() % 3;
-    if first > 0 {
-        grouped.push_str(&whole[..first]);
-        if first < whole.len() {
-            grouped.push(',');
-        }
-    }
-    for (chunk_index, chunk) in whole[first..].as_bytes().chunks(3).enumerate() {
-        if chunk_index > 0 {
-            grouped.push(',');
-        }
-        grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-    }
-    let number = format!("{sign}{grouped}.{fraction}");
-    if prefix.is_empty() {
-        format!("{number} {currency}")
+    let formatted = currency::format_value(value.abs(), currency);
+    if value.is_sign_negative() {
+        format!("−{formatted}")
     } else {
-        format!("{prefix}{number}")
+        formatted
     }
 }
 
-fn cash_holding_row(account: &Account, base: &str, usd_cad: Option<f64>) -> ListBoxRow {
+fn cash_holding_row(account: &Account, base: &str, fx_rates: &FxRates) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_selectable(false);
     row.set_activatable(true);
@@ -4447,7 +4482,7 @@ fn cash_holding_row(account: &Account, base: &str, usd_cad: Option<f64>) -> List
             .css_classes(["heading"])
             .build(),
     );
-    let display_value = convert_currency(account.cash, &account.currency, base, usd_cad)
+    let display_value = convert_currency(account.cash, &account.currency, base, fx_rates)
         .map(|value| format_currency(value, base))
         .unwrap_or_else(|| format_currency(account.cash, &account.currency));
     top.append(
@@ -4485,8 +4520,8 @@ fn rebuild_accounts_list(
     list: &ListBox,
     accounts: &[Account],
     positions: &[Position],
-    base: &str,
-    usd_cad: Option<f64>,
+    _base: &str,
+    fx_rates: &FxRates,
 ) {
     clear_list(list);
     for account in accounts {
@@ -4502,15 +4537,11 @@ fn rebuild_accounts_list(
                 account_positions
                     .iter()
                     .map(|position| (position.market_value(), position.currency.as_str())),
-                base,
-                usd_cad,
+                &account.currency,
+                fx_rates,
             )
         };
-        let cash_in_base = convert_currency(account.cash, &account.currency, base, usd_cad);
-        let total = match (holdings_total, cash_in_base) {
-            (Some(holdings), Some(cash)) => Some(holdings + cash),
-            _ => None,
-        };
+        let total = holdings_total.map(|holdings| holdings + account.cash);
 
         let subtitle = format!(
             "{} · {} cash · {}",
@@ -4548,7 +4579,7 @@ fn rebuild_accounts_list(
             &Label::builder()
                 .label(
                     &total
-                        .map(|value| format_currency(value, base))
+                        .map(|value| format_currency(value, &account.currency))
                         .unwrap_or_else(|| "—".into()),
                 )
                 .halign(Align::End)
@@ -4798,8 +4829,9 @@ fn set_quote_status(label: &Label, text: &str) {
 fn position_row(
     position: &Position,
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
     show_menu: bool,
+    gain_override: Option<(f64, f64)>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_selectable(false);
@@ -4830,7 +4862,7 @@ fn position_row(
         .build();
     top.append(&symbol);
 
-    let value = converted_market_value(position, base, usd_cad)
+    let value = converted_market_value(position, base, fx_rates)
         .map(|value| format_currency(value, base))
         .or_else(|| position.market_value().map(|value| format_currency(value, &position.currency)))
         .unwrap_or_else(|| "—".into());
@@ -4873,13 +4905,13 @@ fn position_row(
     details.set_line_spacing(2);
     details.set_natural_line_length(460);
 
-    let gain_label = match converted_total_gain(position, base, usd_cad) {
-        Some(gain) => {
+    let gain_label = match gain_override {
+        Some((gain, return_percent)) => {
             let label = Label::builder()
                 .label(&format!(
                     "{} ({:+.2}%) total",
                     format_signed_currency(gain, base),
-                    position.total_return_percent().unwrap_or(0.0)
+                    return_percent
                 ))
                 .halign(Align::Start)
                 .css_classes(["caption"])
@@ -5152,8 +5184,8 @@ fn install_window_actions(
             dialog.add_credit_section(
                 Some("Data"),
                 &[
-                    "Market data: Yahoo Finance",
-                    "Exchange rates: Bank of Canada",
+                    "Market data and current exchange rates: Yahoo Finance",
+                    "Historical/reference exchange rates: Bank of Canada",
                 ],
             );
             dialog.present(Some(&window));
@@ -5823,7 +5855,7 @@ fn present_reports_dialog(parent: &ApplicationWindow, refs: UiRefs) {
 struct ReportPreparationResult {
     histories: HashMap<String, History>,
     dividend_histories: HashMap<String, DividendHistory>,
-    fx_history: Option<History>,
+    fx_histories: HistoricalFx,
     failures: usize,
 }
 
@@ -5854,10 +5886,8 @@ fn prepare_report_export(
         .collect::<Vec<_>>();
     symbols.sort();
     symbols.dedup();
-    let needs_fx = transactions
-        .iter()
-        .any(|transaction| !transaction.currency.eq_ignore_ascii_case(&account.currency));
     let (period_start, period_end) = period.bounds();
+    let report_currency = account.currency.clone();
 
     let (sender, receiver) = mpsc::channel::<ReportPreparationResult>();
     std::thread::spawn(move || {
@@ -5880,21 +5910,40 @@ fn prepare_report_export(
                 Err(_) => failures += 1,
             }
         }
-        let fx_history = if needs_fx {
-            match market_data::daily_history_between(USD_CAD_HISTORY_SYMBOL, period_start, period_end) {
-                Ok(history) => Some(history),
-                Err(_) => {
-                    failures += 1;
-                    None
-                }
+        let mut fx_codes = BTreeSet::<String>::new();
+        let target = report_currency.to_ascii_uppercase();
+        let mut add_fx_pair = |source: &str| {
+            let source = source.trim().to_ascii_uppercase();
+            if source == target || !currency::is_supported(&source) || !currency::is_supported(&target) {
+                return;
             }
-        } else {
-            None
+            if source != "CAD" {
+                fx_codes.insert(source);
+            }
+            if target != "CAD" {
+                fx_codes.insert(target.clone());
+            }
         };
+        for transaction in &transactions {
+            add_fx_pair(&transaction.currency);
+        }
+        for history in dividend_histories.values() {
+            if let Some(code) = history.currency.as_deref() {
+                add_fx_pair(code);
+            }
+        }
+        let mut fx_histories = HistoricalFx::new();
+        for code in fx_codes {
+            match fx::historical_to_cad(&code, period_start.saturating_sub(10 * 24 * 60 * 60), period_end) {
+                Ok(points) if !points.is_empty() => { fx_histories.insert(code, points); }
+                Ok(_) => {}
+                Err(_) => failures += 1,
+            }
+        }
         let _ = sender.send(ReportPreparationResult {
             histories,
             dividend_histories,
-            fx_history,
+            fx_histories,
             failures,
         });
     });
@@ -5943,14 +5992,14 @@ fn prepare_report_export(
                 &account,
                 period,
                 &result.histories,
-                result.fx_history.as_ref().map(|history| history.points.as_slice()),
+                &result.fx_histories,
             )
             .map(PreparedReport::Portfolio),
             ReportKind::Dividends => build_dividend_report(
                 &refs,
                 &account,
                 period,
-                result.fx_history.as_ref().map(|history| history.points.as_slice()),
+                &result.fx_histories,
             )
             .map(PreparedReport::Dividends),
         };
@@ -6033,11 +6082,64 @@ struct ReportHoldingState {
     cost_basis: f64,
 }
 
+fn report_transaction_value_at(
+    transaction: &Transaction,
+    target_currency: &str,
+    fx_histories: &HistoricalFx,
+) -> Option<f64> {
+    if let (Some(amount), Some(code)) = (
+        transaction
+            .settlement_amount
+            .filter(|amount| amount.is_finite() && *amount >= 0.0),
+        transaction.settlement_currency.as_deref(),
+    ) {
+        return report_convert_at(
+            amount,
+            code,
+            target_currency,
+            fx_histories,
+            transaction.timestamp,
+        );
+    }
+
+    if matches!(transaction.transaction_type.as_str(), "BUY" | "SELL" | "OPEN")
+        && transaction
+            .settlement_currency
+            .as_deref()
+            .is_some_and(|code| !code.eq_ignore_ascii_case(&transaction.currency))
+    {
+        return None;
+    }
+
+    let principal = report_convert_at(
+        transaction.shares * transaction.price,
+        &transaction.currency,
+        target_currency,
+        fx_histories,
+        transaction.timestamp,
+    )?;
+    let fees = report_convert_at(
+        transaction.fees,
+        &transaction.fees_currency,
+        target_currency,
+        fx_histories,
+        transaction.timestamp,
+    )?;
+    match transaction.transaction_type.as_str() {
+        "BUY" | "OPEN" => Some(principal + fees),
+        "SELL" => Some((principal - fees).max(0.0)),
+        "TRANSFER_IN" | "TRANSFER_OUT" => Some(principal),
+        _ => None,
+    }
+}
+
 fn report_holding_states_as_of(
     transactions: &[Transaction],
     split_events: &[SplitEvent],
     end_timestamp: i64,
-) -> HashMap<String, ReportHoldingState> {
+    target_currency: &str,
+    fx_histories: &HistoricalFx,
+) -> Option<HashMap<String, ReportHoldingState>> {
     #[derive(Clone)]
     enum Event {
         Transaction(Transaction),
@@ -6091,11 +6193,21 @@ fn report_holding_states_as_of(
                 match transaction.transaction_type.as_str() {
                     "BUY" | "OPEN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price + transaction.fees;
+                        state.cost_basis += report_transaction_value_at(
+                            &transaction,
+                            target_currency,
+                            fx_histories,
+                        )?;
                     }
                     "TRANSFER_IN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price;
+                        state.cost_basis += report_convert_at(
+                            transaction.shares * transaction.price,
+                            &transaction.currency,
+                            target_currency,
+                            fx_histories,
+                            transaction.timestamp,
+                        )?;
                     }
                     "SELL" | "TRANSFER_OUT" => {
                         let average = if state.shares.abs() < f64::EPSILON {
@@ -6116,7 +6228,7 @@ fn report_holding_states_as_of(
         }
     }
     states.retain(|_, state| state.shares > 0.0000001);
-    states
+    Some(states)
 }
 
 fn report_realized_gain_for_period(
@@ -6125,8 +6237,7 @@ fn report_realized_gain_for_period(
     start_timestamp: i64,
     end_timestamp: i64,
     target_currency: &str,
-    fx_points: Option<&[PricePoint]>,
-    current_usd_cad: Option<f64>,
+    fx_histories: &HistoricalFx,
 ) -> Option<f64> {
     #[derive(Clone, Default)]
     struct LedgerState {
@@ -6175,11 +6286,21 @@ fn report_realized_gain_for_period(
                 match transaction.transaction_type.as_str() {
                     "BUY" | "OPEN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price + transaction.fees;
+                        state.cost_basis += report_transaction_value_at(
+                            &transaction,
+                            target_currency,
+                            fx_histories,
+                        )?;
                     }
                     "TRANSFER_IN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price;
+                        state.cost_basis += report_convert_at(
+                            transaction.shares * transaction.price,
+                            &transaction.currency,
+                            target_currency,
+                            fx_histories,
+                            transaction.timestamp,
+                        )?;
                     }
                     "SELL" | "TRANSFER_OUT" => {
                         if state.shares <= 0.0 {
@@ -6189,17 +6310,12 @@ fn report_realized_gain_for_period(
                         if transaction.transaction_type == "SELL"
                             && transaction.timestamp >= start_timestamp
                         {
-                            let native_gain = transaction.shares * transaction.price
-                                - transaction.fees
-                                - average * transaction.shares;
-                            realized += report_convert_at(
-                                native_gain,
-                                &transaction.currency,
+                            let proceeds = report_transaction_value_at(
+                                &transaction,
                                 target_currency,
-                                fx_points,
-                                transaction.timestamp,
-                                current_usd_cad,
+                                fx_histories,
                             )?;
+                            realized += proceeds - average * transaction.shares;
                         }
                         state.shares -= transaction.shares;
                         state.cost_basis = (state.cost_basis - average * transaction.shares).max(0.0);
@@ -6266,24 +6382,12 @@ fn report_convert_at(
     value: f64,
     from_currency: &str,
     to_currency: &str,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     timestamp: i64,
-    current_usd_cad: Option<f64>,
 ) -> Option<f64> {
-    if from_currency.eq_ignore_ascii_case(to_currency) {
-        return Some(value);
-    }
-    let rate = historical_fx_at(fx_points, timestamp).or(current_usd_cad)?;
-    if from_currency.eq_ignore_ascii_case("USD") && to_currency.eq_ignore_ascii_case("CAD") {
-        Some(value * rate)
-    } else if from_currency.eq_ignore_ascii_case("CAD")
-        && to_currency.eq_ignore_ascii_case("USD")
-        && rate > 0.0
-    {
-        Some(value / rate)
-    } else {
-        None
-    }
+    // Historical reports must never silently substitute today's exchange rate.
+    // If the period's FX observation is unavailable, keep that value unknown.
+    historical_convert_at(value, from_currency, to_currency, fx_histories, timestamp)
 }
 
 fn build_reconstructed_dividends(
@@ -6292,8 +6396,7 @@ fn build_reconstructed_dividends(
     period: ReportPeriod,
     transactions: &[Transaction],
     split_events: &[SplitEvent],
-    fx_points: Option<&[PricePoint]>,
-    current_usd_cad: Option<f64>,
+    fx_histories: &HistoricalFx,
 ) -> Vec<(i64, String, f64, f64, String, Option<f64>)> {
     let (start, end) = period.bounds();
     let mut symbols = transactions
@@ -6321,9 +6424,8 @@ fn build_reconstructed_dividends(
                 native_gross,
                 &event.currency,
                 &account.currency,
-                fx_points,
+                fx_histories,
                 event.timestamp,
-                current_usd_cad,
             );
             rows.push((
                 event.timestamp,
@@ -6344,7 +6446,7 @@ fn build_portfolio_report(
     account: &Account,
     period: ReportPeriod,
     histories: &HashMap<String, History>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
 ) -> Result<crate::report::PortfolioReport, String> {
     let (period_start, period_end) = period.bounds();
     let transactions = refs
@@ -6364,14 +6466,14 @@ fn build_portfolio_report(
         .filter(|entry| account.id == entry.account_id)
         .collect::<Vec<_>>();
     let split_events = refs.state.database.all_split_events().unwrap_or_default();
-    let current_usd_cad = refs
-        .state
-        .database
-        .fx_rate(USD_CAD_PAIR)
-        .ok()
-        .flatten()
-        .map(|rate| rate.rate);
-    let holdings = report_holding_states_as_of(&transactions, &split_events, period_end);
+    let holdings = report_holding_states_as_of(
+        &transactions,
+        &split_events,
+        period_end,
+        &account.currency,
+        fx_histories,
+    )
+    .ok_or_else(|| "Historical FX is unavailable for this report's cost basis".to_string())?;
     let current_positions = refs.state.database.load_positions().unwrap_or_default();
 
     let mut market_total = 0.0;
@@ -6393,22 +6495,14 @@ fn build_portfolio_report(
                     .and_then(|position| position.last_price)
                     .filter(|_| matches!(period, ReportPeriod::Ytd))
             });
-        let converted_basis = report_convert_at(
-            state.cost_basis,
-            &state.currency,
-            &account.currency,
-            fx_points,
-            period_end,
-            current_usd_cad,
-        );
+        let converted_basis = Some(state.cost_basis);
         let converted_market = end_price.and_then(|price| {
             report_convert_at(
                 state.shares * price,
                 &state.currency,
                 &account.currency,
-                fx_points,
+                fx_histories,
                 period_end,
-                current_usd_cad,
             )
         });
         match converted_market {
@@ -6439,8 +6533,7 @@ fn build_portfolio_report(
         period_start,
         period_end,
         &account.currency,
-        fx_points,
-        current_usd_cad,
+        fx_histories,
     );
     let reconstructed_dividends = build_reconstructed_dividends(
         refs,
@@ -6448,8 +6541,7 @@ fn build_portfolio_report(
         period,
         &transactions,
         &split_events,
-        fx_points,
-        current_usd_cad,
+        fx_histories,
     );
     let dividend_income = if reconstructed_dividends.is_empty() {
         Some(0.0)
@@ -6515,20 +6607,8 @@ fn build_portfolio_report(
             .filter(|transaction| transaction.transaction_type == kind)
             .collect::<Vec<_>>();
         let amount = matching.iter().try_fold(0.0, |total, transaction| {
-            let native = if kind == "SELL" {
-                transaction.shares * transaction.price - transaction.fees
-            } else {
-                transaction.shares * transaction.price + transaction.fees
-            };
-            report_convert_at(
-                native,
-                &transaction.currency,
-                &account.currency,
-                fx_points,
-                transaction.timestamp,
-                current_usd_cad,
-            )
-            .map(|value| total + value)
+            report_transaction_value_at(transaction, &account.currency, fx_histories)
+                .map(|value| total + value)
         });
         push_activity(label, matching.len(), amount);
     }
@@ -6582,9 +6662,8 @@ fn build_portfolio_report(
             transaction.shares * transaction.price,
             &transaction.currency,
             &account.currency,
-            fx_points,
+            fx_histories,
             transaction.timestamp,
-            current_usd_cad,
         )
         .map(|value| total + value.abs())
     });
@@ -6639,7 +6718,7 @@ fn build_dividend_report(
     refs: &UiRefs,
     account: &Account,
     period: ReportPeriod,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
 ) -> Result<crate::report::DividendReport, String> {
     let transactions = refs
         .state
@@ -6650,21 +6729,13 @@ fn build_dividend_report(
         .filter(|transaction| transaction.account_id == account.id)
         .collect::<Vec<_>>();
     let split_events = refs.state.database.all_split_events().unwrap_or_default();
-    let current_usd_cad = refs
-        .state
-        .database
-        .fx_rate(USD_CAD_PAIR)
-        .ok()
-        .flatten()
-        .map(|rate| rate.rate);
     let reconstructed = build_reconstructed_dividends(
         refs,
         account,
         period,
         &transactions,
         &split_events,
-        fx_points,
-        current_usd_cad,
+        fx_histories,
     );
 
     let payer_count = reconstructed
@@ -6785,11 +6856,11 @@ fn report_filename_slug(value: &str) -> String {
 
 fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     let base_currency_row = ComboRow::new();
-    base_currency_row.set_title("Base Currency");
-    base_currency_row.set_subtitle("Currency used for portfolio totals");
-    let currency_model = string_model(&["CAD", "USD"]);
+    base_currency_row.set_title("Portfolio Currency");
+    base_currency_row.set_subtitle("Currency used for portfolio totals, performance, charts, and reports");
+    let currency_model = supported_currency_model();
     base_currency_row.set_model(Some(&currency_model));
-    base_currency_row.set_selected(if base_currency(&refs.state) == "USD" { 1 } else { 0 });
+    base_currency_row.set_selected(currency_index_or_default(&base_currency(&refs.state)));
 
     let portfolio_group = PreferencesGroup::builder().title("Portfolio").build();
     portfolio_group.add(&base_currency_row);
@@ -6839,7 +6910,7 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     {
         let refs = refs.clone();
         base_currency_row.connect_selected_notify(move |row| {
-            if row.selected() > 1 {
+            if !valid_currency_selection(row.selected()) {
                 return;
             }
             let currency = currency_at(row.selected());
@@ -7403,19 +7474,18 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         .spacing(5)
         .hexpand(true)
         .build();
-    hero_text.append(
-        &Label::builder()
-            .label(&format!(
-                "{} · {} · {}",
-                asset.name,
-                friendly_exchange(&asset.exchange),
-                asset.currency
-            ))
-            .halign(Align::Start)
-            .wrap(true)
-            .css_classes(["dim-label"])
-            .build(),
-    );
+    let hero_metadata = Label::builder()
+        .label(&format!(
+            "{} · {} · {}",
+            asset.name,
+            friendly_exchange(&asset.exchange),
+            asset.currency
+        ))
+        .halign(Align::Start)
+        .wrap(true)
+        .css_classes(["dim-label"])
+        .build();
+    hero_text.append(&hero_metadata);
     hero_text.append(&current_price);
     hero_text.append(&day_change);
     hero_text.append(&extended_change);
@@ -7494,7 +7564,18 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
 
     let details = positions_list();
     details.append(&detail_value_row("Exchange", friendly_exchange(&asset.exchange)));
-    details.append(&detail_value_row("Currency", &asset.currency));
+    let currency_value = Label::builder()
+        .label(&asset.currency)
+        .halign(Align::End)
+        .selectable(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(24)
+        .css_classes(["dim-label"])
+        .build();
+    let currency_row = ActionRow::builder().title("Currency").build();
+    currency_row.set_activatable(false);
+    currency_row.add_suffix(&currency_value);
+    details.append(&currency_row);
     details.append(&detail_value_row("Data symbol", &asset.provider_symbol));
     if !asset.asset_type.trim().is_empty() {
         details.append(&detail_value_row(
@@ -7559,7 +7640,11 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     let detail = WatchDetailRefs {
         app: refs.clone(),
         provider_symbol: asset.provider_symbol.clone(),
-        currency: asset.currency.clone(),
+        name: asset.name.clone(),
+        exchange: asset.exchange.clone(),
+        currency: Rc::new(RefCell::new(asset.currency.clone())),
+        hero_metadata,
+        currency_value,
         chart,
         current_price,
         day_change,
@@ -7586,6 +7671,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     {
         let refs = refs.clone();
         let asset = asset.clone();
+        let detail = detail.clone();
         add_activity.connect_clicked(move |button| {
             let Some(root) = button.root() else {
                 return;
@@ -7593,11 +7679,13 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
             let Ok(window) = root.downcast::<ApplicationWindow>() else {
                 return;
             };
+            let mut resolved_asset = asset.clone();
+            resolved_asset.currency = detail.currency.borrow().clone();
             present_add_activity_dialog_with_context(
                 &window,
                 refs.clone(),
                 None,
-                Some(asset.clone()),
+                Some(resolved_asset),
                 None,
             );
         });
@@ -7609,7 +7697,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         button.connect_toggled(move |button| {
             if button.is_active() {
                 active_range.set(range);
-                load_watch_history_range(detail.clone(), range, false, true);
+                load_watch_history_range(detail.clone(), range, false, false);
             }
         });
     }
@@ -7647,6 +7735,37 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     load_watch_history_range(detail, HistoryRange::OneDay, false, true);
 }
 
+fn apply_watch_detail_currency(detail: &WatchDetailRefs, candidate: Option<&str>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let candidate = candidate.trim().to_ascii_uppercase();
+    if candidate.is_empty() || candidate == "N/A" {
+        return;
+    }
+
+    if detail.currency.borrow().eq_ignore_ascii_case(&candidate) {
+        return;
+    }
+
+    *detail.currency.borrow_mut() = candidate.clone();
+    detail.currency_value.set_label(&candidate);
+    detail.hero_metadata.set_label(&format!(
+        "{} · {} · {}",
+        detail.name,
+        friendly_exchange(&detail.exchange),
+        candidate
+    ));
+
+    if let Some(item_id) = watchlist_item_id_for_symbol(&detail.app, &detail.provider_symbol) {
+        let _ = detail
+            .app
+            .state
+            .database
+            .update_watchlist_currency(item_id, &candidate);
+    }
+}
+
 fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
     detail.quote_refresh_status.set_label("Refreshing price…");
     detail.quote_refresh_spinner.set_visible(true);
@@ -7668,6 +7787,7 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
 
         match load.result {
             Ok(quote) => {
+                apply_watch_detail_currency(&detail, quote.currency.as_deref());
                 if let Some(item_id) =
                     watchlist_item_id_for_symbol(&detail.app, &detail.provider_symbol)
                 {
@@ -7702,7 +7822,8 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                         quote.extended_change_percent,
                     );
                 }
-                let price_text = format_currency(quote.close, &detail.currency);
+                let resolved_currency = detail.currency.borrow().clone();
+                let price_text = format_currency(quote.close, &resolved_currency);
                 let quote_state = market_data::quote_state_label(
                     quote.market_state.as_deref(),
                     quote.timestamp,
@@ -7790,12 +7911,16 @@ fn load_watch_history_range(
     detail: WatchDetailRefs,
     range: HistoryRange,
     announce: bool,
-    force_refresh: bool,
+    _force_refresh: bool,
 ) {
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
     let cache_interval = security_detail_history_cache_interval(range);
-    let cached = market_data::display_history_points(
+    let cached_market_offset = cached_history_market_offset(
+        &detail.app.state.database,
+        &detail.provider_symbol,
+    );
+    let cached = market_data::display_history_points_with_offset(
         detail
             .app
             .state
@@ -7803,26 +7928,14 @@ fn load_watch_history_range(
             .history_points(&detail.provider_symbol, cache_interval, minimum)
             .unwrap_or_default(),
         range,
+        cached_market_offset,
     );
     let had_cache = cached.len() >= 2;
-    let cached_provider_range_return = if range == HistoryRange::OneDay {
-        None
-    } else {
-        cached_history_range_return(&detail.app.state.database, &detail.provider_symbol, range)
-    };
-    let needs_refresh = force_refresh
-        || detail
-            .app
-            .state
-            .database
-            .history_needs_refresh(
-                &detail.provider_symbol,
-                range.key(),
-                cache_interval,
-                range.cache_seconds(),
-            )
-            .unwrap_or(true)
-        || (range != HistoryRange::OneDay && cached_provider_range_return.is_none());
+    // Security-detail ranges are always validated against Yahoo when selected.
+    // Cached candles are presentation/offline fallback only; they never make a
+    // range percentage or current-price snapshot authoritative. The selected
+    // range percentage is supplied by Yahoo's live quote-page Range Bar,
+    // while the separate chart response remains responsible for candle data.
 
     // A user-initiated refresh must not repaint the visible chart from the
     // database cache before the network result arrives. The page may already
@@ -7831,10 +7944,6 @@ fn load_watch_history_range(
     // used for initial/range loads and as the failure fallback.
     if !announce {
         if had_cache {
-            let cached_market_offset = cached_history_market_offset(
-                &detail.app.state.database,
-                &detail.provider_symbol,
-            );
             let cached_regular_session = (range == HistoryRange::OneDay)
                 .then(|| {
                     cached_history_regular_session(
@@ -7843,45 +7952,23 @@ fn load_watch_history_range(
                     )
                 })
                 .flatten();
-            let cached_day_change = detail
-                .app
-                .state
-                .database
-                .load_watchlist()
-                .ok()
-                .and_then(|items| {
-                    items
-                        .into_iter()
-                        .find(|item| item.provider_symbol.eq_ignore_ascii_case(&detail.provider_symbol))
-                        .and_then(|item| item.day_change_percent)
-                })
-                .filter(|value| value.is_finite());
-            let cached_range_change = if range == HistoryRange::OneDay {
-                cached_day_change
-            } else {
-                cached_provider_range_return
-            };
+            let cached_range_change = None;
+            let resolved_currency = detail.currency.borrow().clone();
             detail.chart.set_points_with_market_session(
                 cached.clone(),
-                &detail.currency,
+                &resolved_currency,
                 range,
                 cached_range_change,
                 cached_market_offset,
                 cached_regular_session,
             );
-            if needs_refresh {
-                // The chart cache is useful immediately, but a persisted
-                // percentage must never flash while the provider is refreshing
-                // the authoritative range return.
-                detail.range_return.set_label("—");
-                detail.day_change.set_label(&format!("Loading {} change…", range.label()));
-                detail.day_change.add_css_class("dim-label");
-                set_gain_class(&detail.day_change, 0.0);
-                detail.history_status.set_label("Cached history · updating range");
-            } else {
-                update_watch_history_summary(&detail, &cached, range, cached_range_change, false);
-                detail.history_status.set_label("Cached history");
-            }
+            // The cached chart is useful immediately, but derived return values
+            // are intentionally withheld until this selection's live response.
+            detail.range_return.set_label("—");
+            detail.day_change.set_label(&format!("Loading {} change…", range.label()));
+            detail.day_change.add_css_class("dim-label");
+            set_gain_class(&detail.day_change, 0.0);
+            detail.history_status.set_label("Cached history · updating range");
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -7895,12 +7982,6 @@ fn load_watch_history_range(
 
     let generation = detail.generation.get().saturating_add(1);
     detail.generation.set(generation);
-    if !needs_refresh {
-        if announce {
-            complete_detail_refresh(&detail.pull_refresh, &detail.shortcut_refresh);
-        }
-        return;
-    }
     if had_cache {
         detail.history_status.set_label(if announce {
             "Refreshing history"
@@ -7944,7 +8025,6 @@ fn load_watch_history_range(
                 save_history_display_metadata(
                     &detail.app.state.database,
                     &detail.provider_symbol,
-                    load.range,
                     &history,
                 );
                 if load.range == HistoryRange::OneDay {
@@ -7963,13 +8043,15 @@ fn load_watch_history_range(
                         }
                     }
                 }
+                apply_watch_detail_currency(&detail, history.currency.as_deref());
                 refresh_with_loaded_crossfade(detail.app.clone());
                 if detail.generation.get() == load.generation {
+                    let resolved_currency = detail.currency.borrow().clone();
                     let currency = history
                         .currency
                         .as_deref()
                         .filter(|value| !value.trim().is_empty())
-                        .unwrap_or(&detail.currency);
+                        .unwrap_or(&resolved_currency);
                     let range_change = if load.range == HistoryRange::OneDay {
                         history.day_change_percent
                     } else {
@@ -7994,7 +8076,7 @@ fn load_watch_history_range(
                         true,
                     );
                     if let Some(price) = history.current_price {
-                        let price_text = format_currency(price, &detail.currency);
+                        let price_text = format_currency(price, &resolved_currency);
                         let quote_state = market_data::quote_state_label(
                             history.market_state.as_deref(),
                             history.quote_timestamp,
@@ -8030,12 +8112,10 @@ fn load_watch_history_range(
                         detail.history_status.set_label(
                             "Update failed · showing cached history",
                         );
-                        if force_refresh {
-                            detail.range_return.set_label("—");
-                            detail.day_change.set_label(history_range_unavailable_label(load.range));
-                            detail.day_change.add_css_class("dim-label");
-                            set_gain_class(&detail.day_change, 0.0);
-                        }
+                        detail.range_return.set_label("—");
+                        detail.day_change.set_label(history_range_unavailable_label(load.range));
+                        detail.day_change.add_css_class("dim-label");
+                        set_gain_class(&detail.day_change, 0.0);
                     } else {
                         detail.chart.set_message("Price history is unavailable right now");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -8056,17 +8136,6 @@ fn load_watch_history_range(
     });
 }
 
-fn history_range_return_cache_key(provider_symbol: &str, range: HistoryRange) -> String {
-    // Version the provider-authoritative range return separately from candle history.
-    // v7 also invalidates the old All-time special case, which incorrectly
-    // substituted the first monthly chart candle for Yahoo's range metadata.
-    format!(
-        "history-range-return-exact-v7:{}:{}",
-        provider_symbol.trim().to_ascii_uppercase(),
-        range.key()
-    )
-}
-
 fn history_market_offset_cache_key(provider_symbol: &str) -> String {
     format!(
         "history-market-offset:{}",
@@ -8079,19 +8148,6 @@ fn history_regular_session_cache_key(provider_symbol: &str) -> String {
         "history-regular-session:{}",
         provider_symbol.trim().to_ascii_uppercase()
     )
-}
-
-fn cached_history_range_return(
-    database: &Database,
-    provider_symbol: &str,
-    range: HistoryRange,
-) -> Option<f64> {
-    database
-        .setting(&history_range_return_cache_key(provider_symbol, range))
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
 }
 
 fn cached_history_market_offset(database: &Database, provider_symbol: &str) -> i32 {
@@ -8120,17 +8176,8 @@ fn cached_history_regular_session(
 fn save_history_display_metadata(
     database: &Database,
     provider_symbol: &str,
-    range: HistoryRange,
     history: &History,
 ) {
-    let range_return_key = history_range_return_cache_key(provider_symbol, range);
-    if let Some(change) = history.range_return_percent.filter(|value| value.is_finite()) {
-        let _ = database.set_setting(&range_return_key, &change.to_string());
-    } else {
-        // Do not let an older successful range return reappear after a
-        // provider response that no longer contains a valid range baseline.
-        let _ = database.set_setting(&range_return_key, "");
-    }
     if let Some(offset) = history.exchange_gmt_offset {
         let _ = database.set_setting(
             &history_market_offset_cache_key(provider_symbol),
@@ -8225,10 +8272,11 @@ fn update_watch_history_summary(
         .map(|point| point.close)
         .fold(f64::NEG_INFINITY, f64::max);
     let high_low = if low.is_finite() && high.is_finite() {
+        let resolved_currency = detail.currency.borrow().clone();
         format!(
             "Low {} · High {} · {} points",
-            format_currency(low, &detail.currency),
-            format_currency(high, &detail.currency),
+            format_currency(low, &resolved_currency),
+            format_currency(high, &resolved_currency),
             points.len()
         )
     } else {
@@ -8272,14 +8320,8 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
         return;
     };
 
-    let base = base_currency(&refs.state);
-    let usd_cad = refs
-        .state
-        .database
-        .fx_rate(USD_CAD_PAIR)
-        .ok()
-        .flatten()
-        .map(|rate| rate.rate);
+    let display_currency = account.currency.clone();
+    let fx_rates = current_fx_rates(&refs.state);
     let positions = refs
         .state
         .database
@@ -8307,20 +8349,14 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
 
     let holdings_value = sum_optional_converted(
         positions.iter().map(|position| (position.market_value(), position.currency.as_str())),
-        &base,
-        usd_cad,
+        &display_currency,
+        &fx_rates,
     );
-    let cash_value = convert_currency(account.cash, &account.currency, &base, usd_cad);
+    let cash_value = Some(account.cash);
     let total_value = match (holdings_value, cash_value) {
         (Some(holdings), Some(cash)) => Some(holdings + cash),
         _ => None,
     };
-    let unrealized_gain = sum_optional_converted(
-        positions.iter().map(|position| (position.total_gain(), position.currency.as_str())),
-        &base,
-        usd_cad,
-    );
-
     let split_symbols = transactions
         .iter()
         .map(|transaction| transaction.provider_symbol.to_ascii_uppercase())
@@ -8329,18 +8365,34 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     for symbol in split_symbols {
         split_events.extend(refs.state.database.split_events(&symbol).unwrap_or_default());
     }
-    let realized_gain = if transactions.is_empty() {
-        Some(0.0)
+    let account_ledger = if transactions.is_empty() {
+        Some((HashMap::new(), 0.0))
     } else {
-        realized_gain_from_transactions(&transactions, &split_events, &base, usd_cad)
+        investment_ledger_in_currency(
+            &transactions,
+            &split_events,
+            &display_currency,
+            &fx_rates,
+        )
     };
+    let unrealized_gain = account_ledger.as_ref().and_then(|(ledgers, _)| {
+        let mut total = 0.0;
+        for position in &positions {
+            let market = converted_market_value(position, &display_currency, &fx_rates)?;
+            let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+            let basis = ledgers.get(&key)?.cost_basis;
+            total += market - basis;
+        }
+        Some(total)
+    });
+    let realized_gain = account_ledger.as_ref().map(|(_, realized)| *realized);
     let paid_dividends = sum_converted(
         cash_entries
             .iter()
             .filter(|entry| entry.kind == "DIVIDEND" && entry.amount > 0.0)
             .map(|entry| (entry.amount, entry.currency.as_str())),
-        &base,
-        usd_cad,
+        &display_currency,
+        &fx_rates,
     );
 
     let hero = GtkBox::builder()
@@ -8359,7 +8411,7 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
         &Label::builder()
             .label(
                 &total_value
-                    .map(|value| format_currency(value, &base))
+                    .map(|value| format_currency(value, &display_currency))
                     .unwrap_or_else(|| "—".into()),
             )
             .halign(Align::Start)
@@ -8380,13 +8432,13 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     );
 
     let value_label = metric_value_label();
-    value_label.set_label(&total_value.map(|value| format_currency(value, &base)).unwrap_or_else(|| "—".into()));
+    value_label.set_label(&total_value.map(|value| format_currency(value, &display_currency)).unwrap_or_else(|| "—".into()));
     let cash_label = metric_value_label();
     cash_label.set_label(&format_currency(account.cash, &account.currency));
     let gain_label = metric_value_label();
     match unrealized_gain {
         Some(value) => {
-            gain_label.set_label(&format_signed_currency(value, &base));
+            gain_label.set_label(&format_signed_currency(value, &display_currency));
             set_gain_class(&gain_label, value);
         }
         None => gain_label.set_label("—"),
@@ -8394,13 +8446,13 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     let realized_label = metric_value_label();
     match realized_gain {
         Some(value) => {
-            realized_label.set_label(&format_signed_currency(value, &base));
+            realized_label.set_label(&format_signed_currency(value, &display_currency));
             set_gain_class(&realized_label, value);
         }
         None => realized_label.set_label("—"),
     }
     let dividends_label = metric_value_label();
-    dividends_label.set_label(&paid_dividends.map(|value| format_currency(value, &base)).unwrap_or_else(|| "—".into()));
+    dividends_label.set_label(&paid_dividends.map(|value| format_currency(value, &display_currency)).unwrap_or_else(|| "—".into()));
 
     let metrics = WrapBox::new();
     metrics.set_child_spacing(12);
@@ -8415,7 +8467,25 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
 
     let holdings_list = positions_list();
     for position in &positions {
-        holdings_list.append(&position_row(position, &base, usd_cad, true));
+        let gain_override = account_ledger.as_ref().and_then(|(ledgers, _)| {
+            let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+            let basis = ledgers.get(&key)?.cost_basis;
+            let market = converted_market_value(position, &display_currency, &fx_rates)?;
+            let gain = market - basis;
+            let percent = if basis.abs() < f64::EPSILON {
+                0.0
+            } else {
+                gain / basis * 100.0
+            };
+            Some((gain, percent))
+        });
+        holdings_list.append(&position_row(
+            position,
+            &display_currency,
+            &fx_rates,
+            true,
+            gain_override,
+        ));
     }
     holdings_list.connect_row_activated({
         let refs = refs.clone();
@@ -8430,7 +8500,6 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     let activity_list = positions_list();
     let mut events = Vec::new();
     for transaction in &transactions {
-        let amount = transaction.shares * transaction.price + transaction.fees;
         let title = match transaction.transaction_type.as_str() {
             "BUY" => format!("Buy {}", transaction.code),
             "SELL" => format!("Sell {}", transaction.code),
@@ -8445,7 +8514,18 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
             trim_number(transaction.shares),
             format_currency(transaction.price, &transaction.currency)
         );
-        events.push((transaction.timestamp, title, subtitle, format_currency(amount, &transaction.currency)));
+        let amount = transaction
+            .settlement_amount
+            .zip(transaction.settlement_currency.as_deref())
+            .map(|(amount, code)| format_currency(amount, code))
+            .unwrap_or_else(|| {
+                let amount = match transaction.transaction_type.as_str() {
+                    "SELL" => (transaction.shares * transaction.price - transaction.fees).max(0.0),
+                    _ => transaction.shares * transaction.price + transaction.fees,
+                };
+                format_currency(amount, &transaction.currency)
+            });
+        events.push((transaction.timestamp, title, subtitle, amount));
     }
     for entry in &cash_entries {
         let title = match entry.kind.as_str() {
@@ -8565,14 +8645,59 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         return;
     };
 
-    let base = base_currency(&refs.state);
-    let usd_cad = refs
+    let display_currency = refs
         .state
         .database
-        .fx_rate(USD_CAD_PAIR)
+        .load_accounts()
         .ok()
-        .flatten()
-        .map(|rate| rate.rate);
+        .and_then(|accounts| {
+            accounts
+                .into_iter()
+                .find(|account| account.id == position.account_id)
+                .map(|account| account.currency)
+        })
+        .unwrap_or_else(|| position.currency.clone());
+    let fx_rates = current_fx_rates(&refs.state);
+    let holding_transactions = refs
+        .state
+        .database
+        .load_transactions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|transaction| {
+            transaction.account_id == position.account_id
+                && transaction
+                    .provider_symbol
+                    .eq_ignore_ascii_case(&position.provider_symbol)
+        })
+        .collect::<Vec<_>>();
+    let holding_splits = refs
+        .state
+        .database
+        .split_events(&position.provider_symbol)
+        .unwrap_or_default();
+    let holding_ledger = if holding_transactions.is_empty() {
+        None
+    } else {
+        investment_ledger_in_currency(
+            &holding_transactions,
+            &holding_splits,
+            &display_currency,
+            &fx_rates,
+        )
+    };
+    let holding_key = investment_ledger_key(position.account_id, &position.provider_symbol);
+    let account_cost_basis = holding_ledger
+        .as_ref()
+        .and_then(|(ledgers, _)| ledgers.get(&holding_key).map(|state| state.cost_basis));
+    let account_market_value = converted_market_value(&position, &display_currency, &fx_rates);
+    let account_unrealized = account_market_value
+        .zip(account_cost_basis)
+        .map(|(market, basis)| market - basis);
+    let account_return_percent = account_unrealized.zip(account_cost_basis).map(|(gain, basis)| {
+        if basis.abs() < f64::EPSILON { 0.0 } else { gain / basis * 100.0 }
+    });
+    let account_realized = holding_ledger.as_ref().map(|(_, realized)| *realized);
 
     let current_price = Label::builder()
         .label(
@@ -8650,8 +8775,8 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
 
     let market_value = metric_value_label();
     market_value.set_label(
-        &converted_market_value(&position, &base, usd_cad)
-            .map(|value| format_currency(value, &base))
+        &converted_market_value(&position, &display_currency, &fx_rates)
+            .map(|value| format_currency(value, &display_currency))
             .unwrap_or_else(|| {
                 position
                     .market_value()
@@ -8660,9 +8785,9 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
             }),
     );
     let total_gain = metric_value_label();
-    match converted_total_gain(&position, &base, usd_cad) {
+    match account_unrealized {
         Some(gain) => {
-            total_gain.set_label(&format_signed_currency(gain, &base));
+            total_gain.set_label(&format_signed_currency(gain, &display_currency));
             set_gain_class(&total_gain, gain);
         }
         None => total_gain.set_label("—"),
@@ -8757,48 +8882,29 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     details_list.append(&detail_value_row("Shares", &trim_number(position.shares)));
     details_list.append(&detail_value_row(
         "Cost basis",
-        &format_currency(position.cost_basis(), &position.currency),
+        &account_cost_basis
+            .map(|basis| format_currency(basis, &display_currency))
+            .unwrap_or_else(|| "—".into()),
     ));
     details_list.append(&detail_value_row(
         "Unrealized return",
-        &position
-            .total_return_percent()
+        &account_return_percent
             .map(|value| format!("{value:+.2}%"))
             .unwrap_or_else(|| "—".into()),
     ));
-    let holding_transactions = refs
-        .state
-        .database
-        .load_transactions()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|transaction| {
-            transaction.account_id == position.account_id
-                && transaction
-                    .provider_symbol
-                    .eq_ignore_ascii_case(&position.provider_symbol)
-        })
-        .collect::<Vec<_>>();
-    if !holding_transactions.is_empty() {
-        let holding_splits = refs
-            .state
-            .database
-            .split_events(&position.provider_symbol)
-            .unwrap_or_default();
-        if let Some(realized) = realized_gain_from_transactions(&holding_transactions, &holding_splits, &base, usd_cad) {
+    if let Some(realized) = account_realized {
+        details_list.append(&detail_value_row(
+            "Realized gain",
+            &format_signed_currency(realized, &display_currency),
+        ));
+        if let Some(unrealized) = account_unrealized {
             details_list.append(&detail_value_row(
-                "Realized gain",
-                &format_signed_currency(realized, &base),
+                "Investment return",
+                &format_signed_currency(unrealized + realized, &display_currency),
             ));
-            if let Some(unrealized) = converted_total_gain(&position, &base, usd_cad) {
-                details_list.append(&detail_value_row(
-                    "Investment return",
-                    &format_signed_currency(unrealized + realized, &base),
-                ));
-            }
         }
     }
-    if position.currency != base {
+    if position.currency != display_currency {
         if let Some(native_value) = position.market_value() {
             details_list.append(&detail_value_row(
                 "Native market value",
@@ -8900,8 +9006,8 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         quote_status,
         market_value,
         total_gain,
-        base_currency: base,
-        usd_cad,
+        base_currency: display_currency,
+        fx_rates,
         range_return,
         range_high_low,
         history_status,
@@ -8974,7 +9080,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         button.connect_toggled(move |button| {
             if button.is_active() {
                 active_range.set(range);
-                load_history_range(detail.clone(), range, false, true);
+                load_history_range(detail.clone(), range, false, false);
             }
         });
     }
@@ -9228,12 +9334,16 @@ fn load_history_range(
     detail: DetailRefs,
     range: HistoryRange,
     announce: bool,
-    force_refresh: bool,
+    _force_refresh: bool,
 ) {
     let now = current_unix_timestamp();
     let minimum = range.minimum_timestamp(now);
     let cache_interval = security_detail_history_cache_interval(range);
-    let cached = market_data::display_history_points(
+    let cached_market_offset = cached_history_market_offset(
+        &detail.app.state.database,
+        &detail.provider_symbol,
+    );
+    let cached = market_data::display_history_points_with_offset(
         detail
             .app
             .state
@@ -9241,36 +9351,20 @@ fn load_history_range(
             .history_points(&detail.provider_symbol, cache_interval, minimum)
             .unwrap_or_default(),
         range,
+        cached_market_offset,
     );
     let had_cache = cached.len() >= 2;
-    let cached_provider_range_return = if range == HistoryRange::OneDay {
-        None
-    } else {
-        cached_history_range_return(&detail.app.state.database, &detail.provider_symbol, range)
-    };
-    let needs_refresh = force_refresh
-        || detail
-            .app
-            .state
-            .database
-            .history_needs_refresh(
-                &detail.provider_symbol,
-                range.key(),
-                cache_interval,
-                range.cache_seconds(),
-            )
-            .unwrap_or(true)
-        || (range != HistoryRange::OneDay && cached_provider_range_return.is_none());
+    // Security-detail ranges are always validated against Yahoo when selected.
+    // Cached candles are presentation/offline fallback only; they never make a
+    // range percentage or current-price snapshot authoritative. The selected
+    // range percentage is supplied by Yahoo's live quote-page Range Bar,
+    // while the separate chart response remains responsible for candle data.
 
     // Keep the last coherent visible snapshot in place during a manual
     // refresh. Reapplying persisted cache here can make the chart and range
     // percentage visibly jump backward until the fresh request completes.
     if !announce {
         if had_cache {
-            let cached_market_offset = cached_history_market_offset(
-                &detail.app.state.database,
-                &detail.provider_symbol,
-            );
             let cached_regular_session = (range == HistoryRange::OneDay)
                 .then(|| {
                     cached_history_regular_session(
@@ -9279,20 +9373,7 @@ fn load_history_range(
                     )
                 })
                 .flatten();
-            let cached_day_change = detail
-                .app
-                .state
-                .database
-                .position(detail.position_id)
-                .ok()
-                .flatten()
-                .and_then(|position| position.day_change_percent)
-                .filter(|value| value.is_finite());
-            let cached_range_change = if range == HistoryRange::OneDay {
-                cached_day_change
-            } else {
-                cached_provider_range_return
-            };
+            let cached_range_change = None;
             detail.chart.set_points_with_market_session(
                 cached.clone(),
                 &detail.currency,
@@ -9301,24 +9382,15 @@ fn load_history_range(
                 cached_market_offset,
                 cached_regular_session,
             );
-            if needs_refresh {
-                // Reuse cached points for an instant chart, but never display a
-                // persisted range return while the provider's authoritative
-                // range return is being refreshed. This prevents a plausible-but-
-                // wrong value from flashing before the response arrives.
-                detail.range_return.set_label("—");
-                detail.day_change.set_label(&format!("Loading {} change…", range.label()));
-                detail.day_change.add_css_class("dim-label");
-                set_gain_class(&detail.day_change, 0.0);
-                detail
-                    .history_status
-                    .set_label("Cached history · updating range");
-            } else {
-                update_history_summary(&detail, &cached, range, cached_range_change, false);
-                detail
-                    .history_status
-                    .set_label("Cached history");
-            }
+            // The cached chart is useful immediately, but derived return values
+            // are intentionally withheld until this selection's live response.
+            detail.range_return.set_label("—");
+            detail.day_change.set_label(&format!("Loading {} change…", range.label()));
+            detail.day_change.add_css_class("dim-label");
+            set_gain_class(&detail.day_change, 0.0);
+            detail
+                .history_status
+                .set_label("Cached history · updating range");
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -9338,12 +9410,6 @@ fn load_history_range(
     let generation = detail.generation.get().saturating_add(1);
     detail.generation.set(generation);
 
-    if !needs_refresh {
-        if announce {
-            complete_detail_refresh(&detail.pull_refresh, &detail.shortcut_refresh);
-        }
-        return;
-    }
     if had_cache {
         detail.history_status.set_label(if announce {
             "Refreshing history"
@@ -9390,7 +9456,6 @@ fn load_history_range(
                 save_history_display_metadata(
                     &detail.app.state.database,
                     &detail.provider_symbol,
-                    load.range,
                     &history,
                 );
                 if load.range == HistoryRange::OneDay {
@@ -9447,12 +9512,10 @@ fn load_history_range(
                         detail.history_status.set_label(
                             "Update failed · showing cached history",
                         );
-                        if force_refresh {
-                            detail.range_return.set_label("—");
-                            detail.day_change.set_label(history_range_unavailable_label(load.range));
-                            detail.day_change.add_css_class("dim-label");
-                            set_gain_class(&detail.day_change, 0.0);
-                        }
+                        detail.range_return.set_label("—");
+                        detail.day_change.set_label(history_range_unavailable_label(load.range));
+                        detail.day_change.add_css_class("dim-label");
+                        set_gain_class(&detail.day_change, 0.0);
                     } else {
                         detail.chart.set_message("Price history is unavailable right now");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -9478,23 +9541,59 @@ fn update_detail_position_metrics(detail: &DetailRefs, animate: bool) {
         return;
     };
 
-    let market = converted_market_value(
+    let market_value = converted_market_value(
         &position,
         &detail.base_currency,
-        detail.usd_cad,
-    )
-    .map(|value| format_currency(value, &detail.base_currency))
-    .or_else(|| {
-        position
-            .market_value()
-            .map(|value| format_currency(value, &position.currency))
-    })
-    .unwrap_or_else(|| "—".into());
-    let (gain_text, gain_value) = match converted_total_gain(
-        &position,
-        &detail.base_currency,
-        detail.usd_cad,
-    ) {
+        &detail.fx_rates,
+    );
+    let market = market_value
+        .map(|value| format_currency(value, &detail.base_currency))
+        .or_else(|| {
+            position
+                .market_value()
+                .map(|value| format_currency(value, &position.currency))
+        })
+        .unwrap_or_else(|| "—".into());
+
+    // Rebuild the holding's account-currency ledger after each quote refresh so
+    // the displayed gain continues to use the actual brokerage settlement, not
+    // the security's native cost translated at today's FX rate.
+    let holding_transactions = detail
+        .app
+        .state
+        .database
+        .load_transactions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|transaction| {
+            transaction.account_id == position.account_id
+                && transaction
+                    .provider_symbol
+                    .eq_ignore_ascii_case(&position.provider_symbol)
+        })
+        .collect::<Vec<_>>();
+    let holding_splits = detail
+        .app
+        .state
+        .database
+        .split_events(&position.provider_symbol)
+        .unwrap_or_default();
+    let account_basis = if holding_transactions.is_empty() {
+        None
+    } else {
+        investment_ledger_in_currency(
+            &holding_transactions,
+            &holding_splits,
+            &detail.base_currency,
+            &detail.fx_rates,
+        )
+        .and_then(|(ledgers, _)| {
+            let key = investment_ledger_key(position.account_id, &position.provider_symbol);
+            ledgers.get(&key).map(|state| state.cost_basis)
+        })
+    };
+    let gain = market_value.zip(account_basis).map(|(market, basis)| market - basis);
+    let (gain_text, gain_value) = match gain {
         Some(gain) => (format_signed_currency(gain, &detail.base_currency), gain),
         None => ("—".into(), 0.0),
     };
@@ -9657,9 +9756,9 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
 
     let currency = ComboRow::new();
     currency.set_title("Currency");
-    let currency_model = string_model(&["CAD", "USD"]);
+    let currency_model = supported_currency_model();
     currency.set_model(Some(&currency_model));
-    currency.set_selected(if base_currency(&refs.state) == "USD" { 1 } else { 0 });
+    currency.set_selected(currency_index_or_default(&base_currency(&refs.state)));
 
     let dividend_cash = SwitchRow::new();
     dividend_cash.set_title("Add Dividends to Cash");
@@ -9722,8 +9821,8 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
                 refs.toast_overlay.add_toast(Toast::new("Enter an account name"));
                 return;
             }
-            if currency.selected() > 1 {
-                refs.toast_overlay.add_toast(Toast::new("Choose CAD or USD"));
+            if !valid_currency_selection(currency.selected()) {
+                refs.toast_overlay.add_toast(Toast::new("Choose an account currency"));
                 return;
             }
             let account = NewAccount {
@@ -9779,18 +9878,7 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
 }
 
 fn present_manage_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, account: Account) {
-    let base = base_currency(&refs.state);
-    let usd_cad = refs
-        .state
-        .database
-        .fx_rate(USD_CAD_PAIR)
-        .ok()
-        .flatten()
-        .map(|rate| rate.rate);
-    let converted = convert_currency(account.cash, &account.currency, &base, usd_cad);
-    let balance = converted
-        .map(|value| format_currency(value, &base))
-        .unwrap_or_else(|| format_currency(account.cash, &account.currency));
+    let balance = format_currency(account.cash, &account.currency);
 
     let value = Label::builder()
         .label(&balance)
@@ -10285,9 +10373,9 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
 
     let currency = ComboRow::new();
     currency.set_title("Currency");
-    let currency_model = string_model(&["CAD", "USD"]);
+    let currency_model = supported_currency_model();
     currency.set_model(Some(&currency_model));
-    currency.set_selected(if account.currency == "USD" { 1 } else { 0 });
+    currency.set_selected(currency_index_or_default(&account.currency));
     let currency_locked = refs
         .state
         .database
@@ -10918,7 +11006,7 @@ fn rebuild_transactions_list(
                 if transaction.fees > 0.005 {
                     subtitle.push_str(&format!(
                         " · {} fee",
-                        format_currency(transaction.fees, &transaction.currency)
+                        format_currency(transaction.fees, &transaction.fees_currency)
                     ));
                 }
                 if matches!(transaction.transaction_type.as_str(), "TRANSFER_IN" | "TRANSFER_OUT") {
@@ -10928,14 +11016,29 @@ fn rebuild_transactions_list(
                 }
                 let row = ActionRow::builder().title(&title).subtitle(&subtitle).build();
 
-                let gross = transaction.shares * transaction.price;
-                let total_value = match transaction.transaction_type.as_str() {
-                    "SELL" => gross - transaction.fees,
-                    "TRANSFER_OUT" | "TRANSFER_IN" => gross,
-                    _ => gross + transaction.fees,
-                };
+                let total_text = transaction
+                    .settlement_amount
+                    .zip(transaction.settlement_currency.as_deref())
+                    .filter(|_| !matches!(transaction.transaction_type.as_str(), "TRANSFER_IN" | "TRANSFER_OUT"))
+                    .map(|(amount, code)| format_currency(amount, code))
+                    .unwrap_or_else(|| {
+                        let gross = transaction.shares * transaction.price;
+                        let total_value = if transaction
+                            .fees_currency
+                            .eq_ignore_ascii_case(&transaction.currency)
+                        {
+                            match transaction.transaction_type.as_str() {
+                                "SELL" => (gross - transaction.fees).max(0.0),
+                                "TRANSFER_OUT" | "TRANSFER_IN" => gross,
+                                _ => gross + transaction.fees,
+                            }
+                        } else {
+                            gross
+                        };
+                        format_currency(total_value, &transaction.currency)
+                    });
                 let total = Label::builder()
-                    .label(&format_currency(total_value, &transaction.currency))
+                    .label(&total_text)
                     .css_classes(["dim-label"])
                     .valign(Align::Center)
                     .build();
@@ -11168,112 +11271,141 @@ fn present_edit_cash_entry_dialog(
     dialog.present(Some(parent));
 }
 
-fn update_cash_settlement_row(
-    row: &SwitchRow,
-    accounts: &[Account],
-    account_index: u32,
+fn estimated_account_settlement(
     kind: &str,
-    asset_currency: Option<&str>,
-) {
-    let Some(asset_currency) = asset_currency else {
-        row.set_visible(false);
-        row.set_active(false);
-        return;
+    shares: &EntryRow,
+    price: &EntryRow,
+    fees: &EntryRow,
+    asset_currency: &str,
+    fee_currency: &str,
+    account_currency: &str,
+    fx_rates: &FxRates,
+) -> Option<f64> {
+    let shares = shares_value(shares)?;
+    let price = money_value(price)?;
+    let fees = money_value(fees)?;
+    let principal = convert_currency(
+        shares * price,
+        asset_currency,
+        account_currency,
+        fx_rates,
+    )?;
+    let fees = convert_currency(fees, fee_currency, account_currency, fx_rates)?;
+    let amount = match kind {
+        "SELL" => (principal - fees).max(0.0),
+        "BUY" | "OPEN" => principal + fees,
+        _ => principal,
     };
-    if kind == "OPEN" {
-        row.set_visible(false);
-        row.set_active(false);
-        return;
-    }
-
-    row.set_visible(true);
-    row.set_title(if kind == "SELL" {
-        "Add Proceeds to Account Cash"
-    } else {
-        "Use Account Cash"
-    });
-
-    let Some(account) = accounts.get(account_index as usize) else {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("Choose an account");
-        return;
-    };
-    if !account.currency.eq_ignore_ascii_case(asset_currency) {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle(&format!("Account cash is {}", account.currency));
-        return;
-    }
-
-    row.set_sensitive(true);
-    row.set_subtitle(&format!(
-        "Current cash: {}",
-        format_currency(account.cash, &account.currency)
-    ));
+    (amount.is_finite() && amount >= 0.0).then_some(amount)
 }
 
-fn update_add_activity_cash_settlement_row(
-    row: &SwitchRow,
+fn sync_add_activity_currency_fields(
+    fees: &EntryRow,
+    settlement: &EntryRow,
+    settle_cash: &SwitchRow,
     accounts: &[Account],
     account_index: u32,
     kind: &str,
     asset_currency: Option<&str>,
     shares: &EntryRow,
     price: &EntryRow,
-    fees: &EntryRow,
+    fx_rates: &FxRates,
+    auto_settlement: bool,
+    settlement_programmatic: &Cell<bool>,
 ) {
-    update_cash_settlement_row(row, accounts, account_index, kind, asset_currency);
-
-    if kind != "BUY" || !row.is_visible() || !row.is_sensitive() {
+    let Some(asset_currency) = asset_currency else {
+        settlement.set_visible(false);
+        settle_cash.set_visible(false);
+        settle_cash.set_active(false);
         return;
-    }
-
+    };
     let Some(account) = accounts.get(account_index as usize) else {
-        return;
-    };
-    if account.cash <= 0.005 {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("No account cash available");
-        return;
-    }
-
-    let Some(share_count) = shares_value(shares) else {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("Enter a valid number of shares");
-        return;
-    };
-    let Some(price_value) = money_value(price) else {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("Enter a valid price");
-        return;
-    };
-    let Some(fee_value) = money_value(fees) else {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("Enter valid fees");
+        settlement.set_visible(false);
+        settle_cash.set_visible(false);
+        settle_cash.set_active(false);
         return;
     };
 
-    let purchase_total = share_count * price_value + fee_value;
-    if !purchase_total.is_finite() || purchase_total <= 0.0 {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle("Enter a valid purchase amount");
-        return;
-    }
-    if purchase_total > account.cash + 0.005 {
-        row.set_sensitive(false);
-        row.set_active(false);
-        row.set_subtitle(&format!(
-            "Needs {} · available {}",
-            format_currency(purchase_total, &account.currency),
-            format_currency(account.cash, &account.currency)
+    let cross_currency = !account.currency.eq_ignore_ascii_case(asset_currency);
+    let fee_currency = if cross_currency {
+        account.currency.as_str()
+    } else {
+        asset_currency
+    };
+    fees.set_title(&format!("Fees ({fee_currency})"));
+
+    settlement.set_visible(cross_currency);
+    if cross_currency {
+        settlement.set_title(&format!(
+            "{} ({})",
+            match kind {
+                "SELL" => "Amount received",
+                "OPEN" => "Original cost",
+                _ => "Amount charged",
+            },
+            account.currency
         ));
+        if auto_settlement {
+            if let Some(estimate) = estimated_account_settlement(
+                kind,
+                shares,
+                price,
+                fees,
+                asset_currency,
+                fee_currency,
+                &account.currency,
+                fx_rates,
+            ) {
+                settlement_programmatic.set(true);
+                settlement.set_text(&trim_number(estimate));
+                settlement_programmatic.set(false);
+            }
+        }
     }
+
+    if kind == "OPEN" {
+        settle_cash.set_visible(false);
+        settle_cash.set_active(false);
+        return;
+    }
+
+    settle_cash.set_visible(true);
+    settle_cash.set_title(if kind == "SELL" {
+        "Add Proceeds to Account Cash"
+    } else {
+        "Use Account Cash"
+    });
+
+    let settlement_amount = if cross_currency {
+        money_value(settlement)
+    } else {
+        estimated_account_settlement(
+            kind,
+            shares,
+            price,
+            fees,
+            asset_currency,
+            fee_currency,
+            &account.currency,
+            fx_rates,
+        )
+    };
+    let Some(settlement_amount) = settlement_amount else {
+        settle_cash.set_sensitive(false);
+        settle_cash.set_active(false);
+        settle_cash.set_subtitle(&format!("Enter the {} settlement amount", account.currency));
+        return;
+    };
+
+    let _ = settlement_amount;
+    // Cash sufficiency is validated against the dated ledger when the activity
+    // is saved. Comparing only today's balance would incorrectly block valid
+    // backdated trades that had enough cash at the time.
+    settle_cash.set_sensitive(true);
+    settle_cash.set_subtitle(&format!(
+        "Current cash: {}",
+        format_currency(account.cash, &account.currency)
+    ));
 }
 
 fn activity_asset_from_position(position: &Position) -> SearchResult {
@@ -11405,6 +11537,11 @@ fn present_add_activity_dialog_with_context(
 
     let price = money_entry_row("Price per share", 0.0);
     let fees = money_entry_row("Fees", 0.0);
+    let settlement = money_entry_row("Account amount", 0.0);
+    settlement.set_visible(false);
+    let fx_rates = current_fx_rates(&refs.state);
+    let auto_settlement = Rc::new(Cell::new(true));
+    let settlement_programmatic = Rc::new(Cell::new(false));
 
     let settle_cash = SwitchRow::new();
     settle_cash.set_title("Use Account Cash");
@@ -11422,6 +11559,7 @@ fn present_add_activity_dialog_with_context(
     activity_group.add(&shares);
     activity_group.add(&price);
     activity_group.add(&fees);
+    activity_group.add(&settlement);
     activity_group.add(&settle_cash);
 
     let record = Button::builder()
@@ -11481,9 +11619,10 @@ fn present_add_activity_dialog_with_context(
     if let Some(asset) = preset_asset.as_ref() {
         price.set_title(&format!("Price per share ({})", asset.currency));
         price.set_text(&trim_number(asset.market_price.unwrap_or(0.0).max(0.0)));
-        fees.set_title(&format!("Fees ({})", asset.currency));
         fees.set_text("0");
-        update_add_activity_cash_settlement_row(
+        sync_add_activity_currency_fields(
+            &fees,
+            &settlement,
             &settle_cash,
             &accounts,
             account.selected(),
@@ -11491,7 +11630,9 @@ fn present_add_activity_dialog_with_context(
             Some(&asset.currency),
             &shares,
             &price,
-            &fees,
+            &fx_rates,
+            auto_settlement.get(),
+            &settlement_programmatic,
         );
 
         // Contextual Buy/Sell dialogs start directly on the form. Re-evaluate
@@ -11505,8 +11646,14 @@ fn present_add_activity_dialog_with_context(
         let shares_for_idle = shares.clone();
         let price_for_idle = price.clone();
         let fees_for_idle = fees.clone();
+        let settlement_for_idle = settlement.clone();
+        let fx_rates_for_idle = fx_rates.clone();
+        let auto_for_idle = auto_settlement.clone();
+        let programmatic_for_idle = settlement_programmatic.clone();
         glib::idle_add_local_once(move || {
-            update_add_activity_cash_settlement_row(
+            sync_add_activity_currency_fields(
+                &fees_for_idle,
+                &settlement_for_idle,
                 &settle_cash_for_idle,
                 &accounts_for_idle,
                 account_for_idle.selected(),
@@ -11514,7 +11661,9 @@ fn present_add_activity_dialog_with_context(
                 Some(&currency_for_idle),
                 &shares_for_idle,
                 &price_for_idle,
-                &fees_for_idle,
+                &fx_rates_for_idle,
+                auto_for_idle.get(),
+                &programmatic_for_idle,
             );
         });
     }
@@ -11613,7 +11762,11 @@ fn present_add_activity_dialog_with_context(
         let shares = shares.clone();
         let price = price.clone();
         let fees = fees.clone();
+        let settlement = settlement.clone();
         let settle_cash = settle_cash.clone();
+        let fx_rates = fx_rates.clone();
+        let auto_settlement = auto_settlement.clone();
+        let settlement_programmatic = settlement_programmatic.clone();
         let account = account.clone();
         let activity_type = activity_type.clone();
         let accounts = accounts.clone();
@@ -11632,9 +11785,11 @@ fn present_add_activity_dialog_with_context(
 
             price.set_title(&format!("Price per share ({})", item.currency));
             price.set_text(&trim_number(item.market_price.unwrap_or(0.0).max(0.0)));
-            fees.set_title(&format!("Fees ({})", item.currency));
             fees.set_text("0");
-            update_add_activity_cash_settlement_row(
+            auto_settlement.set(true);
+            sync_add_activity_currency_fields(
+                &fees,
+                &settlement,
                 &settle_cash,
                 &accounts,
                 account.selected(),
@@ -11642,7 +11797,9 @@ fn present_add_activity_dialog_with_context(
                 Some(&item.currency),
                 &shares,
                 &price,
-                &fees,
+                &fx_rates,
+                auto_settlement.get(),
+                &settlement_programmatic,
             );
             title.set_title(&item.code);
             title.set_subtitle(&item.name);
@@ -11657,6 +11814,7 @@ fn present_add_activity_dialog_with_context(
     {
         let selected = selected.clone();
         let settle_cash = settle_cash.clone();
+        let settlement = settlement.clone();
         let record = record.clone();
         let flow_stack = flow_stack.clone();
         let back_for_callback = back.clone();
@@ -11666,6 +11824,7 @@ fn present_add_activity_dialog_with_context(
             *selected.borrow_mut() = None;
             settle_cash.set_active(false);
             settle_cash.set_visible(false);
+            settlement.set_visible(false);
             record.set_sensitive(false);
             back_for_callback.set_visible(false);
             title.set_title("Add Activity");
@@ -11679,44 +11838,44 @@ fn present_add_activity_dialog_with_context(
     {
         let selected = selected.clone();
         let settle_cash = settle_cash.clone();
+        let settlement = settlement.clone();
         let accounts = accounts.clone();
         let activity_type = activity_type.clone();
         let shares = shares.clone();
         let price = price.clone();
         let fees = fees.clone();
+        let fx_rates = fx_rates.clone();
+        let auto_settlement = auto_settlement.clone();
+        let settlement_programmatic = settlement_programmatic.clone();
         account.connect_selected_notify(move |row| {
+            auto_settlement.set(true);
             let currency = selected.borrow().as_ref().map(|asset| asset.currency.clone());
-            update_add_activity_cash_settlement_row(
-                &settle_cash,
-                &accounts,
-                row.selected(),
-                transaction_kind_from_index(activity_type.selected()),
-                currency.as_deref(),
-                &shares,
-                &price,
-                &fees,
+            sync_add_activity_currency_fields(
+                &fees, &settlement, &settle_cash, &accounts, row.selected(),
+                transaction_kind_from_index(activity_type.selected()), currency.as_deref(),
+                &shares, &price, &fx_rates, auto_settlement.get(), &settlement_programmatic,
             );
         });
     }
     {
         let selected = selected.clone();
         let settle_cash = settle_cash.clone();
+        let settlement = settlement.clone();
         let accounts = accounts.clone();
         let account = account.clone();
         let shares = shares.clone();
         let price = price.clone();
         let fees = fees.clone();
+        let fx_rates = fx_rates.clone();
+        let auto_settlement = auto_settlement.clone();
+        let settlement_programmatic = settlement_programmatic.clone();
         activity_type.connect_selected_notify(move |row| {
+            auto_settlement.set(true);
             let currency = selected.borrow().as_ref().map(|asset| asset.currency.clone());
-            update_add_activity_cash_settlement_row(
-                &settle_cash,
-                &accounts,
-                account.selected(),
-                transaction_kind_from_index(row.selected()),
-                currency.as_deref(),
-                &shares,
-                &price,
-                &fees,
+            sync_add_activity_currency_fields(
+                &fees, &settlement, &settle_cash, &accounts, account.selected(),
+                transaction_kind_from_index(row.selected()), currency.as_deref(),
+                &shares, &price, &fx_rates, auto_settlement.get(), &settlement_programmatic,
             );
         });
     }
@@ -11724,24 +11883,44 @@ fn present_add_activity_dialog_with_context(
     for entry in [&shares, &price, &fees] {
         let selected = selected.clone();
         let settle_cash = settle_cash.clone();
+        let settlement = settlement.clone();
         let accounts = accounts.clone();
         let account = account.clone();
         let activity_type = activity_type.clone();
         let shares = shares.clone();
         let price = price.clone();
         let fees = fees.clone();
+        let fx_rates = fx_rates.clone();
+        let auto_settlement = auto_settlement.clone();
+        let settlement_programmatic = settlement_programmatic.clone();
         entry.connect_changed(move |_| {
             let currency = selected.borrow().as_ref().map(|asset| asset.currency.clone());
-            update_add_activity_cash_settlement_row(
-                &settle_cash,
-                &accounts,
-                account.selected(),
-                transaction_kind_from_index(activity_type.selected()),
-                currency.as_deref(),
-                &shares,
-                &price,
-                &fees,
+            sync_add_activity_currency_fields(
+                &fees, &settlement, &settle_cash, &accounts, account.selected(),
+                transaction_kind_from_index(activity_type.selected()), currency.as_deref(),
+                &shares, &price, &fx_rates, auto_settlement.get(), &settlement_programmatic,
             );
+        });
+    }
+
+    {
+        let auto_settlement = auto_settlement.clone();
+        let settlement_programmatic = settlement_programmatic.clone();
+        let settle_cash = settle_cash.clone();
+        let accounts = accounts.clone();
+        let account = account.clone();
+        settlement.connect_changed(move |_| {
+            if !settlement_programmatic.get() {
+                auto_settlement.set(false);
+            }
+            if let Some(selected_account) = accounts.get(account.selected() as usize) {
+                if settle_cash.is_visible() {
+                    settle_cash.set_subtitle(&format!(
+                        "Current cash: {}",
+                        format_currency(selected_account.cash, &selected_account.currency)
+                    ));
+                }
+            }
         });
     }
 
@@ -11751,6 +11930,8 @@ fn present_add_activity_dialog_with_context(
         let dialog = dialog.clone();
         let accounts = accounts.clone();
         let shares_for_record = shares.clone();
+        let settlement_for_record = settlement.clone();
+        let fx_rates_for_record = fx_rates.clone();
         record.connect_clicked(move |_| {
             let Some(asset) = selected.borrow().clone() else {
                 return;
@@ -11758,6 +11939,13 @@ fn present_add_activity_dialog_with_context(
             let Some(selected_account) = accounts.get(account.selected() as usize) else {
                 return;
             };
+            if !currency::is_supported(&asset.currency) {
+                refs.toast_overlay.add_toast(Toast::new(&format!(
+                    "{} is not a supported Aureus account currency",
+                    asset.currency
+                )));
+                return;
+            }
             let trade_date = date.value();
             let Ok(timestamp) = activity_timestamp(&trade_date) else {
                 refs.toast_overlay
@@ -11796,6 +11984,39 @@ fn present_add_activity_dialog_with_context(
                 return;
             };
 
+            let cross_currency =
+                !selected_account.currency.eq_ignore_ascii_case(&asset.currency);
+            let fees_currency = if cross_currency {
+                selected_account.currency.clone()
+            } else {
+                asset.currency.clone()
+            };
+            let settlement_amount = if cross_currency {
+                let Some(amount) = money_value(&settlement_for_record)
+                    .filter(|amount| amount.is_finite() && *amount > 0.0)
+                else {
+                    refs.toast_overlay.add_toast(Toast::new(&format!(
+                        "Enter the actual {} amount {} by the brokerage",
+                        selected_account.currency,
+                        if kind == "SELL" { "received" } else { "charged" }
+                    )));
+                    return;
+                };
+                Some(amount)
+            } else {
+                estimated_account_settlement(
+                    kind,
+                    &shares_for_record,
+                    &price,
+                    &fees,
+                    &asset.currency,
+                    &fees_currency,
+                    &selected_account.currency,
+                    &fx_rates_for_record,
+                )
+            };
+            let settlement_currency = Some(selected_account.currency.clone());
+
             let activity = NewTransaction {
                 account_id: selected_account.id,
                 code: asset.code.clone(),
@@ -11808,6 +12029,9 @@ fn present_add_activity_dialog_with_context(
                 shares: share_count,
                 price: price_value,
                 fees: fee_value,
+                fees_currency,
+                settlement_amount,
+                settlement_currency,
                 settle_cash: kind != "OPEN" && settle_cash.is_active(),
                 currency: asset.currency.clone(),
             };
@@ -11888,6 +12112,72 @@ fn present_add_activity_dialog_with_context(
     }
 }
 
+fn sync_edit_transaction_fields(
+    settlement: &EntryRow,
+    settle_cash: &SwitchRow,
+    account: &Account,
+    kind: &str,
+    asset_currency: &str,
+    fee_currency: &str,
+    shares: &EntryRow,
+    price: &EntryRow,
+    fees: &EntryRow,
+    fx_rates: &FxRates,
+) {
+    let cross_currency = !account.currency.eq_ignore_ascii_case(asset_currency);
+    settlement.set_visible(cross_currency);
+    if cross_currency {
+        settlement.set_title(&format!(
+            "{} ({})",
+            match kind {
+                "SELL" => "Amount received",
+                "OPEN" => "Original cost",
+                _ => "Amount charged",
+            },
+            account.currency
+        ));
+    }
+
+    if kind == "OPEN" {
+        settle_cash.set_visible(false);
+        settle_cash.set_active(false);
+        return;
+    }
+
+    settle_cash.set_visible(true);
+    settle_cash.set_title(if kind == "SELL" {
+        "Add Proceeds to Account Cash"
+    } else {
+        "Use Account Cash"
+    });
+    let settlement_amount = if cross_currency {
+        money_value(settlement).filter(|amount| *amount > 0.0)
+    } else {
+        estimated_account_settlement(
+            kind,
+            shares,
+            price,
+            fees,
+            asset_currency,
+            fee_currency,
+            &account.currency,
+            fx_rates,
+        )
+    };
+    if settlement_amount.is_none() {
+        settle_cash.set_sensitive(false);
+        settle_cash.set_active(false);
+        settle_cash.set_subtitle(&format!("Enter the {} settlement amount", account.currency));
+        return;
+    }
+
+    settle_cash.set_sensitive(true);
+    settle_cash.set_subtitle(&format!(
+        "Current cash: {}",
+        format_currency(account.cash, &account.currency)
+    ));
+}
+
 fn present_edit_transaction_dialog(
     parent: &Dialog,
     refs: UiRefs,
@@ -11897,10 +12187,15 @@ fn present_edit_transaction_dialog(
     filter_state: Rc<RefCell<TransactionsFilterState>>,
 ) {
     let accounts = refs.state.database.load_accounts().unwrap_or_default();
-    let account_index = accounts
+    let Some(account) = accounts
         .iter()
-        .position(|account| account.id == transaction.account_id)
-        .unwrap_or(0) as u32;
+        .find(|account| account.id == transaction.account_id)
+        .cloned()
+    else {
+        refs.toast_overlay
+            .add_toast(Toast::new("This account is no longer available"));
+        return;
+    };
 
     let security = ActionRow::builder()
         .title(&format!("{} · {}", transaction.code, transaction.account_name))
@@ -11916,25 +12211,41 @@ fn present_edit_transaction_dialog(
     transaction_type.set_selected(transaction_kind_index(&transaction.transaction_type));
 
     let date = DateChooser::new(&transaction.trade_date);
-
     let shares = shares_entry_row(transaction.shares);
-
     let price = money_entry_row(
         &format!("Price per share ({})", transaction.currency),
         transaction.price,
     );
-    let fees = money_entry_row(&format!("Fees ({})", transaction.currency), transaction.fees);
+    let fee_currency = if currency::is_supported(&transaction.fees_currency) {
+        transaction.fees_currency.clone()
+    } else {
+        transaction.currency.clone()
+    };
+    let fees = money_entry_row(&format!("Fees ({fee_currency})"), transaction.fees);
+
+    let cross_currency = !account.currency.eq_ignore_ascii_case(&transaction.currency);
+    let settlement = money_entry_row(
+        "Account amount",
+        transaction.settlement_amount.unwrap_or(0.0),
+    );
+    settlement.set_visible(cross_currency);
 
     let settle_cash = SwitchRow::new();
     settle_cash.set_active(transaction.settle_cash);
-    update_cash_settlement_row(
+    let fx_rates = current_fx_rates(&refs.state);
+    sync_edit_transaction_fields(
+        &settlement,
         &settle_cash,
-        &accounts,
-        account_index,
+        &account,
         &transaction.transaction_type,
-        Some(&transaction.currency),
+        &transaction.currency,
+        &fee_currency,
+        &shares,
+        &price,
+        &fees,
+        &fx_rates,
     );
-    if transaction.settle_cash && transaction.transaction_type != "OPEN" {
+    if transaction.settle_cash && transaction.transaction_type != "OPEN" && settle_cash.is_sensitive() {
         settle_cash.set_active(true);
     }
 
@@ -11944,6 +12255,7 @@ fn present_edit_transaction_dialog(
     group.add(&shares);
     group.add(&price);
     group.add(&fees);
+    group.add(&settlement);
     group.add(&settle_cash);
 
     let body = dialog_body();
@@ -11979,16 +12291,54 @@ fn present_edit_transaction_dialog(
     install_escape_to_close(&dialog);
 
     {
+        let settlement = settlement.clone();
         let settle_cash = settle_cash.clone();
-        let accounts = accounts.clone();
-        let currency = transaction.currency.clone();
+        let account = account.clone();
+        let asset_currency = transaction.currency.clone();
+        let fee_currency = fee_currency.clone();
+        let shares = shares.clone();
+        let price = price.clone();
+        let fees = fees.clone();
+        let fx_rates = fx_rates.clone();
         transaction_type.connect_selected_notify(move |row| {
-            update_cash_settlement_row(
+            sync_edit_transaction_fields(
+                &settlement,
                 &settle_cash,
-                &accounts,
-                account_index,
+                &account,
                 transaction_kind_from_index(row.selected()),
-                Some(&currency),
+                &asset_currency,
+                &fee_currency,
+                &shares,
+                &price,
+                &fees,
+                &fx_rates,
+            );
+        });
+    }
+
+    for entry in [&shares, &price, &fees, &settlement] {
+        let settlement = settlement.clone();
+        let settle_cash = settle_cash.clone();
+        let account = account.clone();
+        let asset_currency = transaction.currency.clone();
+        let fee_currency = fee_currency.clone();
+        let shares = shares.clone();
+        let price = price.clone();
+        let fees = fees.clone();
+        let fx_rates = fx_rates.clone();
+        let transaction_type = transaction_type.clone();
+        entry.connect_changed(move |_| {
+            sync_edit_transaction_fields(
+                &settlement,
+                &settle_cash,
+                &account,
+                transaction_kind_from_index(transaction_type.selected()),
+                &asset_currency,
+                &fee_currency,
+                &shares,
+                &price,
+                &fees,
+                &fx_rates,
             );
         });
     }
@@ -11998,6 +12348,12 @@ fn present_edit_transaction_dialog(
         let manager = <Dialog as Clone>::clone(parent);
         let refs = refs.clone();
         let transaction_id = transaction.id;
+        let account_id = transaction.account_id;
+        let provider_symbol = transaction.provider_symbol.clone();
+        let asset_currency = transaction.currency.clone();
+        let account_currency = account.currency.clone();
+        let fee_currency = fee_currency.clone();
+        let fx_rates = fx_rates.clone();
         save.connect_clicked(move |_| {
             let trade_date = date.value();
             let Ok(timestamp) = activity_timestamp(&trade_date) else {
@@ -12018,8 +12374,8 @@ fn present_edit_transaction_dialog(
             };
             if let Err(message) = validate_transaction_change(
                 &refs,
-                transaction.account_id,
-                &transaction.provider_symbol,
+                account_id,
+                &provider_symbol,
                 Some(transaction_id),
                 kind,
                 timestamp,
@@ -12036,6 +12392,33 @@ fn present_edit_transaction_dialog(
                 refs.toast_overlay.add_toast(Toast::new("Enter valid fees"));
                 return;
             };
+
+            let cross_currency = !account_currency.eq_ignore_ascii_case(&asset_currency);
+            let settlement_amount = if cross_currency {
+                let Some(amount) = money_value(&settlement)
+                    .filter(|amount| amount.is_finite() && *amount > 0.0)
+                else {
+                    refs.toast_overlay.add_toast(Toast::new(&format!(
+                        "Enter the actual {} amount {} by the brokerage",
+                        account_currency,
+                        if kind == "SELL" { "received" } else { "charged" }
+                    )));
+                    return;
+                };
+                Some(amount)
+            } else {
+                estimated_account_settlement(
+                    kind,
+                    &shares,
+                    &price,
+                    &fees,
+                    &asset_currency,
+                    &fee_currency,
+                    &account_currency,
+                    &fx_rates,
+                )
+            };
+
             match refs.state.database.update_transaction(
                 transaction_id,
                 kind,
@@ -12044,11 +12427,20 @@ fn present_edit_transaction_dialog(
                 share_count,
                 price_value,
                 fee_value,
+                &fee_currency,
+                settlement_amount,
+                Some(&account_currency),
                 kind != "OPEN" && settle_cash.is_active(),
             ) {
                 Ok(()) => {
                     let _ = refs.state.database.sync_paid_dividends_to_cash();
-                    rebuild_transactions_list(&list, &stack, &manager, refs.clone(), filter_state.clone());
+                    rebuild_transactions_list(
+                        &list,
+                        &stack,
+                        &manager,
+                        refs.clone(),
+                        filter_state.clone(),
+                    );
                     refs.refresh();
                     refresh_portfolio_history_async(refs.clone(), false);
                     dialog.close();
@@ -12062,7 +12454,6 @@ fn present_edit_transaction_dialog(
 
     dialog.present(Some(parent));
 }
-
 fn rebuild_search_results(list: &ListBox, results: &[SearchResult]) {
     clear_list(list);
     for result in results {
@@ -12286,13 +12677,21 @@ fn portfolio_history_fetch_key(range: HistoryRange) -> String {
     }
 }
 
+type HistoricalFx = HashMap<String, Vec<PricePoint>>;
+
 fn portfolio_visible_range_start(
     range: HistoryRange,
     histories: &HashMap<String, Vec<PricePoint>>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
 ) -> Option<i64> {
     let fx_visible = || {
-        fx_points.map(|points| market_data::display_history_points(points.to_vec(), range))
+        let mut points = fx_histories.values().flatten().cloned().collect::<Vec<_>>();
+        if points.is_empty() {
+            None
+        } else {
+            points.sort_by_key(|point| point.timestamp);
+            Some(market_data::display_history_points(points, range))
+        }
     };
 
     if range == HistoryRange::FiveDays {
@@ -12337,6 +12736,113 @@ fn portfolio_visible_range_start(
         .filter_map(|history| history.first().map(|point| point.timestamp))
         .min()
         .or_else(|| fx_visible().and_then(|points| points.first().map(|point| point.timestamp)))
+}
+
+fn required_historical_fx_currencies(
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+    accounts: &[Account],
+    base: &str,
+) -> Vec<String> {
+    let base = base.trim().to_ascii_uppercase();
+    if !currency::is_supported(&base) {
+        return Vec::new();
+    }
+
+    // Keep every currency that can participate in historical accounting, not
+    // only currencies that differ from the portfolio base. A USD security in
+    // an EUR account still needs both USD->CAD and EUR->CAD history for a
+    // payment-date dividend conversion even when the portfolio base is USD.
+    let mut all = BTreeSet::<String>::new();
+    all.insert(base);
+    for transaction in transactions {
+        for code in [
+            Some(transaction.currency.as_str()),
+            Some(transaction.fees_currency.as_str()),
+            transaction.settlement_currency.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let code = code.trim().to_ascii_uppercase();
+            if currency::is_supported(&code) {
+                all.insert(code);
+            }
+        }
+    }
+    for entry in cash_entries {
+        let code = entry.currency.trim().to_ascii_uppercase();
+        if currency::is_supported(&code) {
+            all.insert(code);
+        }
+    }
+    let active_account_ids = transactions
+        .iter()
+        .map(|transaction| transaction.account_id)
+        .chain(cash_entries.iter().map(|entry| entry.account_id))
+        .collect::<HashSet<_>>();
+    for account in accounts.iter().filter(|account| active_account_ids.contains(&account.id)) {
+        let code = account.currency.trim().to_ascii_uppercase();
+        if currency::is_supported(&code) {
+            all.insert(code);
+        }
+    }
+
+    if all.len() <= 1 {
+        return Vec::new();
+    }
+    all.into_iter().filter(|code| code != "CAD").collect()
+}
+
+fn historical_fx_minimum(
+    range: HistoryRange,
+    range_minimum: i64,
+    transactions: &[Transaction],
+    cash_entries: &[CashEntry],
+) -> i64 {
+    if range != HistoryRange::All {
+        return range_minimum;
+    }
+
+    transactions
+        .iter()
+        .map(|transaction| transaction.timestamp)
+        .chain(cash_entries.iter().map(|entry| entry.occurred_at))
+        .filter(|timestamp| *timestamp > 0)
+        .min()
+        .unwrap_or(range_minimum)
+        .saturating_sub(10 * 24 * 60 * 60)
+        .max(0)
+}
+
+fn load_cached_historical_fx(
+    database: &Database,
+    codes: &[String],
+    range: HistoryRange,
+    minimum: i64,
+) -> HistoricalFx {
+    let mut histories = HistoricalFx::new();
+    for code in codes {
+        // Keep USD on Aureus's established CAD=X history path for every
+        // range so the already-verified CAD/USD portfolio results do not shift
+        // as a side effect of adding more currencies. Other currencies use the
+        // generalized BoC/Yahoo historical cache, except 1D which needs Yahoo
+        // intraday bars for all currencies.
+        let use_price_history = range == HistoryRange::OneDay || code.eq_ignore_ascii_case("USD");
+        let mut points = if use_price_history {
+            currency::yahoo_cad_symbol(code)
+                .and_then(|symbol| database.history_points(&symbol, range.portfolio_interval(), minimum).ok())
+                .unwrap_or_default()
+        } else {
+            database.fx_history_points(code, minimum).unwrap_or_default()
+        };
+        points.sort_by_key(|point| point.timestamp);
+        points.dedup_by_key(|point| point.timestamp);
+        if !points.is_empty() {
+            histories.insert(code.clone(), points);
+        }
+    }
+    histories
 }
 
 fn update_portfolio_history_from_cache(refs: &UiRefs) {
@@ -12402,25 +12908,13 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         }
     }
 
-    let needs_fx = transactions
+    let accounts = refs.state.database.load_accounts().unwrap_or_default();
+    let required_fx = required_historical_fx_currencies(&transactions, &cash_entries, &accounts, &base);
+    let fx_minimum = historical_fx_minimum(range, minimum, &transactions, &cash_entries);
+    let fx_histories = load_cached_historical_fx(&refs.state.database, &required_fx, range, fx_minimum);
+    let fx_missing = required_fx
         .iter()
-        .any(|transaction| transaction.currency != base)
-        || cash_entries.iter().any(|entry| entry.currency != base);
-    let fx_points = needs_fx.then(|| {
-        // Keep the whole backing FX window. A Sunday FX session may be newer
-        // than the latest Friday equity session, but Friday bars are still
-        // needed to value that equity session correctly.
-        refs
-            .state
-            .database
-            .history_points(USD_CAD_HISTORY_SYMBOL, range.portfolio_interval(), minimum)
-            .unwrap_or_default()
-    });
-    let fx_missing = needs_fx
-        && fx_points
-            .as_ref()
-            .map(|points| points.is_empty())
-            .unwrap_or(true);
+        .any(|code| !fx_histories.contains_key(code));
 
     let split_events = refs.state.database.all_split_events().unwrap_or_default();
     // 1D is the most recent trading session, not the last 24 clock hours. The
@@ -12436,15 +12930,16 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
             .filter_map(|points| points.first().map(|point| point.timestamp))
             .max()
             .or_else(|| {
-                fx_points
-                    .as_ref()
-                    .and_then(|points| points.first().map(|point| point.timestamp))
+                fx_histories
+                    .values()
+                    .filter_map(|points| points.first().map(|point| point.timestamp))
+                    .max()
             })
             .unwrap_or_else(|| now.saturating_sub(24 * 60 * 60))
     } else if range == HistoryRange::All {
         minimum
     } else {
-        portfolio_visible_range_start(range, &histories, fx_points.as_deref())
+        portfolio_visible_range_start(range, &histories, &fx_histories)
             .unwrap_or(minimum)
     };
     let visible_maximum = if range == HistoryRange::OneDay {
@@ -12456,9 +12951,10 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
             .filter_map(|points| points.last().map(|point| point.timestamp))
             .min()
             .or_else(|| {
-                fx_points
-                    .as_ref()
-                    .and_then(|points| points.last().map(|point| point.timestamp))
+                fx_histories
+                    .values()
+                    .filter_map(|points| points.last().map(|point| point.timestamp))
+                    .min()
             })
     } else {
         None
@@ -12484,7 +12980,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
         &history_cash_entries,
         &split_events,
         &histories,
-        fx_points.as_deref(),
+        &fx_histories,
         &base,
         visible_minimum,
         visible_maximum,
@@ -12512,7 +13008,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                     &cash_entries,
                     &split_events,
                     &raw_histories,
-                    fx_points.as_deref(),
+                    &fx_histories,
                     &base,
                     visible_minimum,
                     session_end,
@@ -12524,7 +13020,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                     current_value,
                     &transactions,
                     &cash_entries,
-                    fx_points.as_deref(),
+                    &fx_histories,
                     &base,
                 )
             })
@@ -12538,7 +13034,7 @@ fn update_portfolio_history_from_cache(refs: &UiRefs) {
                 &cash_entries,
                 &split_events,
                 &raw_histories,
-                fx_points.as_deref(),
+                &fx_histories,
                 &base,
                 visible_minimum,
             )
@@ -12600,12 +13096,59 @@ fn normalize_one_day_activity_to_session_start(
     (transactions, cash_entries)
 }
 
+fn transaction_external_flow_converted(
+    transaction: &Transaction,
+    mut convert: impl FnMut(f64, &str) -> Option<f64>,
+) -> Option<f64> {
+    let direction = match transaction.transaction_type.as_str() {
+        "BUY" | "OPEN" => 1.0,
+        "SELL" => -1.0,
+        "TRANSFER_IN" | "TRANSFER_OUT" => return Some(0.0),
+        _ => return None,
+    };
+
+    // The brokerage settlement is authoritative whenever it is known. It
+    // captures the actual FX execution/spread and explicit fees instead of
+    // reconstructing a cross-currency trade from a reference market rate.
+    if let (Some(amount), Some(code)) = (
+        transaction
+            .settlement_amount
+            .filter(|amount| amount.is_finite() && *amount >= 0.0),
+        transaction.settlement_currency.as_deref(),
+    ) {
+        return Some(direction * convert(amount, code)?);
+    }
+
+    // Older backups can contain cross-currency activity from before Aureus
+    // stored the brokerage's actual account-currency settlement. A reference
+    // FX rate cannot reconstruct the broker spread, so leave performance
+    // unavailable until the activity is edited instead of inventing a value.
+    if transaction
+        .settlement_currency
+        .as_deref()
+        .is_some_and(|code| !code.eq_ignore_ascii_case(&transaction.currency))
+    {
+        return None;
+    }
+
+    let principal = convert(
+        transaction.shares * transaction.price,
+        &transaction.currency,
+    )?;
+    let fees = convert(transaction.fees, &transaction.fees_currency)?;
+    match transaction.transaction_type.as_str() {
+        "BUY" | "OPEN" => Some(principal + fees),
+        "SELL" => Some(-(principal - fees).max(0.0)),
+        _ => Some(0.0),
+    }
+}
+
 fn portfolio_one_day_investment_return(
     transactions: &[Transaction],
     cash_entries: &[CashEntry],
     split_events: &[SplitEvent],
     histories: &HashMap<String, Vec<PricePoint>>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     base: &str,
     session_start: i64,
     session_end: i64,
@@ -12618,37 +13161,11 @@ fn portfolio_one_day_investment_return(
     let session_date = format!("{year:04}-{month:02}-{day:02}");
     let session_day = session_start.div_euclid(86_400);
 
-    let convert_at = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
-        if currency.eq_ignore_ascii_case(base) {
-            return Some(amount);
-        }
-        let rate = historical_fx_at(fx_points, timestamp)?;
-        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
-            Some(amount * rate)
-        } else if currency.eq_ignore_ascii_case("CAD")
-            && base.eq_ignore_ascii_case("USD")
-            && rate > 0.0
-        {
-            Some(amount / rate)
-        } else {
-            None
-        }
+    let convert_at = |amount: f64, code: &str, timestamp: i64| {
+        historical_convert_at(amount, code, base, fx_histories, timestamp)
     };
-    let convert_before = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
-        if currency.eq_ignore_ascii_case(base) {
-            return Some(amount);
-        }
-        let rate = historical_fx_before(fx_points, timestamp)?;
-        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
-            Some(amount * rate)
-        } else if currency.eq_ignore_ascii_case("CAD")
-            && base.eq_ignore_ascii_case("USD")
-            && rate > 0.0
-        {
-            Some(amount / rate)
-        } else {
-            None
-        }
+    let convert_before = |amount: f64, code: &str, timestamp: i64| {
+        historical_convert_before(amount, code, base, fx_histories, timestamp)
     };
 
     #[derive(Clone)]
@@ -12801,13 +13318,9 @@ fn portfolio_one_day_investment_return(
         if transaction.settle_cash {
             continue;
         }
-        let native_flow = match transaction.transaction_type.as_str() {
-            "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
-            "SELL" => -(transaction.shares * transaction.price - transaction.fees),
-            "TRANSFER_IN" | "TRANSFER_OUT" => continue,
-            _ => continue,
-        };
-        external_flow += convert_at(native_flow, &transaction.currency, session_start)?;
+        external_flow += transaction_external_flow_converted(transaction, |amount, code| {
+            convert_at(amount, code, session_start)
+        })?;
     }
 
     let gain = (closing_market + closing_cash_value)
@@ -12819,13 +13332,7 @@ fn portfolio_one_day_investment_return(
 fn current_portfolio_value(refs: &UiRefs, base: &str) -> Option<f64> {
     let positions = refs.state.database.load_positions().ok()?;
     let accounts = refs.state.database.load_accounts().ok()?;
-    let usd_cad = refs
-        .state
-        .database
-        .fx_rate(USD_CAD_PAIR)
-        .ok()
-        .flatten()
-        .map(|rate| rate.rate);
+    let fx_rates = current_fx_rates(&refs.state);
 
     let holdings = if positions.is_empty() {
         Some(0.0)
@@ -12835,7 +13342,7 @@ fn current_portfolio_value(refs: &UiRefs, base: &str) -> Option<f64> {
                 .iter()
                 .map(|position| (position.market_value(), position.currency.as_str())),
             base,
-            usd_cad,
+            &fx_rates,
         )
     }?;
     let cash = sum_converted(
@@ -12843,7 +13350,7 @@ fn current_portfolio_value(refs: &UiRefs, base: &str) -> Option<f64> {
             .iter()
             .map(|account| (account.cash, account.currency.as_str())),
         base,
-        usd_cad,
+        &fx_rates,
     )?;
     let value = holdings + cash;
     value.is_finite().then_some(value)
@@ -12853,24 +13360,11 @@ fn portfolio_all_investment_return(
     current_value: f64,
     transactions: &[Transaction],
     cash_entries: &[CashEntry],
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     base: &str,
 ) -> Option<f64> {
-    let convert_at = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
-        if currency.eq_ignore_ascii_case(base) {
-            return Some(amount);
-        }
-        let rate = historical_fx_at(fx_points, timestamp)?;
-        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
-            Some(amount * rate)
-        } else if currency.eq_ignore_ascii_case("CAD")
-            && base.eq_ignore_ascii_case("USD")
-            && rate > 0.0
-        {
-            Some(amount / rate)
-        } else {
-            None
-        }
+    let convert_at = |amount: f64, code: &str, timestamp: i64| {
+        historical_convert_at(amount, code, base, fx_histories, timestamp)
     };
 
     // Lifetime return is a ledger calculation, not a chart-candle calculation:
@@ -12883,17 +13377,9 @@ fn portfolio_all_investment_return(
     }
 
     for transaction in transactions.iter().filter(|transaction| !transaction.settle_cash) {
-        let native_flow = match transaction.transaction_type.as_str() {
-            "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
-            "SELL" => -(transaction.shares * transaction.price - transaction.fees),
-            "TRANSFER_IN" | "TRANSFER_OUT" => continue,
-            _ => continue,
-        };
-        external_flow += convert_at(
-            native_flow,
-            &transaction.currency,
-            transaction.timestamp,
-        )?;
+        external_flow += transaction_external_flow_converted(transaction, |amount, code| {
+            convert_at(amount, code, transaction.timestamp)
+        })?;
     }
 
     let gain = current_value - external_flow;
@@ -12905,7 +13391,7 @@ fn portfolio_opening_value_before_session(
     cash_entries: &[CashEntry],
     split_events: &[SplitEvent],
     histories: &HashMap<String, Vec<PricePoint>>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     base: &str,
     session_start: i64,
 ) -> Option<(i64, f64)> {
@@ -12944,7 +13430,7 @@ fn portfolio_opening_value_before_session(
         &opening_cash_entries,
         &opening_splits,
         histories,
-        fx_points,
+        fx_histories,
         base,
         opening_timestamp,
         Some(opening_timestamp),
@@ -12960,7 +13446,7 @@ fn portfolio_range_investment_return(
     cash_entries: &[CashEntry],
     split_events: &[SplitEvent],
     histories: &HashMap<String, Vec<PricePoint>>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     base: &str,
     range_start: i64,
 ) -> Option<f64> {
@@ -12970,7 +13456,7 @@ fn portfolio_range_investment_return(
         cash_entries,
         split_events,
         histories,
-        fx_points,
+        fx_histories,
         base,
         range_start,
     )?;
@@ -12978,21 +13464,8 @@ fn portfolio_range_investment_return(
         return None;
     }
 
-    let convert_at = |amount: f64, currency: &str, timestamp: i64| -> Option<f64> {
-        if currency.eq_ignore_ascii_case(base) {
-            return Some(amount);
-        }
-        let rate = historical_fx_at(fx_points, timestamp)?;
-        if currency.eq_ignore_ascii_case("USD") && base.eq_ignore_ascii_case("CAD") {
-            Some(amount * rate)
-        } else if currency.eq_ignore_ascii_case("CAD")
-            && base.eq_ignore_ascii_case("USD")
-            && rate > 0.0
-        {
-            Some(amount / rate)
-        } else {
-            None
-        }
+    let convert_at = |amount: f64, code: &str, timestamp: i64| {
+        historical_convert_at(amount, code, base, fx_histories, timestamp)
     };
 
     // Remove only external money movement after the pre-range snapshot. Trade
@@ -13012,40 +13485,84 @@ fn portfolio_range_investment_return(
             && transaction.timestamp > opening_timestamp
             && transaction.timestamp <= last.timestamp
     }) {
-        let native_flow = match transaction.transaction_type.as_str() {
-            "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
-            "SELL" => -(transaction.shares * transaction.price - transaction.fees),
-            "TRANSFER_IN" | "TRANSFER_OUT" => continue,
-            _ => continue,
-        };
-        external_flow += convert_at(
-            native_flow,
-            &transaction.currency,
-            transaction.timestamp,
-        )?;
+        external_flow += transaction_external_flow_converted(transaction, |amount, code| {
+            convert_at(amount, code, transaction.timestamp)
+        })?;
     }
 
     let gain = last.close - opening_value - external_flow;
     gain.is_finite().then_some(gain)
 }
 
-fn realized_gain_from_transactions(
+#[derive(Clone, Debug, Default)]
+struct InvestmentLedgerState {
+    shares: f64,
+    cost_basis: f64,
+}
+
+fn investment_ledger_key(account_id: i64, provider_symbol: &str) -> String {
+    format!(
+        "{}|{}",
+        account_id,
+        provider_symbol.trim().to_ascii_uppercase()
+    )
+}
+
+fn transaction_value_in_currency(
+    transaction: &Transaction,
+    base: &str,
+    fx_rates: &FxRates,
+) -> Option<f64> {
+    if let (Some(amount), Some(code)) = (
+        transaction
+            .settlement_amount
+            .filter(|amount| amount.is_finite() && *amount >= 0.0),
+        transaction.settlement_currency.as_deref(),
+    ) {
+        return convert_currency(amount, code, base, fx_rates);
+    }
+
+    if matches!(transaction.transaction_type.as_str(), "BUY" | "SELL" | "OPEN")
+        && transaction
+            .settlement_currency
+            .as_deref()
+            .is_some_and(|code| !code.eq_ignore_ascii_case(&transaction.currency))
+    {
+        return None;
+    }
+
+    let principal = convert_currency(
+        transaction.shares * transaction.price,
+        &transaction.currency,
+        base,
+        fx_rates,
+    )?;
+    let fees = convert_currency(
+        transaction.fees,
+        &transaction.fees_currency,
+        base,
+        fx_rates,
+    )?;
+    match transaction.transaction_type.as_str() {
+        "BUY" | "OPEN" => Some(principal + fees),
+        "SELL" => Some((principal - fees).max(0.0)),
+        "TRANSFER_IN" | "TRANSFER_OUT" => Some(principal),
+        _ => None,
+    }
+}
+
+fn investment_ledger_in_currency(
     transactions: &[Transaction],
     splits: &[SplitEvent],
     base: &str,
-    usd_cad: Option<f64>,
-) -> Option<f64> {
-    #[derive(Default)]
-    struct LedgerState {
-        shares: f64,
-        cost_basis: f64,
-    }
-
+    fx_rates: &FxRates,
+) -> Option<(HashMap<String, InvestmentLedgerState>, f64)> {
     #[derive(Clone)]
     enum Event {
         Transaction(Transaction),
         Split(SplitEvent),
     }
+
     let mut events = transactions
         .iter()
         .cloned()
@@ -13061,26 +13578,23 @@ fn realized_gain_from_transactions(
         ),
     });
 
-    let mut ledgers = HashMap::<String, LedgerState>::new();
+    let mut ledgers = HashMap::<String, InvestmentLedgerState>::new();
     let mut realized = 0.0;
 
     for event in events {
         match event {
             Event::Split(split) => {
-                let symbol = split.provider_symbol.to_ascii_uppercase();
-                let suffix = format!("|{symbol}");
+                let suffix = format!("|{}", split.provider_symbol.to_ascii_uppercase());
                 for (key, state) in ledgers.iter_mut() {
-                    if key.ends_with(suffix.as_str()) && state.shares > 0.0000001 {
-                        // Total basis is unchanged by a split; only the share count changes.
+                    if key.ends_with(&suffix) && state.shares > 0.0000001 {
                         state.shares *= split.ratio;
                     }
                 }
             }
             Event::Transaction(transaction) => {
-                let key = format!(
-                    "{}|{}",
+                let key = investment_ledger_key(
                     transaction.account_id,
-                    transaction.provider_symbol.to_ascii_uppercase()
+                    &transaction.provider_symbol,
                 );
                 let state = ledgers.entry(key).or_default();
                 match transaction.transaction_type.as_str() {
@@ -13093,18 +13607,15 @@ fn realized_gain_from_transactions(
                         } else {
                             state.cost_basis / state.shares
                         };
-                        if transaction.transaction_type == "SELL" {
-                            let native_gain = transaction.shares * transaction.price
-                                - transaction.fees
-                                - average_cost * transaction.shares;
-                            realized += convert_currency(
-                                native_gain,
-                                &transaction.currency,
-                                base,
-                                usd_cad,
-                            )?;
-                        }
                         let removed_basis = average_cost * transaction.shares;
+                        if transaction.transaction_type == "SELL" {
+                            let proceeds = transaction_value_in_currency(
+                                &transaction,
+                                base,
+                                fx_rates,
+                            )?;
+                            realized += proceeds - removed_basis;
+                        }
                         state.shares -= transaction.shares;
                         state.cost_basis = (state.cost_basis - removed_basis).max(0.0);
                         if state.shares.abs() < 0.0000001 {
@@ -13114,11 +13625,20 @@ fn realized_gain_from_transactions(
                     }
                     "BUY" | "OPEN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price + transaction.fees;
+                        state.cost_basis += transaction_value_in_currency(
+                            &transaction,
+                            base,
+                            fx_rates,
+                        )?;
                     }
                     "TRANSFER_IN" => {
                         state.shares += transaction.shares;
-                        state.cost_basis += transaction.shares * transaction.price;
+                        state.cost_basis += convert_currency(
+                            transaction.shares * transaction.price,
+                            &transaction.currency,
+                            base,
+                            fx_rates,
+                        )?;
                     }
                     _ => return None,
                 }
@@ -13126,7 +13646,7 @@ fn realized_gain_from_transactions(
         }
     }
 
-    Some(realized)
+    Some((ledgers, realized))
 }
 
 fn build_portfolio_value_points(
@@ -13134,7 +13654,7 @@ fn build_portfolio_value_points(
     cash_entries: &[CashEntry],
     split_events: &[SplitEvent],
     histories: &HashMap<String, Vec<PricePoint>>,
-    fx_points: Option<&[PricePoint]>,
+    fx_histories: &HistoricalFx,
     base: &str,
     minimum: i64,
     maximum: Option<i64>,
@@ -13215,6 +13735,16 @@ fn build_portfolio_value_points(
         }
     }
     for points in histories.values() {
+        for point in points {
+            if point.timestamp >= first_visible && point.timestamp <= last_visible {
+                timeline.insert(point.timestamp);
+            }
+        }
+    }
+    // Foreign cash is an asset too. Include FX timestamps in the valuation
+    // timeline so a cash-only multi-currency portfolio can visibly gain or
+    // lose value as exchange rates move instead of producing a flat/sparse chart.
+    for points in fx_histories.values() {
         for point in points {
             if point.timestamp >= first_visible && point.timestamp <= last_visible {
                 timeline.insert(point.timestamp);
@@ -13303,19 +13833,13 @@ fn build_portfolio_value_points(
             };
             let native_value = share_count * price;
             let currency = currencies.get(key).map(String::as_str).unwrap_or(base);
-            let converted = if currency == base {
-                Some(native_value)
-            } else {
-                historical_fx_at(fx_points, timestamp).and_then(|rate| {
-                    if currency == "USD" && base == "CAD" {
-                        Some(native_value * rate)
-                    } else if currency == "CAD" && base == "USD" && rate > 0.0 {
-                        Some(native_value / rate)
-                    } else {
-                        None
-                    }
-                })
-            };
+            let converted = historical_convert_at(
+                native_value,
+                currency,
+                base,
+                fx_histories,
+                timestamp,
+            );
             let Some(converted) = converted else {
                 complete = false;
                 break;
@@ -13325,19 +13849,13 @@ fn build_portfolio_value_points(
 
         if complete {
             for ((_, currency), amount) in &cash_balances {
-                let converted = if currency == base {
-                    Some(*amount)
-                } else {
-                    historical_fx_at(fx_points, timestamp).and_then(|rate| {
-                        if currency == "USD" && base == "CAD" {
-                            Some(*amount * rate)
-                        } else if currency == "CAD" && base == "USD" && rate > 0.0 {
-                            Some(*amount / rate)
-                        } else {
-                            None
-                        }
-                    })
-                };
+                let converted = historical_convert_at(
+                    *amount,
+                    currency,
+                    base,
+                    fx_histories,
+                    timestamp,
+                );
                 let Some(converted) = converted else {
                     complete = false;
                     break;
@@ -13371,12 +13889,68 @@ fn historical_close_before(points: Option<&[PricePoint]>, timestamp: i64) -> Opt
     index.checked_sub(1).map(|index| points[index].close)
 }
 
-fn historical_fx_at(points: Option<&[PricePoint]>, timestamp: i64) -> Option<f64> {
-    historical_close_at(points, timestamp)
+const MAX_HISTORICAL_FX_AGE_SECONDS: i64 = 10 * 24 * 60 * 60;
+
+fn historical_fx_point_at<'a>(points: Option<&'a [PricePoint]>, timestamp: i64) -> Option<&'a PricePoint> {
+    let points = points?;
+    let index = points.partition_point(|point| point.timestamp <= timestamp);
+    let point = points.get(index.checked_sub(1)?)?;
+    (timestamp.saturating_sub(point.timestamp) <= MAX_HISTORICAL_FX_AGE_SECONDS).then_some(point)
 }
 
-fn historical_fx_before(points: Option<&[PricePoint]>, timestamp: i64) -> Option<f64> {
-    historical_close_before(points, timestamp)
+fn historical_fx_point_before<'a>(points: Option<&'a [PricePoint]>, timestamp: i64) -> Option<&'a PricePoint> {
+    let points = points?;
+    let index = points.partition_point(|point| point.timestamp < timestamp);
+    let point = points.get(index.checked_sub(1)?)?;
+    (timestamp.saturating_sub(point.timestamp) <= MAX_HISTORICAL_FX_AGE_SECONDS).then_some(point)
+}
+
+fn historical_cad_rate_at(fx_histories: &HistoricalFx, code: &str, timestamp: i64) -> Option<f64> {
+    if code.eq_ignore_ascii_case("CAD") {
+        return Some(1.0);
+    }
+    let code = code.trim().to_ascii_uppercase();
+    historical_fx_point_at(fx_histories.get(&code).map(Vec::as_slice), timestamp)
+        .map(|point| point.close)
+}
+
+fn historical_cad_rate_before(fx_histories: &HistoricalFx, code: &str, timestamp: i64) -> Option<f64> {
+    if code.eq_ignore_ascii_case("CAD") {
+        return Some(1.0);
+    }
+    let code = code.trim().to_ascii_uppercase();
+    historical_fx_point_before(fx_histories.get(&code).map(Vec::as_slice), timestamp)
+        .map(|point| point.close)
+}
+
+fn historical_convert_at(
+    value: f64,
+    from_currency: &str,
+    to_currency: &str,
+    fx_histories: &HistoricalFx,
+    timestamp: i64,
+) -> Option<f64> {
+    if from_currency.eq_ignore_ascii_case(to_currency) {
+        return Some(value);
+    }
+    let from_rate = historical_cad_rate_at(fx_histories, from_currency, timestamp)?;
+    let to_rate = historical_cad_rate_at(fx_histories, to_currency, timestamp)?;
+    (to_rate > 0.0).then_some(value * from_rate / to_rate)
+}
+
+fn historical_convert_before(
+    value: f64,
+    from_currency: &str,
+    to_currency: &str,
+    fx_histories: &HistoricalFx,
+    timestamp: i64,
+) -> Option<f64> {
+    if from_currency.eq_ignore_ascii_case(to_currency) {
+        return Some(value);
+    }
+    let from_rate = historical_cad_rate_before(fx_histories, from_currency, timestamp)?;
+    let to_rate = historical_cad_rate_before(fx_histories, to_currency, timestamp)?;
+    (to_rate > 0.0).then_some(value * from_rate / to_rate)
 }
 
 fn transaction_price_at(
@@ -13524,8 +14098,12 @@ struct PortfolioHistoryRefreshResult {
     generation: u64,
     range: HistoryRange,
     histories: Vec<(String, History)>,
-    fx_history: Option<History>,
+    fx_histories: Vec<(String, Vec<PricePoint>, bool)>,
     failures: usize,
+}
+
+fn fx_history_cache_key(code: &str, range: HistoryRange) -> String {
+    format!("fx-cad-v1-{}-{}", code.to_ascii_lowercase(), range.key())
 }
 
 fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
@@ -13564,34 +14142,37 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
     }
 
     let base = base_currency(&refs.state);
-    let needs_fx = transactions
-        .iter()
-        .any(|transaction| transaction.currency != base)
-        || cash_entries.iter().any(|entry| entry.currency != base);
-    let fetch_fx = if needs_fx {
-        let cached_fx = refs
-            .state
-            .database
-            .history_points(USD_CAD_HISTORY_SYMBOL, range.portfolio_interval(), minimum)
-            .unwrap_or_default();
-        let cached_empty = cached_fx.is_empty();
+    let accounts = refs.state.database.load_accounts().unwrap_or_default();
+    let required_fx = required_historical_fx_currencies(&transactions, &cash_entries, &accounts, &base);
+    let fx_minimum = historical_fx_minimum(range, minimum, &transactions, &cash_entries);
+    let mut fx_to_fetch = Vec::<String>::new();
+    for code in required_fx {
+        let cache_key = fx_history_cache_key(&code, range);
+        let use_price_history = range == HistoryRange::OneDay || code == "USD";
+        let cached = if use_price_history {
+            currency::yahoo_cad_symbol(&code)
+                .and_then(|symbol| refs.state.database.history_points(&symbol, range.portfolio_interval(), fx_minimum).ok())
+                .unwrap_or_default()
+        } else {
+            refs.state.database.fx_history_points(&code, fx_minimum).unwrap_or_default()
+        };
         let one_day_window_too_short = range == HistoryRange::OneDay
-            && cached_fx
+            && cached
                 .first()
-                .zip(cached_fx.last())
+                .zip(cached.last())
                 .map(|(first, last)| last.timestamp.saturating_sub(first.timestamp) < 2 * 24 * 60 * 60)
                 .unwrap_or(true);
         let stale = refs
             .state
             .database
-            .history_needs_refresh(USD_CAD_HISTORY_SYMBOL, &fetch_key, range.portfolio_interval(), range.cache_seconds())
+            .history_needs_refresh(&cache_key, &fetch_key, range.portfolio_interval(), range.cache_seconds())
             .unwrap_or(true);
-        cached_empty || stale || one_day_window_too_short
-    } else {
-        false
-    };
+        if cached.is_empty() || stale || one_day_window_too_short {
+            fx_to_fetch.push(code);
+        }
+    }
 
-    if to_fetch.is_empty() && !fetch_fx {
+    if to_fetch.is_empty() && fx_to_fetch.is_empty() {
         update_portfolio_history_from_cache(&refs);
         return;
     }
@@ -13602,34 +14183,40 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
     let (sender, receiver) = mpsc::channel::<PortfolioHistoryRefreshResult>();
     std::thread::spawn(move || {
         let mut histories = Vec::new();
+        let mut fx_histories = Vec::new();
         let mut failures = 0usize;
         for symbol in to_fetch {
-            // Portfolio performance needs the provider's backing window so it
-            // can value the instant immediately before the visible range. The
-            // UI trims this cache only when drawing the chart.
             match market_data::portfolio_history_window(&symbol, range) {
                 Ok(history) => histories.push((symbol, history)),
                 Err(_) => failures += 1,
             }
         }
-        let fx_history = if fetch_fx {
-            // Keep the full OneDay backing window for conversion. Securities
-            // themselves are trimmed to their latest market session.
-            match market_data::portfolio_history_window(USD_CAD_HISTORY_SYMBOL, range) {
-                Ok(history) => Some(history),
-                Err(_) => {
-                    failures += 1;
-                    None
-                }
+        for code in fx_to_fetch {
+            let result = if range == HistoryRange::OneDay {
+                fx::intraday_to_cad(&code).map(|points| (code.clone(), points, true))
+            } else if code == "USD" {
+                // Preserve the exact historical CAD=X backing-window behavior
+                // used before multi-currency support.
+                currency::yahoo_cad_symbol(&code)
+                    .ok_or_else(|| fx::FxError("No Yahoo FX symbol for USD".into()))
+                    .and_then(|symbol| {
+                        market_data::portfolio_history_window(&symbol, range)
+                            .map(|history| (code.clone(), history.points, true))
+                            .map_err(|error| fx::FxError(error.to_string()))
+                    })
+            } else {
+                fx::historical_to_cad(&code, fx_minimum, now).map(|points| (code.clone(), points, false))
+            };
+            match result {
+                Ok(history) => fx_histories.push(history),
+                Err(_) => failures += 1,
             }
-        } else {
-            None
-        };
+        }
         let _ = sender.send(PortfolioHistoryRefreshResult {
             generation,
             range,
             histories,
-            fx_history,
+            fx_histories,
             failures,
         });
     });
@@ -13655,21 +14242,34 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
                 result.range.portfolio_interval(),
             );
         }
-        if let Some(history) = &result.fx_history {
-            let _ = refs
-                .state
-                .database
-                .save_history(USD_CAD_HISTORY_SYMBOL, result.range.portfolio_interval(), &history.points);
+        for (code, points, use_price_history) in &result.fx_histories {
+            if *use_price_history {
+                if let Some(symbol) = currency::yahoo_cad_symbol(code) {
+                    let _ = refs
+                        .state
+                        .database
+                        .save_history(&symbol, result.range.portfolio_interval(), points);
+                }
+                // Dividend cash accounting reads the provider-neutral FX cache.
+                // Mirror Yahoo-backed USD/intraday history there as well so a
+                // payment-date conversion never has to depend only on today's FX.
+                let _ = refs.state.database.save_fx_history(code, points, "Yahoo Finance");
+            } else {
+                let _ = refs.state.database.save_fx_history(code, points, "Bank of Canada / Yahoo Finance");
+            }
+            let cache_key = fx_history_cache_key(code, result.range);
             let _ = refs.state.database.set_history_fetched(
-                USD_CAD_HISTORY_SYMBOL,
+                &cache_key,
                 &fetch_key,
                 result.range.portfolio_interval(),
             );
         }
 
+        let _ = refs.state.database.sync_paid_dividends_to_cash();
+
         update_portfolio_history_from_cache(&refs);
         if announce && result.failures > 0 {
-            let message = if result.histories.is_empty() && result.fx_history.is_none() {
+            let message = if result.histories.is_empty() && result.fx_histories.is_empty() {
                 "Could not refresh portfolio history"
             } else {
                 "Some portfolio history could not be updated"
@@ -13856,7 +14456,7 @@ struct RefreshResult {
     quote_network_failures: usize,
     quote_attempted: bool,
     fx_attempted: bool,
-    fx: Option<Result<FxQuote, String>>,
+    fx: Vec<(String, Result<FxQuote, String>)>,
 }
 
 fn refresh_market_async(
@@ -13865,7 +14465,15 @@ fn refresh_market_async(
     fetch_fx: bool,
     announce: bool,
 ) {
-    if quote_positions.is_empty() && !fetch_fx {
+    let base = base_currency(&refs.state);
+    let all_positions = refs.state.database.load_positions().unwrap_or_default();
+    let fx_currencies = if fetch_fx {
+        required_fx_currencies(&refs.state, &all_positions, &base)
+    } else {
+        Vec::new()
+    };
+
+    if quote_positions.is_empty() && fx_currencies.is_empty() {
         if announce {
             finish_refresh_feedback(&refs);
         }
@@ -13873,6 +14481,7 @@ fn refresh_market_async(
     }
 
     let quote_attempted = !quote_positions.is_empty();
+    let fx_attempted = !fx_currencies.is_empty();
     let generation = refs.market_refresh_generation.get().wrapping_add(1);
     refs.market_refresh_generation.set(generation);
 
@@ -13900,14 +14509,20 @@ fn refresh_market_async(
                 }
             }
         }
-        let fx = fetch_fx.then(|| fx::usd_cad().map_err(|error| error.to_string()));
+        let fx = fx_currencies
+            .into_iter()
+            .map(|code| {
+                let result = fx::current_to_cad(&code).map_err(|error| error.to_string());
+                (code, result)
+            })
+            .collect();
         let _ = sender.send(RefreshResult {
             generation,
             quotes,
             quote_failures,
             quote_network_failures,
             quote_attempted,
-            fx_attempted: fetch_fx,
+            fx_attempted,
             fx,
         });
     });
@@ -13936,36 +14551,37 @@ fn refresh_market_async(
                 );
             }
         }
-        let mut fx_failed = false;
-        if let Some(fx_result) = result.fx {
+        let mut fx_failures = 0usize;
+        for (code, fx_result) in result.fx {
             match fx_result {
                 Ok(rate) => {
                     let _ = refs.state.database.set_fx_rate(
-                        USD_CAD_PAIR,
+                        &fx_pair_to_cad(&code),
                         rate.rate,
                         &rate.observation_date,
                     );
                 }
-                Err(_) => fx_failed = true,
+                Err(_) => fx_failures += 1,
             }
         }
+        let fx_failed = fx_failures > 0;
 
         let _ = refs.state.database.sync_paid_dividends_to_cash();
         refresh_with_loaded_crossfade(refs.clone());
 
         if announce {
             let message = if !result.quote_attempted && result.fx_attempted && fx_failed {
-                Some("Could not refresh exchange rate")
+                Some("Could not refresh exchange rates")
             } else if result.quotes.is_empty() && result.quote_failures > 0 && result.quote_network_failures == result.quote_failures {
                 Some("Network unavailable · using cached prices")
             } else if result.quotes.is_empty() && result.quote_failures > 0 {
                 Some("Quotes unavailable · using cached prices")
             } else if result.quote_failures > 0 && fx_failed {
-                Some("Some prices and the exchange rate could not be updated")
+                Some("Some prices and exchange rates could not be updated")
             } else if result.quote_failures > 0 {
                 Some("Some prices could not be updated · stale values may remain")
             } else if fx_failed {
-                Some("Exchange rate could not be updated")
+                Some("Some exchange rates could not be updated")
             } else {
                 None
             };
@@ -14005,65 +14621,136 @@ fn apply_appearance(state: &AppState) {
 }
 
 fn base_currency(state: &AppState) -> String {
-    match state
+    if let Some(code) = state
         .database
         .setting(BASE_CURRENCY_KEY)
         .ok()
         .flatten()
-        .as_deref()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| currency::is_supported(value))
     {
-        Some("CAD") => "CAD".into(),
-        Some("USD") => "USD".into(),
-        _ => state
-            .database
-            .load_accounts()
-            .ok()
-            .and_then(|accounts| accounts.into_iter().next())
-            .map(|account| account.currency)
-            .filter(|currency| matches!(currency.as_str(), "CAD" | "USD"))
-            .unwrap_or_else(|| "USD".into()),
+        return code;
     }
+
+    // Existing installations historically reported aggregate portfolio values
+    // in CAD. Keep that behaviour until the user explicitly chooses another
+    // Portfolio Currency. Brand-new setups persist the first account currency
+    // when the account is created, so they do not pass through this fallback.
+    "CAD".into()
+}
+
+fn fx_pair_to_cad(code: &str) -> String {
+    format!("{}CAD", code.trim().to_ascii_uppercase())
+}
+
+fn current_fx_rates(state: &AppState) -> FxRates {
+    let mut rates = FxRates::new();
+    rates.insert("CAD".into(), 1.0);
+    for rate in state.database.fx_rates().unwrap_or_default() {
+        let Some(code) = rate.pair.strip_suffix("CAD") else {
+            continue;
+        };
+        if code != "CAD" && currency::is_supported(code) && rate.rate.is_finite() && rate.rate > 0.0 {
+            rates.insert(code.to_string(), rate.rate);
+        }
+    }
+    rates
+}
+
+fn required_fx_currencies(state: &AppState, positions: &[Position], base: &str) -> Vec<String> {
+    let mut currencies = BTreeSet::<String>::new();
+    let base = base.trim().to_ascii_uppercase();
+
+    let mut add_pair = |from: &str, to: &str| {
+        let from = from.trim().to_ascii_uppercase();
+        let to = to.trim().to_ascii_uppercase();
+        if from == to || !currency::is_supported(&from) || !currency::is_supported(&to) {
+            return;
+        }
+        if from != "CAD" {
+            currencies.insert(from);
+        }
+        if to != "CAD" {
+            currencies.insert(to);
+        }
+    };
+
+    let accounts = state.database.load_accounts().unwrap_or_default();
+    let account_currencies = accounts
+        .iter()
+        .map(|account| (account.id, account.currency.as_str()))
+        .collect::<HashMap<_, _>>();
+
+    // Overview/reporting conversion into Portfolio Currency.
+    for position in positions {
+        add_pair(&position.currency, &base);
+    }
+    for account in &accounts {
+        if account.cash.abs() > 0.0000001 {
+            add_pair(&account.currency, &base);
+        }
+    }
+
+    // Account pages are intentionally independent of Portfolio Currency. Ensure
+    // all rates needed to convert a holding into its account's own currency are
+    // cached as well, even when that account currently has no cash balance.
+    for position in positions {
+        if let Some(account_currency) = account_currencies.get(&position.account_id) {
+            add_pair(&position.currency, account_currency);
+        }
+    }
+
+    // Sold positions can still contribute realized gain on an account page, so
+    // keep the transaction/account currency pair available after the holding is
+    // gone. Cash entries are included for the same reason.
+    for transaction in state.database.load_transactions().unwrap_or_default() {
+        if let Some(account_currency) = account_currencies.get(&transaction.account_id) {
+            add_pair(&transaction.currency, account_currency);
+            add_pair(&transaction.fees_currency, account_currency);
+            if let Some(settlement_currency) = transaction.settlement_currency.as_deref() {
+                add_pair(settlement_currency, account_currency);
+                add_pair(settlement_currency, &base);
+            }
+        }
+        add_pair(&transaction.currency, &base);
+        add_pair(&transaction.fees_currency, &base);
+    }
+    for entry in state.database.load_cash_entries().unwrap_or_default() {
+        if let Some(account_currency) = account_currencies.get(&entry.account_id) {
+            add_pair(&entry.currency, account_currency);
+        }
+    }
+
+    currencies.into_iter().collect()
 }
 
 fn portfolio_needs_fx_with_cash(state: &AppState, positions: &[Position], base: &str) -> bool {
-    portfolio_needs_fx(positions, base)
-        || state
-            .database
-            .load_accounts()
-            .unwrap_or_default()
-            .iter()
-            .any(|account| {
-                account.cash.abs() > 0.005
-                    && account.currency != base
-                    && matches!(account.currency.as_str(), "CAD" | "USD")
-                    && matches!(base, "CAD" | "USD")
-            })
+    !required_fx_currencies(state, positions, base).is_empty()
 }
 
-fn portfolio_needs_fx(positions: &[Position], base: &str) -> bool {
-    positions.iter().any(|position| {
-        position.currency != base
-            && matches!(position.currency.as_str(), "CAD" | "USD")
-            && matches!(base, "CAD" | "USD")
-    })
+fn portfolio_fx_needs_refresh(state: &AppState, positions: &[Position], base: &str) -> bool {
+    required_fx_currencies(state, positions, base)
+        .into_iter()
+        .any(|code| {
+            state
+                .database
+                .fx_rate_needs_refresh(&fx_pair_to_cad(&code), FX_CACHE_SECONDS)
+                .unwrap_or(true)
+        })
 }
 
-fn converted_market_value(position: &Position, base: &str, usd_cad: Option<f64>) -> Option<f64> {
-    convert_currency(position.market_value()?, &position.currency, base, usd_cad)
-}
-
-fn converted_total_gain(position: &Position, base: &str, usd_cad: Option<f64>) -> Option<f64> {
-    convert_currency(position.total_gain()?, &position.currency, base, usd_cad)
+fn converted_market_value(position: &Position, base: &str, fx_rates: &FxRates) -> Option<f64> {
+    convert_currency(position.market_value()?, &position.currency, base, fx_rates)
 }
 
 fn sum_converted<'a>(
     values: impl Iterator<Item = (f64, &'a str)>,
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
 ) -> Option<f64> {
     let mut total = 0.0;
     for (value, currency) in values {
-        total += convert_currency(value, currency, base, usd_cad)?;
+        total += convert_currency(value, currency, base, fx_rates)?;
     }
     Some(total)
 }
@@ -14071,16 +14758,16 @@ fn sum_converted<'a>(
 fn sum_optional_converted<'a>(
     values: impl Iterator<Item = (Option<f64>, &'a str)>,
     base: &str,
-    usd_cad: Option<f64>,
+    fx_rates: &FxRates,
 ) -> Option<f64> {
     let mut total = 0.0;
     for (value, currency) in values {
-        total += convert_currency(value?, currency, base, usd_cad)?;
+        total += convert_currency(value?, currency, base, fx_rates)?;
     }
     Some(total)
 }
 
-fn market_status_text(positions: &[Position], base: &str, fx: Option<&FxRate>) -> String {
+fn market_status_text(state: &AppState, positions: &[Position], base: &str, fx_rates: &FxRates) -> String {
     let quote_times = positions
         .iter()
         .filter_map(|position| position.quote_updated_at)
@@ -14088,8 +14775,8 @@ fn market_status_text(positions: &[Position], base: &str, fx: Option<&FxRate>) -
     let mut parts = Vec::new();
     if quote_times.len() == positions.len() {
         if let Some(oldest) = quote_times.iter().min() {
-            let state = market_data::quote_state_label(None, *oldest, current_unix_timestamp());
-            parts.push(format!("{} · oldest {}", state, relative_time(*oldest)));
+            let state_label = market_data::quote_state_label(None, *oldest, current_unix_timestamp());
+            parts.push(format!("{} · oldest {}", state_label, relative_time(*oldest)));
         }
     } else if let Some(oldest) = quote_times.iter().min() {
         parts.push(format!("Some quotes unavailable · cached {}", relative_time(*oldest)));
@@ -14097,19 +14784,18 @@ fn market_status_text(positions: &[Position], base: &str, fx: Option<&FxRate>) -
         parts.push("Quotes unavailable".into());
     }
 
-    if portfolio_needs_fx(positions, base) {
-        if let Some(rate) = fx {
-            parts.push(format!("USD/CAD {:.4} · {}", rate.rate, rate.observation_date));
+    let needed = required_fx_currencies(state, positions, base);
+    if !needed.is_empty() {
+        let missing = needed.iter().filter(|code| !fx_rates.contains_key(code.as_str())).count();
+        if missing == 0 {
+            parts.push(if needed.len() == 1 {
+                format!("{} FX available", needed[0])
+            } else {
+                format!("{} FX rates available", needed.len())
+            });
         } else {
-            parts.push("waiting for USD/CAD rate".into());
+            parts.push(format!("waiting for {missing} exchange rate{}", if missing == 1 { "" } else { "s" }));
         }
-    }
-
-    if positions
-        .iter()
-        .any(|position| !matches!(position.currency.as_str(), "CAD" | "USD"))
-    {
-        parts.push("some currencies are shown natively".into());
     }
     parts.join(" · ")
 }
@@ -14338,31 +15024,6 @@ fn set_gain_class(label: &Label, value: f64) {
     }
 }
 
-fn format_money_number(value: f64) -> String {
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let raw = format!("{:.2}", value.abs());
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
-    if whole.len() < 5 {
-        return format!("{sign}{raw}");
-    }
-
-    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
-    let first = whole.len() % 3;
-    if first > 0 {
-        grouped.push_str(&whole[..first]);
-        if first < whole.len() {
-            grouped.push(',');
-        }
-    }
-    for (index, chunk) in whole[first..].as_bytes().chunks(3).enumerate() {
-        if index > 0 {
-            grouped.push(',');
-        }
-        grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-    }
-    format!("{sign}{grouped}.{fraction}")
-}
-
 // Keep the dividend headline on GTK/Pango's normal text path. Per-glyph font
 // markup caused the dollar stem to render as a detached artifact on some
 // systems/themes.
@@ -14371,19 +15032,7 @@ fn set_dividend_income_text(label: &Label, text: &str) {
 }
 
 fn format_currency(value: f64, currency: &str) -> String {
-    let prefix = match currency {
-        "CAD" => "C$",
-        "USD" => "US$",
-        "EUR" => "€",
-        "GBP" => "£",
-        _ => "",
-    };
-    let number = format_money_number(value);
-    if prefix.is_empty() {
-        format!("{number} {currency}")
-    } else {
-        format!("{prefix}{number}")
-    }
+    currency::format_value(value, currency)
 }
 
 fn format_signed_currency(value: f64, currency: &str) -> String {
@@ -14470,8 +15119,24 @@ fn account_choice_label(account: &Account) -> String {
     format!("{} · {}", account.name, account.currency)
 }
 
+fn supported_currency_model() -> StringList {
+    let model = StringList::new(&[]);
+    for currency in currency::SUPPORTED_CURRENCIES {
+        model.append(currency.code);
+    }
+    model
+}
+
+fn valid_currency_selection(index: u32) -> bool {
+    (index as usize) < currency::SUPPORTED_CURRENCIES.len()
+}
+
+fn currency_index_or_default(code: &str) -> u32 {
+    currency::index_of(code).unwrap_or(0)
+}
+
 fn currency_at(index: u32) -> &'static str {
-    if index == 1 { "USD" } else { "CAD" }
+    currency::code_at(index).unwrap_or("CAD")
 }
 
 fn friendly_asset_type(asset_type: &str) -> &str {

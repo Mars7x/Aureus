@@ -583,40 +583,8 @@ fn rounded_rectangle(
     context.close_path();
 }
 
-fn format_money_number(value: f64) -> String {
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let raw = format!("{:.2}", value.abs());
-    let (whole, fraction) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
-    if whole.len() < 5 {
-        return format!("{sign}{raw}");
-    }
-
-    let mut grouped = String::with_capacity(whole.len() + whole.len() / 3);
-    let first = whole.len() % 3;
-    if first > 0 {
-        grouped.push_str(&whole[..first]);
-        if first < whole.len() {
-            grouped.push(',');
-        }
-    }
-    for (index, chunk) in whole[first..].as_bytes().chunks(3).enumerate() {
-        if index > 0 {
-            grouped.push(',');
-        }
-        grouped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
-    }
-    format!("{sign}{grouped}.{fraction}")
-}
-
 fn format_price(value: f64, currency: &str) -> String {
-    let number = format_money_number(value);
-    match currency {
-        "CAD" => format!("C${number}"),
-        "USD" => format!("US${number}"),
-        "EUR" => format!("€{number}"),
-        "GBP" => format!("£{number}"),
-        _ => format!("{number} {currency}"),
-    }
+    crate::currency::format_value(value, currency)
 }
 
 fn format_axis_time(timestamp: i64, range: HistoryRange, exchange_gmt_offset: i32) -> String {

@@ -24,6 +24,10 @@ pub struct SearchResult {
 
 #[derive(Clone, Debug)]
 pub struct Quote {
+    /// Provider-authoritative quote currency when available. Search results
+    /// are discovery metadata; the quote/chart response is authoritative for
+    /// the actual security.
+    pub currency: Option<String>,
     /// Timestamp for the price currently shown by Aureus. During supported
     /// extended sessions this is the pre-/post-market timestamp.
     pub timestamp: i64,
@@ -155,14 +159,21 @@ impl HistoryRange {
         now.saturating_sub(days * 24 * 60 * 60)
     }
 
-    fn display_minimum_timestamp(self, anchor: i64) -> i64 {
+    /// Exact rolling boundary used for security-detail range charts/returns.
+    /// Anchor this to the current clock rather than the last trade: thinly
+    /// traded securities can go a day or more without printing, and using the
+    /// last candle silently stretches a 1M/6M/1Y/5Y window backwards.
+    pub fn display_start_timestamp(self, now: i64, exchange_gmt_offset: i32) -> i64 {
         match self {
             Self::OneDay | Self::FiveDays | Self::All => 0,
-            Self::OneMonth => shift_timestamp_months(anchor, 1),
-            Self::SixMonths => shift_timestamp_months(anchor, 6),
-            Self::YearToDate => year_start_timestamp(anchor),
-            Self::OneYear => shift_timestamp_months(anchor, 12),
-            Self::FiveYears => shift_timestamp_months(anchor, 60),
+            Self::OneMonth => shift_timestamp_months(now, 1),
+            Self::SixMonths => shift_timestamp_months(now, 6),
+            Self::YearToDate => {
+                let local_now = now.saturating_add(i64::from(exchange_gmt_offset));
+                year_start_timestamp(local_now).saturating_sub(i64::from(exchange_gmt_offset))
+            }
+            Self::OneYear => shift_timestamp_months(now, 12),
+            Self::FiveYears => shift_timestamp_months(now, 60),
         }
     }
 }
@@ -170,7 +181,19 @@ impl HistoryRange {
 /// Normalize live provider history and the wider local database cache to the
 /// exact same visible range. The database intentionally stores a little extra
 /// history so cached charts remain useful across weekends and holidays.
-pub fn display_history_points(mut points: Vec<PricePoint>, range: HistoryRange) -> Vec<PricePoint> {
+pub fn display_history_points(points: Vec<PricePoint>, range: HistoryRange) -> Vec<PricePoint> {
+    display_history_points_with_offset(points, range, 0)
+}
+
+/// Normalize history while respecting the provider's exchange-local day for
+/// multi-session intraday ranges. Sparse securities can go many hours between
+/// trades during a single session, so elapsed-time gaps are not a reliable way
+/// to identify the five trading days in a 5D chart.
+pub fn display_history_points_with_offset(
+    mut points: Vec<PricePoint>,
+    range: HistoryRange,
+    exchange_gmt_offset: i32,
+) -> Vec<PricePoint> {
     if points.len() <= 1 {
         return points;
     }
@@ -182,16 +205,13 @@ pub fn display_history_points(mut points: Vec<PricePoint>, range: HistoryRange) 
         return latest_trading_session(points);
     }
     if range == HistoryRange::FiveDays {
-        return latest_trading_sessions(points, 5);
+        return latest_exchange_trading_days(points, 5, exchange_gmt_offset);
     }
     if range == HistoryRange::All {
         return points;
     }
 
-    let Some(anchor) = points.last().map(|point| point.timestamp) else {
-        return points;
-    };
-    let minimum = range.display_minimum_timestamp(anchor);
+    let minimum = range.display_start_timestamp(now_unix(), exchange_gmt_offset);
     let mut start = points.partition_point(|point| point.timestamp < minimum);
 
     // Preserve a usable two-point chart for unusually sparse instruments while
@@ -273,9 +293,9 @@ pub struct History {
     /// Provider-authoritative regular-session change for the current trading day.
     pub day_change_percent: Option<f64>,
     /// Provider-authoritative change for the requested chart range. This is
-    /// intentionally separate from first-visible-point -> last-visible-point,
-    /// because providers such as Yahoo anchor a range to the close immediately
-    /// before the selected range.
+    /// intentionally separate from a locally inferred first/last-point return:
+    /// providers such as Yahoo can expose range-specific frontend baselines and
+    /// special session semantics (notably 5D and YTD).
     pub range_return_percent: Option<f64>,
     /// Exchange-local offset supplied by the active provider for intraday chart
     /// labels. Keeping this on provider-neutral history avoids hard-coding TSX/US
@@ -439,6 +459,10 @@ fn extended_market_state(value: Option<&str>) -> bool {
 
 fn validate_quote_result(provider_symbol: &str, mut quote: Quote) -> Result<Quote, MarketError> {
     let now = now_unix();
+    quote.currency = quote.currency.and_then(|value| {
+        let value = value.trim().to_ascii_uppercase();
+        (!value.is_empty()).then_some(value)
+    });
     if !valid_provider_price(quote.close) || !valid_provider_price(quote.regular_close) {
         return Err(MarketError(format!(
             "{} returned an invalid price for {provider_symbol}",
@@ -718,7 +742,11 @@ pub fn dividends(provider_symbol: &str) -> Result<DividendHistory, MarketError> 
 
 pub fn history(provider_symbol: &str, range: HistoryRange) -> Result<History, MarketError> {
     let mut result = history_window(provider_symbol, range)?;
-    result.points = display_history_points(result.points, range);
+    result.points = display_history_points_with_offset(
+        result.points,
+        range,
+        result.exchange_gmt_offset.unwrap_or(0),
+    );
     if result.points.is_empty() {
         return Err(MarketError(format!(
             "{} returned no usable price history for {provider_symbol}",
@@ -742,7 +770,11 @@ pub fn history_with_extended_hours(
         provider.history_window_with_extended_hours(provider_symbol, range)
     })?;
     let mut result = sanitize_history_result(provider_symbol, history)?;
-    result.points = display_history_points(result.points, range);
+    result.points = display_history_points_with_offset(
+        result.points,
+        range,
+        result.exchange_gmt_offset.unwrap_or(0),
+    );
     if result.points.is_empty() {
         return Err(MarketError(format!(
             "{} returned no usable price history for {provider_symbol}",
@@ -858,6 +890,35 @@ fn latest_trading_sessions(points: Vec<PricePoint>, session_count: usize) -> Vec
     points.into_iter().skip(start).collect()
 }
 
+fn latest_exchange_trading_days(
+    points: Vec<PricePoint>,
+    day_count: usize,
+    exchange_gmt_offset: i32,
+) -> Vec<PricePoint> {
+    if points.len() <= 1 || day_count == 0 {
+        return points;
+    }
+
+    let exchange_day = |timestamp: i64| {
+        timestamp
+            .saturating_add(i64::from(exchange_gmt_offset))
+            .div_euclid(86_400)
+    };
+
+    let mut day_starts = vec![0usize];
+    let mut previous_day = exchange_day(points[0].timestamp);
+    for (index, point) in points.iter().enumerate().skip(1) {
+        let day = exchange_day(point.timestamp);
+        if day != previous_day {
+            day_starts.push(index);
+            previous_day = day;
+        }
+    }
+
+    let day_index = day_starts.len().saturating_sub(day_count);
+    points.into_iter().skip(day_starts[day_index]).collect()
+}
+
 pub(crate) fn display_symbol(symbol: &str) -> String {
     symbol
         .split_once('.')
@@ -870,6 +931,30 @@ pub(crate) fn infer_currency(exchange: &str) -> &'static str {
     match exchange.to_ascii_uppercase().as_str() {
         "TOR" | "TO" | "VAN" | "V" | "CNQ" => "CAD",
         "NMS" | "NGM" | "NCM" | "NYQ" | "ASE" | "PCX" | "BTS" | "US" => "USD",
+        "LSE" | "LON" => "GBP",
+        "GER" | "FRA" | "STU" | "MUN" | "DUS" | "HAM" | "HAN" | "BER" | "XETRA"
+        | "MUNICH" | "DUSSELDORF" | "FRANKFURT" | "STUTTGART" | "PAR" | "AMS"
+        | "MIL" | "MCE" => "EUR",
+        "JPX" | "TYO" | "TSE" => "JPY",
+        "HKG" | "HKSE" => "HKD",
+        "ASX" => "AUD",
+        "NZE" => "NZD",
+        "VTX" | "SWX" => "CHF",
+        "SES" | "SGX" => "SGD",
+        "KSC" | "KOE" => "KRW",
+        "TAI" | "TWO" => "TWD",
+        "STO" => "SEK",
+        "OSL" => "NOK",
+        "JNB" => "ZAR",
+        "MEX" | "BMV" => "MXN",
+        "SAO" => "BRL",
+        "IST" => "TRY",
+        "WSE" | "WAR" => "PLN",
+        "JKT" => "IDR",
+        "KLS" => "MYR",
+        "SET" => "THB",
+        "NSI" | "BSE" => "INR",
+        "SHH" | "SHZ" => "CNY",
         _ => "N/A",
     }
 }
@@ -896,6 +981,12 @@ mod tests {
     fn common_exchange_currencies_are_inferred_when_search_omits_currency() {
         assert_eq!(infer_currency("TO"), "CAD");
         assert_eq!(infer_currency("US"), "USD");
+        assert_eq!(infer_currency("LSE"), "GBP");
+        assert_eq!(infer_currency("MUN"), "EUR");
+        assert_eq!(infer_currency("Munich"), "EUR");
+        assert_eq!(infer_currency("DUS"), "EUR");
+        assert_eq!(infer_currency("JPX"), "JPY");
+        assert_eq!(infer_currency("HKG"), "HKD");
     }
 
     #[test]
@@ -957,6 +1048,7 @@ mod tests {
     #[test]
     fn provider_quote_rejects_unlabeled_session_prices() {
         let quote = Quote {
+            currency: Some("USD".into()),
             timestamp: 200,
             close: 101.0,
             regular_timestamp: 100,
@@ -971,6 +1063,7 @@ mod tests {
     #[test]
     fn provider_quote_discards_disagreeing_extended_percent() {
         let quote = Quote {
+            currency: Some("USD".into()),
             timestamp: 200,
             close: 101.0,
             regular_timestamp: 100,
@@ -1040,5 +1133,23 @@ mod tests {
         assert_eq!(visible.len(), 5);
         assert_eq!(visible.first().map(|point| point.close), Some(103.0));
         assert_eq!(visible.last().map(|point| point.close), Some(107.0));
+    }
+
+
+    #[test]
+    fn five_day_range_does_not_treat_sparse_same_day_trades_as_separate_sessions() {
+        let day = 86_400;
+        let points = vec![
+            PricePoint { timestamp: day + 9 * 3_600, close: 10.0 },
+            PricePoint { timestamp: day + 16 * 3_600, close: 10.1 },
+            PricePoint { timestamp: 2 * day + 9 * 3_600, close: 10.2 },
+            PricePoint { timestamp: 3 * day + 9 * 3_600, close: 10.3 },
+            PricePoint { timestamp: 4 * day + 9 * 3_600, close: 10.4 },
+            PricePoint { timestamp: 5 * day + 9 * 3_600, close: 10.5 },
+        ];
+        let visible = display_history_points_with_offset(points, HistoryRange::FiveDays, 3_600);
+        assert_eq!(visible.len(), 6);
+        assert_eq!(visible.first().map(|point| point.close), Some(10.0));
+        assert_eq!(visible.last().map(|point| point.close), Some(10.5));
     }
 }

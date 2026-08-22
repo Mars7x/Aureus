@@ -41,7 +41,6 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 - Used [Planify](https://flathub.org/apps/io.github.alainm23.planify) colour scheme for libadwaita colours
 
 ## Roadmap
-- Rework currencies
 - Fetch brand logos
 - Windows support
 - Android support

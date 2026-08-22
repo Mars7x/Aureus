@@ -6,13 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::currency;
 use crate::model::{
     Account, CashEntry, DividendEvent, FxRate, NewAccount, NewTransaction, NewWatchlistItem, Position,
     PricePoint, SplitEvent, Transaction, WatchlistItem,
 };
 use crate::storage;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 19;
 
 pub struct Database {
     connection: Connection,
@@ -28,6 +29,44 @@ struct DerivedPosition {
     currency: String,
     shares: f64,
     cost_basis: f64,
+}
+
+
+fn native_fee_from_settlement(
+    kind: &str,
+    shares: f64,
+    price: f64,
+    fees: f64,
+    asset_currency: &str,
+    fees_currency: &str,
+    settlement_amount: Option<f64>,
+) -> f64 {
+    if fees <= 0.0 {
+        return 0.0;
+    }
+    if asset_currency.eq_ignore_ascii_case(fees_currency) {
+        return fees;
+    }
+    let native_principal = shares * price;
+    let Some(settlement) = settlement_amount.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return 0.0;
+    };
+    if !native_principal.is_finite() || native_principal <= 0.0 {
+        return 0.0;
+    }
+    let account_principal = match kind {
+        "SELL" => settlement + fees,
+        "BUY" | "OPEN" => (settlement - fees).max(0.0),
+        _ => 0.0,
+    };
+    if account_principal <= 0.0 {
+        return 0.0;
+    }
+    let account_per_native = account_principal / native_principal;
+    if !account_per_native.is_finite() || account_per_native <= 0.0 {
+        return 0.0;
+    }
+    fees / account_per_native
 }
 
 fn invalid_database_error(message: String) -> rusqlite::Error {
@@ -97,6 +136,14 @@ impl Database {
             self.migrate_v16_to_v17()?;
             version = 17;
         }
+        if version == 17 {
+            self.migrate_v17_to_v18()?;
+            version = 18;
+        }
+        if version == 18 {
+            self.migrate_v18_to_v19()?;
+            version = 19;
+        }
         if version != 0 && version != SCHEMA_VERSION {
             // Never destroy a portfolio just because a database version is not
             // understood. Failing visibly is safer than silently resetting it.
@@ -110,7 +157,7 @@ impl Database {
              CREATE TABLE IF NOT EXISTS accounts (\n\
                  id INTEGER PRIMARY KEY AUTOINCREMENT,\n\
                  name TEXT NOT NULL,\n\
-                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD')),\n\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),\n\
                  created_at INTEGER NOT NULL DEFAULT (unixepoch())\n\
              );\n\
              CREATE TABLE IF NOT EXISTS transactions (\n\
@@ -126,8 +173,11 @@ impl Database {
                  shares REAL NOT NULL CHECK (shares > 0),\n\
                  price REAL NOT NULL CHECK (price >= 0),\n\
                  fees REAL NOT NULL DEFAULT 0 CHECK (fees >= 0),\n\
+                 fees_currency TEXT NOT NULL CHECK (fees_currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),\n\
+                 settlement_amount REAL CHECK (settlement_amount IS NULL OR settlement_amount >= 0),\n\
+                 settlement_currency TEXT CHECK (settlement_currency IS NULL OR settlement_currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),\n\
                  settle_cash INTEGER NOT NULL DEFAULT 0 CHECK (settle_cash IN (0, 1)),\n\
-                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD')),\n\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),\n\
                  created_at INTEGER NOT NULL DEFAULT (unixepoch())\n\
              );\n\
              CREATE INDEX IF NOT EXISTS transactions_timestamp_idx ON transactions(timestamp);\n\
@@ -157,7 +207,7 @@ impl Database {
                  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n\
                  kind TEXT NOT NULL CHECK (kind IN ('DEPOSIT', 'TRADE', 'DIVIDEND', 'TRANSFER')),\n\
                  amount REAL NOT NULL,\n\
-                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD')),\n\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),\n\
                  occurred_at INTEGER NOT NULL CHECK (occurred_at > 0),\n\
                  description TEXT NOT NULL,\n\
                  source_key TEXT UNIQUE,\n\
@@ -227,7 +277,15 @@ impl Database {
                  provider_symbol TEXT PRIMARY KEY COLLATE NOCASE,\n\
                  fetched_at INTEGER NOT NULL\n\
              );\n\
-             PRAGMA user_version = 17;\n\
+             CREATE TABLE IF NOT EXISTS fx_history (\n\
+                 currency TEXT NOT NULL,\n\
+                 timestamp INTEGER NOT NULL,\n\
+                 cad_rate REAL NOT NULL CHECK (cad_rate > 0),\n\
+                 source TEXT NOT NULL,\n\
+                 PRIMARY KEY(currency, timestamp)\n\
+             );\n\
+             CREATE INDEX IF NOT EXISTS fx_history_currency_time_idx ON fx_history(currency, timestamp);\n\
+             PRAGMA user_version = 19;\n\
              COMMIT;",
         )?;
 
@@ -298,6 +356,9 @@ impl Database {
              PRAGMA user_version = 15;\n\
              COMMIT;",
         );
+        if migration.is_err() {
+            let _ = self.connection.execute_batch("ROLLBACK;");
+        }
         let foreign_keys = self.connection.execute_batch("PRAGMA foreign_keys = ON;");
         migration?;
         foreign_keys?;
@@ -398,12 +459,236 @@ impl Database {
         rows.collect()
     }
 
+    fn migrate_v17_to_v18(&self) -> Result<()> {
+        // Widen the three user-money currency constraints without changing any
+        // stored amounts. Rebuild the account-linked tables together so foreign
+        // keys continue to point at the canonical accounts table.
+        self.connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = self.connection.execute_batch(
+            "BEGIN IMMEDIATE;
+\
+             ALTER TABLE transactions RENAME TO transactions_v17;
+\
+             ALTER TABLE positions RENAME TO positions_v17;
+\
+             ALTER TABLE cash_entries RENAME TO cash_entries_v17;
+\
+             ALTER TABLE accounts RENAME TO accounts_v17;
+\
+             CREATE TABLE accounts (
+\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+\
+                 name TEXT NOT NULL,
+\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),
+\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+\
+             );
+\
+             INSERT INTO accounts (id, name, currency, created_at)
+\
+             SELECT id, name, currency, created_at FROM accounts_v17;
+\
+             CREATE TABLE transactions (
+\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+\
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+\
+                 code TEXT NOT NULL COLLATE NOCASE,
+\
+                 exchange TEXT NOT NULL COLLATE NOCASE,
+\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE,
+\
+                 name TEXT NOT NULL,
+\
+                 transaction_type TEXT NOT NULL CHECK (transaction_type IN ('BUY', 'SELL', 'OPEN', 'TRANSFER_IN', 'TRANSFER_OUT')),
+\
+                 trade_date TEXT NOT NULL,
+\
+                 timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+\
+                 shares REAL NOT NULL CHECK (shares > 0),
+\
+                 price REAL NOT NULL CHECK (price >= 0),
+\
+                 fees REAL NOT NULL DEFAULT 0 CHECK (fees >= 0),
+\
+                 settle_cash INTEGER NOT NULL DEFAULT 0 CHECK (settle_cash IN (0, 1)),
+\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),
+\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+\
+             );
+\
+             INSERT INTO transactions (id, account_id, code, exchange, provider_symbol, name, transaction_type, trade_date, timestamp, shares, price, fees, settle_cash, currency, created_at)
+\
+             SELECT id, account_id, code, exchange, provider_symbol, name, transaction_type, trade_date, timestamp, shares, price, fees, settle_cash, currency, created_at FROM transactions_v17;
+\
+             CREATE TABLE positions (
+\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+\
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+\
+                 code TEXT NOT NULL COLLATE NOCASE,
+\
+                 exchange TEXT NOT NULL COLLATE NOCASE,
+\
+                 provider_symbol TEXT NOT NULL COLLATE NOCASE,
+\
+                 name TEXT NOT NULL,
+\
+                 shares REAL NOT NULL CHECK (shares > 0),
+\
+                 average_cost REAL NOT NULL CHECK (average_cost >= 0),
+\
+                 currency TEXT NOT NULL,
+\
+                 last_price REAL,
+\
+                 day_change_percent REAL,
+\
+                 quote_updated_at INTEGER,
+\
+                 quote_market_state TEXT,
+\
+                 extended_change_percent REAL,
+\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+\
+                 UNIQUE(account_id, provider_symbol)
+\
+             );
+\
+             INSERT INTO positions (id, account_id, code, exchange, provider_symbol, name, shares, average_cost, currency, last_price, day_change_percent, quote_updated_at, quote_market_state, extended_change_percent, created_at)
+\
+             SELECT id, account_id, code, exchange, provider_symbol, name, shares, average_cost, currency, last_price, day_change_percent, quote_updated_at, quote_market_state, extended_change_percent, created_at FROM positions_v17;
+\
+             CREATE TABLE cash_entries (
+\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+\
+                 account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+\
+                 kind TEXT NOT NULL CHECK (kind IN ('DEPOSIT', 'TRADE', 'DIVIDEND', 'TRANSFER')),
+\
+                 amount REAL NOT NULL,
+\
+                 currency TEXT NOT NULL CHECK (currency IN ('CAD', 'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CHF', 'CNY', 'HKD', 'INR', 'IDR', 'KRW', 'MYR', 'MXN', 'NZD', 'NOK', 'PEN', 'PLN', 'SGD', 'ZAR', 'SEK', 'TWD', 'THB', 'TRY', 'BRL')),
+\
+                 occurred_at INTEGER NOT NULL CHECK (occurred_at > 0),
+\
+                 description TEXT NOT NULL,
+\
+                 source_key TEXT UNIQUE,
+\
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+\
+             );
+\
+             INSERT INTO cash_entries (id, account_id, kind, amount, currency, occurred_at, description, source_key, created_at)
+\
+             SELECT id, account_id, kind, amount, currency, occurred_at, description, source_key, created_at FROM cash_entries_v17;
+\
+             DROP TABLE transactions_v17;
+\
+             DROP TABLE positions_v17;
+\
+             DROP TABLE cash_entries_v17;
+\
+             DROP TABLE accounts_v17;
+\
+             CREATE INDEX transactions_timestamp_idx ON transactions(timestamp);
+\
+             CREATE INDEX transactions_symbol_idx ON transactions(provider_symbol COLLATE NOCASE);
+\
+             CREATE INDEX transactions_account_symbol_idx ON transactions(account_id, provider_symbol COLLATE NOCASE);
+\
+             CREATE INDEX positions_account_id_idx ON positions(account_id);
+\
+             CREATE INDEX cash_entries_account_time_idx ON cash_entries(account_id, occurred_at);
+\
+             CREATE TABLE IF NOT EXISTS fx_history (
+\
+                 currency TEXT NOT NULL,
+\
+                 timestamp INTEGER NOT NULL,
+\
+                 cad_rate REAL NOT NULL CHECK (cad_rate > 0),
+\
+                 source TEXT NOT NULL,
+\
+                 PRIMARY KEY(currency, timestamp)
+\
+             );
+\
+             CREATE INDEX IF NOT EXISTS fx_history_currency_time_idx ON fx_history(currency, timestamp);
+\
+             PRAGMA user_version = 19;
+\
+             COMMIT;",
+        );
+        if let Err(error) = migration {
+            let _ = self.connection.execute_batch("ROLLBACK;");
+            let _ = self.connection.execute_batch("PRAGMA foreign_keys = ON;");
+            return Err(error);
+        }
+        self.connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        let violations = self.connection.prepare("PRAGMA foreign_key_check")?.query_map([], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?.collect::<Result<Vec<_>>>()?;
+        if !violations.is_empty() {
+            return Err(invalid_database_error("Portfolio database foreign-key check failed after currency migration".into()));
+        }
+        Ok(())
+    }
+
+    fn migrate_v18_to_v19(&self) -> Result<()> {
+        // Cross-currency trades keep the security execution in its native
+        // currency and separately record the actual account-currency
+        // settlement. Existing same-currency activity can be reconstructed
+        // exactly; older cross-currency activity remains unset rather than
+        // inventing an FX rate.
+        self.connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE transactions ADD COLUMN fees_currency TEXT;
+             ALTER TABLE transactions ADD COLUMN settlement_amount REAL;
+             ALTER TABLE transactions ADD COLUMN settlement_currency TEXT;
+             UPDATE transactions SET fees_currency = currency WHERE fees_currency IS NULL;
+             UPDATE transactions
+                SET settlement_currency = (SELECT a.currency FROM accounts a WHERE a.id = transactions.account_id)
+              WHERE settlement_currency IS NULL;
+             UPDATE transactions
+                SET settlement_amount = CASE transaction_type
+                    WHEN 'BUY' THEN shares * price + fees
+                    WHEN 'OPEN' THEN shares * price + fees
+                    WHEN 'SELL' THEN MAX(shares * price - fees, 0)
+                    ELSE NULL
+                END
+              WHERE currency = settlement_currency
+                AND transaction_type IN ('BUY', 'OPEN', 'SELL');
+             PRAGMA user_version = 19;
+             COMMIT;",
+        )?;
+        Ok(())
+    }
+
     pub fn add_account(&self, account: &NewAccount) -> Result<i64> {
+        let currency_code = account.currency.trim().to_uppercase();
+        if !currency::is_supported(&currency_code) {
+            return Err(invalid_database_error("Unsupported account currency".into()));
+        }
         self.connection.execute(
             "INSERT INTO accounts (name, currency) VALUES (?1, ?2)",
             params![
                 account.name.trim(),
-                account.currency.trim().to_uppercase(),
+                currency_code,
             ],
         )?;
         let account_id = self.connection.last_insert_rowid();
@@ -426,8 +711,8 @@ impl Database {
             return Err(invalid_database_error("Account name cannot be empty".into()));
         }
         let currency = currency.trim().to_uppercase();
-        if !matches!(currency.as_str(), "CAD" | "USD") {
-            return Err(invalid_database_error("Account currency must be CAD or USD".into()));
+        if !currency::is_supported(&currency) {
+            return Err(invalid_database_error("Unsupported account currency".into()));
         }
 
         let current_currency = self
@@ -533,6 +818,8 @@ impl Database {
                 shares: f64,
                 price: f64,
                 fees: f64,
+                fees_currency: String,
+                settlement_amount: Option<f64>,
                 currency: String,
             },
             Split {
@@ -563,7 +850,8 @@ impl Database {
 
         let mut events = Vec::<LedgerEvent>::new();
         let mut statement = self.connection.prepare(
-            "SELECT id, account_id, code, exchange, provider_symbol, name, transaction_type, shares, price, fees, currency, timestamp\n\
+            "SELECT id, account_id, code, exchange, provider_symbol, name, transaction_type, shares, price, fees,\n\
+                    COALESCE(fees_currency, currency), settlement_amount, currency, timestamp\n\
              FROM transactions",
         )?;
         let rows = statement.query_map([], |row| {
@@ -578,8 +866,10 @@ impl Database {
                 shares: row.get(7)?,
                 price: row.get(8)?,
                 fees: row.get(9)?,
-                currency: row.get(10)?,
-                timestamp: row.get(11)?,
+                fees_currency: row.get(10)?,
+                settlement_amount: row.get(11)?,
+                currency: row.get(12)?,
+                timestamp: row.get(13)?,
             })
         })?;
         events.extend(rows.collect::<Result<Vec<_>>>()?);
@@ -610,7 +900,8 @@ impl Database {
                     }
                 }
                 LedgerEvent::Transaction {
-                    account_id, code, exchange, provider_symbol, name, kind, shares, price, fees, currency, ..
+                    account_id, code, exchange, provider_symbol, name, kind, shares, price, fees,
+                    fees_currency, settlement_amount, currency, ..
                 } => {
                     let symbol = provider_symbol.trim().to_ascii_uppercase();
                     let key = (account_id, symbol.clone());
@@ -632,8 +923,11 @@ impl Database {
 
                     match kind.as_str() {
                         "BUY" | "OPEN" => {
+                            let native_fee = native_fee_from_settlement(
+                                &kind, shares, price, fees, &currency, &fees_currency, settlement_amount,
+                            );
                             state.shares += shares;
-                            state.cost_basis += shares * price + fees;
+                            state.cost_basis += shares * price + native_fee;
                         }
                         "SELL" | "TRANSFER_OUT" => {
                             if state.shares + 0.0005 < shares || state.shares <= 0.0 {
@@ -979,6 +1273,7 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT t.id, t.account_id, a.name, t.code, t.exchange, t.provider_symbol, t.name,\n\
                     t.transaction_type, t.trade_date, t.timestamp, t.shares, t.price, t.fees,\n\
+                    COALESCE(t.fees_currency, t.currency), t.settlement_amount, t.settlement_currency,\n\
                     t.settle_cash, t.currency\n\
              FROM transactions t\n\
              JOIN accounts a ON a.id = t.account_id\n\
@@ -999,8 +1294,11 @@ impl Database {
                 shares: row.get(10)?,
                 price: row.get(11)?,
                 fees: row.get(12)?,
-                settle_cash: row.get::<_, i64>(13)? != 0,
-                currency: row.get(14)?,
+                fees_currency: row.get(13)?,
+                settlement_amount: row.get(14)?,
+                settlement_currency: row.get(15)?,
+                settle_cash: row.get::<_, i64>(16)? != 0,
+                currency: row.get(17)?,
             })
         })?;
         rows.collect()
@@ -1011,7 +1309,8 @@ impl Database {
         let source_key = format!("trade:{transaction_id}");
         let row = self.connection.query_row(
             "SELECT t.account_id, t.code, t.transaction_type, t.shares, t.price, t.fees,\n\
-                    t.settle_cash, t.currency, a.currency, t.timestamp\n\
+                    COALESCE(t.fees_currency, t.currency), t.settle_cash, t.currency, a.currency, t.timestamp,\n\
+                    t.settlement_amount, t.settlement_currency\n\
              FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.id = ?1",
             params![transaction_id],
             |row| {
@@ -1022,10 +1321,13 @@ impl Database {
                     row.get::<_, f64>(3)?,
                     row.get::<_, f64>(4)?,
                     row.get::<_, f64>(5)?,
-                    row.get::<_, i64>(6)? != 0,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)? != 0,
                     row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, Option<f64>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             },
         )?;
@@ -1036,10 +1338,13 @@ impl Database {
             shares,
             price,
             fees,
+            fees_currency,
             settle_cash,
-            currency,
+            trade_currency,
             account_currency,
             timestamp,
+            settlement_amount,
+            settlement_currency,
         ) = row;
 
         let existing_entry_id = self
@@ -1061,17 +1366,29 @@ impl Database {
             }
             return Ok(());
         }
-        if !currency.eq_ignore_ascii_case(&account_currency) {
+        let settlement_currency = settlement_currency
+            .filter(|code| currency::is_supported(code))
+            .unwrap_or_else(|| account_currency.clone());
+        if !settlement_currency.eq_ignore_ascii_case(&account_currency) {
             return Err(invalid_database_error(format!(
-                "{} trades can only use {} cash in this account",
-                currency.to_ascii_uppercase(),
+                "Trade settlement must use the account currency ({})",
                 account_currency.to_ascii_uppercase()
             )));
         }
+        let settlement_amount = settlement_amount.or_else(|| {
+            (trade_currency.eq_ignore_ascii_case(&account_currency)
+                && fees_currency.eq_ignore_ascii_case(&account_currency))
+                .then(|| match kind.as_str() {
+                    "BUY" => shares * price + fees,
+                    "SELL" => (shares * price - fees).max(0.0),
+                    _ => 0.0,
+                })
+        }).filter(|amount| amount.is_finite() && *amount >= 0.0)
+          .ok_or_else(|| invalid_database_error("Enter the account-currency settlement amount for this trade".into()))?;
 
         let amount = match kind.as_str() {
-            "BUY" => -(shares * price + fees),
-            "SELL" => shares * price - fees,
+            "BUY" => -settlement_amount,
+            "SELL" => settlement_amount,
             _ => 0.0,
         };
         self.validate_cash_ledger_change(
@@ -1082,7 +1399,7 @@ impl Database {
 
         self.connection.execute(
             "INSERT INTO cash_entries (account_id, kind, amount, currency, occurred_at, description, source_key)\n\
-             SELECT account_id, 'TRADE', ?2, currency, timestamp, ?3, ?4 FROM transactions WHERE id = ?1\n\
+             SELECT account_id, 'TRADE', ?2, ?5, timestamp, ?3, ?4 FROM transactions WHERE id = ?1\n\
              ON CONFLICT(source_key) DO UPDATE SET\n\
                  account_id = excluded.account_id, amount = excluded.amount, currency = excluded.currency,\n\
                  occurred_at = excluded.occurred_at, description = excluded.description",
@@ -1091,19 +1408,58 @@ impl Database {
                 amount,
                 if kind == "BUY" { format!("Bought {code}") } else { format!("Sold {code}") },
                 &source_key,
+                &account_currency,
             ],
         )?;
         Ok(())
     }
 
     pub fn add_transaction(&self, transaction: &NewTransaction) -> Result<i64> {
+        let trade_currency = transaction.currency.trim().to_ascii_uppercase();
+        let fees_currency = transaction.fees_currency.trim().to_ascii_uppercase();
+        if !currency::is_supported(&trade_currency) || !currency::is_supported(&fees_currency) {
+            return Err(invalid_database_error("Unsupported transaction currency".into()));
+        }
+        if transaction
+            .settlement_amount
+            .is_some_and(|amount| !amount.is_finite() || amount < 0.0)
+        {
+            return Err(invalid_database_error("Invalid trade settlement amount".into()));
+        }
+        let account_currency: String = self.connection.query_row(
+            "SELECT currency FROM accounts WHERE id = ?1",
+            params![transaction.account_id],
+            |row| row.get(0),
+        )?;
+        if let Some(settlement_currency) = transaction.settlement_currency.as_deref() {
+            if !currency::is_supported(settlement_currency)
+                || !settlement_currency.eq_ignore_ascii_case(&account_currency)
+            {
+                return Err(invalid_database_error(format!(
+                    "Trade settlement must use the account currency ({})",
+                    account_currency.to_ascii_uppercase()
+                )));
+            }
+        }
+        let kind = transaction.transaction_type.trim().to_ascii_uppercase();
+        if matches!(kind.as_str(), "BUY" | "SELL" | "OPEN")
+            && !trade_currency.eq_ignore_ascii_case(&account_currency)
+            && transaction.settlement_amount.is_none()
+        {
+            return Err(invalid_database_error(format!(
+                "Enter the actual {} settlement amount for this cross-currency trade",
+                account_currency.to_ascii_uppercase()
+            )));
+        }
+
         self.connection.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<i64> {
             self.connection.execute(
                 "INSERT INTO transactions (\n\
                      account_id, code, exchange, provider_symbol, name, transaction_type,\n\
-                     trade_date, timestamp, shares, price, fees, settle_cash, currency\n\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     trade_date, timestamp, shares, price, fees, fees_currency, settlement_amount,\n\
+                     settlement_currency, settle_cash, currency\n\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     transaction.account_id,
                     transaction.code.trim().to_uppercase(),
@@ -1116,6 +1472,9 @@ impl Database {
                     transaction.shares,
                     transaction.price,
                     transaction.fees,
+                    transaction.fees_currency.trim().to_uppercase(),
+                    transaction.settlement_amount,
+                    transaction.settlement_currency.as_deref().map(|value| value.trim().to_uppercase()),
                     if transaction.settle_cash { 1 } else { 0 },
                     transaction.currency.trim().to_uppercase(),
                 ],
@@ -1141,14 +1500,51 @@ impl Database {
         shares: f64,
         price: f64,
         fees: f64,
+        fees_currency: &str,
+        settlement_amount: Option<f64>,
+        settlement_currency: Option<&str>,
         settle_cash: bool,
     ) -> Result<()> {
+        let fees_currency = fees_currency.trim().to_ascii_uppercase();
+        if !currency::is_supported(&fees_currency) {
+            return Err(invalid_database_error("Unsupported fee currency".into()));
+        }
+        if settlement_amount.is_some_and(|amount| !amount.is_finite() || amount < 0.0) {
+            return Err(invalid_database_error("Invalid trade settlement amount".into()));
+        }
+        let (trade_currency, account_currency): (String, String) = self.connection.query_row(
+            "SELECT t.currency, a.currency FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.id = ?1",
+            params![transaction_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(settlement_currency) = settlement_currency {
+            if !currency::is_supported(settlement_currency)
+                || !settlement_currency.eq_ignore_ascii_case(&account_currency)
+            {
+                return Err(invalid_database_error(format!(
+                    "Trade settlement must use the account currency ({})",
+                    account_currency.to_ascii_uppercase()
+                )));
+            }
+        }
+        let kind = transaction_type.trim().to_ascii_uppercase();
+        if matches!(kind.as_str(), "BUY" | "SELL" | "OPEN")
+            && !trade_currency.eq_ignore_ascii_case(&account_currency)
+            && settlement_amount.is_none()
+        {
+            return Err(invalid_database_error(format!(
+                "Enter the actual {} settlement amount for this cross-currency trade",
+                account_currency.to_ascii_uppercase()
+            )));
+        }
+
         self.connection.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<()> {
             self.connection.execute(
                 "UPDATE transactions\n\
                  SET transaction_type = ?2, trade_date = ?3, timestamp = ?4, shares = ?5,\n\
-                     price = ?6, fees = ?7, settle_cash = ?8\n\
+                     price = ?6, fees = ?7, fees_currency = ?8, settlement_amount = ?9,\n\
+                     settlement_currency = ?10, settle_cash = ?11\n\
                  WHERE id = ?1",
                 params![
                     transaction_id,
@@ -1158,6 +1554,9 @@ impl Database {
                     shares,
                     price,
                     fees,
+                    fees_currency.trim().to_uppercase(),
+                    settlement_amount,
+                    settlement_currency.map(|value| value.trim().to_uppercase()),
                     if settle_cash { 1 } else { 0 },
                 ],
             )?;
@@ -1453,8 +1852,9 @@ impl Database {
             self.connection.execute(
                 "INSERT INTO transactions (\n\
                      account_id, code, exchange, provider_symbol, name, transaction_type,\n\
-                     trade_date, timestamp, shares, price, fees, settle_cash, currency\n\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'TRANSFER_OUT', ?6, ?7, ?8, ?9, 0, 0, ?10)",
+                     trade_date, timestamp, shares, price, fees, fees_currency, settlement_amount,\n\
+                     settlement_currency, settle_cash, currency\n\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'TRANSFER_OUT', ?6, ?7, ?8, ?9, 0, ?10, NULL, NULL, 0, ?10)",
                 params![
                     from_account_id,
                     &position.code,
@@ -1471,8 +1871,9 @@ impl Database {
             self.connection.execute(
                 "INSERT INTO transactions (\n\
                      account_id, code, exchange, provider_symbol, name, transaction_type,\n\
-                     trade_date, timestamp, shares, price, fees, settle_cash, currency\n\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'TRANSFER_IN', ?6, ?7, ?8, ?9, 0, 0, ?10)",
+                     trade_date, timestamp, shares, price, fees, fees_currency, settlement_amount,\n\
+                     settlement_currency, settle_cash, currency\n\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'TRANSFER_IN', ?6, ?7, ?8, ?9, 0, ?10, NULL, NULL, 0, ?10)",
                 params![
                     to_account_id,
                     &position.code,
@@ -1710,7 +2111,6 @@ impl Database {
         self.connection.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<()> {
             let transactions = self.load_transactions()?;
-            let usd_cad = self.fx_rate("USDCAD")?.map(|rate| rate.rate);
 
             for (symbol, ex_date, payment_date) in schedules {
                 let Some((_event_timestamp, per_share, currency)) =
@@ -1735,14 +2135,30 @@ impl Database {
                         continue;
                     }
                     let native_amount = shares * per_share;
-                    let amount = if currency.eq_ignore_ascii_case(&account.currency) {
+                    let from_currency = currency.trim().to_ascii_uppercase();
+                    let to_currency = account.currency.trim().to_ascii_uppercase();
+                    let amount = if from_currency == to_currency {
                         Some(native_amount)
-                    } else if currency.eq_ignore_ascii_case("USD") && account.currency == "CAD" {
-                        usd_cad.map(|rate| native_amount * rate)
-                    } else if currency.eq_ignore_ascii_case("CAD") && account.currency == "USD" {
-                        usd_cad.filter(|rate| *rate > 0.0).map(|rate| native_amount / rate)
                     } else {
-                        None
+                        let from_rate = if from_currency == "CAD" {
+                            Some(1.0)
+                        } else {
+                            self.fx_history_rate_at(&from_currency, payment_date)?
+                        };
+                        let to_rate = if to_currency == "CAD" {
+                            Some(1.0)
+                        } else {
+                            self.fx_history_rate_at(&to_currency, payment_date)?
+                        };
+                        from_rate
+                            .zip(to_rate)
+                            .filter(|(from_rate, to_rate)| {
+                                from_rate.is_finite()
+                                    && *from_rate > 0.0
+                                    && to_rate.is_finite()
+                                    && *to_rate > 0.0
+                            })
+                            .map(|(from_rate, to_rate)| native_amount * from_rate / to_rate)
                     };
                     let Some(amount) = amount.filter(|amount| amount.is_finite() && *amount > 0.0) else {
                         continue;
@@ -1878,6 +2294,18 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_watchlist_currency(&self, item_id: i64, currency: &str) -> Result<()> {
+        let currency = currency.trim().to_ascii_uppercase();
+        if currency.is_empty() {
+            return Ok(());
+        }
+        self.connection.execute(
+            "UPDATE watchlist SET currency = ?2 WHERE id = ?1",
+            params![item_id, currency],
+        )?;
+        Ok(())
+    }
+
     pub fn watchlist_needing_refresh(&self, max_age_seconds: i64) -> Result<Vec<WatchlistItem>> {
         let now = unix_timestamp();
         Ok(self
@@ -1907,6 +2335,21 @@ impl Database {
         }))
     }
 
+    pub fn fx_rates(&self) -> Result<Vec<FxRate>> {
+        let mut statement = self.connection.prepare(
+            "SELECT pair, rate, observation_date, updated_at FROM fx_rates ORDER BY pair ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(FxRate {
+                pair: row.get(0)?,
+                rate: row.get(1)?,
+                observation_date: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn set_fx_rate(&self, pair: &str, rate: f64, observation_date: &str) -> Result<()> {
         self.connection.execute(
             "INSERT INTO fx_rates (pair, rate, observation_date, updated_at)\n\
@@ -1925,6 +2368,66 @@ impl Database {
             .fx_rate(pair)?
             .map(|rate| unix_timestamp().saturating_sub(rate.updated_at) >= max_age_seconds)
             .unwrap_or(true))
+    }
+
+    pub fn save_fx_history(
+        &self,
+        currency_code: &str,
+        points: &[PricePoint],
+        source: &str,
+    ) -> Result<()> {
+        let currency_code = currency_code.trim().to_ascii_uppercase();
+        if currency_code == "CAD" || !currency::is_supported(&currency_code) {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO fx_history (currency, timestamp, cad_rate, source)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(currency, timestamp) DO UPDATE SET
+                     cad_rate = excluded.cad_rate, source = excluded.source",
+            )?;
+            for point in points {
+                if point.timestamp > 0 && point.close.is_finite() && point.close > 0.0 {
+                    statement.execute(params![currency_code, point.timestamp, point.close, source])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fx_history_points(&self, currency_code: &str, minimum_timestamp: i64) -> Result<Vec<PricePoint>> {
+        let currency_code = currency_code.trim().to_ascii_uppercase();
+        let mut statement = self.connection.prepare(
+            "SELECT timestamp, cad_rate FROM fx_history
+             WHERE currency = ?1 AND timestamp >= ?2 ORDER BY timestamp ASC",
+        )?;
+        let rows = statement.query_map(params![currency_code, minimum_timestamp], |row| {
+            Ok(PricePoint {
+                timestamp: row.get(0)?,
+                close: row.get(1)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    fn fx_history_rate_at(&self, currency_code: &str, timestamp: i64) -> Result<Option<f64>> {
+        let currency_code = currency_code.trim().to_ascii_uppercase();
+        if currency_code == "CAD" {
+            return Ok(Some(1.0));
+        }
+        let minimum = timestamp.saturating_sub(10 * 24 * 60 * 60);
+        self.connection
+            .query_row(
+                "SELECT cad_rate FROM fx_history
+                 WHERE currency = ?1 AND timestamp <= ?2 AND timestamp >= ?3
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![currency_code, timestamp, minimum],
+                |row| row.get::<_, f64>(0),
+            )
+            .optional()
     }
 
     pub fn history_points(
@@ -2171,7 +2674,7 @@ impl Database {
         let base_currency = self
             .setting("base-currency")
             .map_err(|error| error.to_string())?
-            .filter(|currency| matches!(currency.as_str(), "CAD" | "USD"))
+            .filter(|currency| currency::is_supported(currency))
             .unwrap_or_else(|| {
                 accounts
                     .first()
@@ -2179,7 +2682,7 @@ impl Database {
                     .unwrap_or_else(|| "CAD".into())
             });
         let backup = PortfolioBackup {
-            format_version: 5,
+            format_version: 6,
             base_currency,
             accounts: accounts
                 .into_iter()
@@ -2215,6 +2718,9 @@ impl Database {
                     shares: transaction.shares,
                     price: transaction.price,
                     fees: transaction.fees,
+                    fees_currency: Some(transaction.fees_currency),
+                    settlement_amount: transaction.settlement_amount,
+                    settlement_currency: transaction.settlement_currency,
                     settle_cash: transaction.settle_cash,
                     currency: transaction.currency,
                 })
@@ -2238,21 +2744,26 @@ impl Database {
     pub fn import_backup_json(&self, json: &str) -> std::result::Result<(), String> {
         let backup: PortfolioBackup = serde_json::from_str(json)
             .map_err(|error| format!("This is not a valid Aureus backup: {error}"))?;
-        if backup.format_version != 5 {
-            return Err("This version of Aureus only imports current-format backups".into());
+        if !matches!(backup.format_version, 5 | 6) {
+            return Err("This version of Aureus only imports supported Aureus backups".into());
         }
         if backup.accounts.is_empty() {
             return Err("The backup does not contain any accounts".into());
         }
-        if !matches!(backup.base_currency.as_str(), "CAD" | "USD") {
+        if !currency::is_supported(&backup.base_currency) {
             return Err("The backup has an unsupported portfolio currency".into());
         }
 
         let account_ids = backup.accounts.iter().map(|account| account.id).collect::<HashSet<_>>();
+        let account_currencies = backup
+            .accounts
+            .iter()
+            .map(|account| (account.id, account.currency.as_str()))
+            .collect::<HashMap<_, _>>();
         if account_ids.len() != backup.accounts.len()
             || backup.accounts.iter().any(|account| {
                 account.name.trim().is_empty()
-                    || !matches!(account.currency.as_str(), "CAD" | "USD")
+                    || !currency::is_supported(&account.currency)
             })
         {
             return Err("The backup contains an invalid account".into());
@@ -2270,7 +2781,16 @@ impl Database {
                 || transaction.price < 0.0
                 || !transaction.fees.is_finite()
                 || transaction.fees < 0.0
-                || !matches!(transaction.currency.as_str(), "CAD" | "USD")
+                || transaction.fees_currency.as_deref().is_some_and(|code| !currency::is_supported(code))
+                || transaction.settlement_amount.is_some_and(|amount| !amount.is_finite() || amount < 0.0)
+                || transaction.settlement_currency.as_deref().is_some_and(|code| {
+                    !currency::is_supported(code)
+                        || account_currencies
+                            .get(&transaction.account_id)
+                            .map(|account_currency| !code.eq_ignore_ascii_case(account_currency))
+                            .unwrap_or(true)
+                })
+                || !currency::is_supported(&transaction.currency)
         }) {
             return Err("The backup contains invalid activity".into());
         }
@@ -2278,7 +2798,7 @@ impl Database {
             !account_ids.contains(&entry.account_id)
                 || !matches!(entry.kind.as_str(), "DEPOSIT" | "DIVIDEND" | "TRANSFER")
                 || !entry.amount.is_finite()
-                || !matches!(entry.currency.as_str(), "CAD" | "USD")
+                || !currency::is_supported(&entry.currency)
                 || entry.occurred_at <= 0
         }) {
             return Err("The backup contains invalid cash activity".into());
@@ -2356,8 +2876,9 @@ impl Database {
                 self.connection.execute(
                     "INSERT INTO transactions (\n\
                          account_id, code, exchange, provider_symbol, name, transaction_type, trade_date,\n\
-                         timestamp, shares, price, fees, settle_cash, currency\n\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         timestamp, shares, price, fees, fees_currency, settlement_amount, settlement_currency,\n\
+                         settle_cash, currency\n\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         new_account_id,
                         transaction.code.trim().to_uppercase(),
@@ -2370,6 +2891,16 @@ impl Database {
                         transaction.shares,
                         transaction.price,
                         transaction.fees,
+                        transaction.fees_currency.as_deref().unwrap_or(&transaction.currency).trim().to_uppercase(),
+                        transaction.settlement_amount.or_else(|| {
+                            let account_currency = backup.accounts.iter().find(|account| account.id == transaction.account_id).map(|account| account.currency.as_str())?;
+                            transaction.currency.eq_ignore_ascii_case(account_currency).then(|| match transaction.transaction_type.as_str() {
+                                "BUY" | "OPEN" => transaction.shares * transaction.price + transaction.fees,
+                                "SELL" => (transaction.shares * transaction.price - transaction.fees).max(0.0),
+                                _ => 0.0,
+                            })
+                        }),
+                        transaction.settlement_currency.as_deref().or_else(|| backup.accounts.iter().find(|account| account.id == transaction.account_id).map(|account| account.currency.as_str())).map(|value| value.trim().to_uppercase()),
                         if transaction.settle_cash { 1 } else { 0 },
                         transaction.currency.trim().to_uppercase(),
                     ],
@@ -2503,6 +3034,12 @@ struct BackupTransaction {
     shares: f64,
     price: f64,
     fees: f64,
+    #[serde(default)]
+    fees_currency: Option<String>,
+    #[serde(default)]
+    settlement_amount: Option<f64>,
+    #[serde(default)]
+    settlement_currency: Option<String>,
     settle_cash: bool,
     currency: String,
 }
@@ -2610,6 +3147,9 @@ mod tests {
                 shares: 10.0,
                 price: 10.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -2680,6 +3220,9 @@ mod tests {
                 shares: 10.0,
                 price: 10.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -2697,6 +3240,9 @@ mod tests {
                 shares: 10.0,
                 price: 12.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -2752,6 +3298,9 @@ mod tests {
                 shares: 10.0,
                 price: 10.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -2916,6 +3465,9 @@ mod tests {
                 shares: 10.0,
                 price: 20.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -2970,6 +3522,9 @@ mod tests {
                 shares: 10.0,
                 price: 20.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -3008,6 +3563,9 @@ mod tests {
                 shares: 10.0,
                 price: 20.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -3047,6 +3605,9 @@ mod tests {
                 shares: 10.0,
                 price: 50.0,
                 fees: 5.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3138,6 +3699,9 @@ mod tests {
             shares: 2.0,
             price: 100.0,
             fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
             settle_cash: true,
             currency: "CAD".into(),
         });
@@ -3167,6 +3731,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -3184,6 +3751,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3201,6 +3771,9 @@ mod tests {
                 shares: 9.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3215,6 +3788,9 @@ mod tests {
                 10.0,
                 10.0,
                 0.0,
+                "CAD",
+                None,
+                None,
                 true,
             )
             .is_err());
@@ -3241,6 +3817,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -3258,6 +3837,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3275,6 +3857,9 @@ mod tests {
                 shares: 9.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3306,6 +3891,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: false,
                 currency: "CAD".into(),
             })
@@ -3323,6 +3911,9 @@ mod tests {
                 shares: 10.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3340,6 +3931,9 @@ mod tests {
                 shares: 9.0,
                 price: 100.0,
                 fees: 0.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: None,
+                settlement_currency: None,
                 settle_cash: true,
                 currency: "CAD".into(),
             })
@@ -3350,6 +3944,42 @@ mod tests {
         assert!(transactions.iter().any(|transaction| transaction.provider_symbol == "OLD.TO"));
         let account = database.load_accounts().expect("accounts").remove(0);
         assert!((account.cash - 100.0).abs() < 0.0000001);
+    }
+
+    #[test]
+    fn cross_currency_trade_uses_exact_account_settlement_for_cash_and_native_fee_basis() {
+        let database = Database::open_in_memory().expect("database");
+        let account_id = database
+            .add_account(&NewAccount { name: "CAD".into(), currency: "CAD".into() })
+            .expect("account");
+        database.add_cash(account_id, 1_000.0, 100).expect("deposit");
+
+        database
+            .add_transaction(&NewTransaction {
+                account_id,
+                code: "TEST".into(),
+                exchange: "GER".into(),
+                provider_symbol: "TEST.DE".into(),
+                name: "Euro Test".into(),
+                transaction_type: "BUY".into(),
+                trade_date: "1970-01-01".into(),
+                timestamp: 200,
+                shares: 1.0,
+                price: 100.0,
+                fees: 5.0,
+                fees_currency: "CAD".into(),
+                settlement_amount: Some(155.0),
+                settlement_currency: Some("CAD".into()),
+                settle_cash: true,
+                currency: "EUR".into(),
+            })
+            .expect("cross-currency buy");
+
+        let account = database.load_accounts().expect("accounts").remove(0);
+        assert!((account.cash - 845.0).abs() < 0.0000001);
+        let position = database.load_positions().expect("positions").remove(0);
+        assert_eq!(position.currency, "EUR");
+        assert!((position.average_cost - (100.0 + 5.0 / 1.5)).abs() < 0.0000001);
     }
 
 }

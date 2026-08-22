@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Account {
     pub id: i64,
@@ -89,6 +91,12 @@ pub struct Transaction {
     pub shares: f64,
     pub price: f64,
     pub fees: f64,
+    /// Currency the brokerage charged the explicit transaction fee in.
+    pub fees_currency: String,
+    /// Positive magnitude actually charged to/credited from the account for
+    /// this trade, inclusive of fees. Stored in settlement_currency.
+    pub settlement_amount: Option<f64>,
+    pub settlement_currency: Option<String>,
     pub settle_cash: bool,
     pub currency: String,
 }
@@ -106,6 +114,9 @@ pub struct NewTransaction {
     pub shares: f64,
     pub price: f64,
     pub fees: f64,
+    pub fees_currency: String,
+    pub settlement_amount: Option<f64>,
+    pub settlement_currency: Option<String>,
     pub settle_cash: bool,
     pub currency: String,
 }
@@ -167,34 +178,41 @@ impl Position {
     }
 }
 
+pub type FxRates = HashMap<String, f64>;
+
 pub fn convert_currency(
     value: f64,
     from_currency: &str,
     to_currency: &str,
-    usd_cad: Option<f64>,
+    cad_rates: &FxRates,
 ) -> Option<f64> {
-    let from = from_currency.to_ascii_uppercase();
-    let to = to_currency.to_ascii_uppercase();
+    let from = from_currency.trim().to_ascii_uppercase();
+    let to = to_currency.trim().to_ascii_uppercase();
 
-    if from == to {
+    if from == to || value == 0.0 {
         return Some(value);
     }
 
-    let rate = usd_cad?;
-    if rate <= 0.0 {
+    let from_cad = if from == "CAD" {
+        1.0
+    } else {
+        *cad_rates.get(&from)?
+    };
+    let to_cad = if to == "CAD" {
+        1.0
+    } else {
+        *cad_rates.get(&to)?
+    };
+    if !from_cad.is_finite() || from_cad <= 0.0 || !to_cad.is_finite() || to_cad <= 0.0 {
         return None;
     }
 
-    match (from.as_str(), to.as_str()) {
-        ("USD", "CAD") => Some(value * rate),
-        ("CAD", "USD") => Some(value / rate),
-        _ => None,
-    }
+    Some(value * from_cad / to_cad)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_currency, Position};
+    use super::{convert_currency, FxRates, Position};
 
     fn position() -> Position {
         Position {
@@ -226,11 +244,16 @@ mod tests {
     }
 
     #[test]
-    fn converts_between_cad_and_usd() {
-        let usd_cad = 1.40;
-        assert_eq!(convert_currency(100.0, "USD", "CAD", Some(usd_cad)), Some(140.0));
-        assert_eq!(convert_currency(140.0, "CAD", "USD", Some(usd_cad)), Some(100.0));
-        assert_eq!(convert_currency(42.0, "CAD", "CAD", None), Some(42.0));
-        assert_eq!(convert_currency(42.0, "EUR", "CAD", Some(usd_cad)), None);
+    fn converts_through_cad_reference_rates() {
+        let rates = FxRates::from([
+            ("USD".into(), 1.40),
+            ("EUR".into(), 1.60),
+        ]);
+        assert_eq!(convert_currency(100.0, "USD", "CAD", &rates), Some(140.0));
+        assert_eq!(convert_currency(140.0, "CAD", "USD", &rates), Some(100.0));
+        assert_eq!(convert_currency(160.0, "EUR", "USD", &rates), Some(160.0 * 1.60 / 1.40));
+        assert_eq!(convert_currency(42.0, "CAD", "CAD", &rates), Some(42.0));
+        assert_eq!(convert_currency(0.0, "JPY", "CAD", &rates), Some(0.0));
+        assert_eq!(convert_currency(42.0, "JPY", "CAD", &rates), None);
     }
 }

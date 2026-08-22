@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::currency;
 use crate::market_data::{
     display_symbol, infer_currency, now_unix, DividendCalendar, DividendHistory, History,
     HistoryRange, MarketDataProvider, MarketError, Quote, SearchResult,
@@ -13,6 +14,12 @@ use crate::model::{DividendEvent, PricePoint, SplitEvent};
 
 const SEARCH_URL: &str = "https://query1.finance.yahoo.com/v1/finance/search";
 const CHART_URL: &str = "https://query2.finance.yahoo.com/v8/finance/chart";
+// Security-detail chart candles use Yahoo's web-facing chart host. Range-bar
+// percentages are intentionally fetched from the quote page itself below; the
+// v8 chart metadata is not treated as an exact proxy for Yahoo's displayed
+// 5D/1M/6M/YTD/1Y/5Y/All percentages.
+const YAHOO_WEB_CHART_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
+const YAHOO_QUOTE_PAGE_URL: &str = "https://finance.yahoo.com/quote";
 const QUOTE_URL: &str = "https://query1.finance.yahoo.com/v7/finance/quote";
 const QUOTE_SUMMARY_URL: &str = "https://query2.finance.yahoo.com/v10/finance/quoteSummary";
 const CALENDAR_URL: &str = "https://query1.finance.yahoo.com/v1/finance/visualization";
@@ -133,8 +140,6 @@ struct YahooChartMeta {
     has_pre_post_market_data: Option<bool>,
     #[serde(default, rename = "previousClose")]
     previous_close: Option<f64>,
-    #[serde(default, rename = "chartPreviousClose")]
-    chart_previous_close: Option<f64>,
     #[serde(default)]
     gmtoffset: Option<i32>,
     #[serde(default, rename = "marketState")]
@@ -203,10 +208,10 @@ struct YahooQuoteResponse {
 struct YahooQuoteCalendar {
     #[serde(default)]
     symbol: String,
+    #[serde(default)]
+    currency: Option<String>,
     #[serde(default, rename = "regularMarketPrice")]
     regular_market_price: Option<f64>,
-    #[serde(default, rename = "regularMarketChangePercent")]
-    regular_market_change_percent: Option<f64>,
     #[serde(default, rename = "regularMarketPreviousClose")]
     regular_market_previous_close: Option<f64>,
     #[serde(default, rename = "regularMarketTime")]
@@ -243,6 +248,8 @@ struct YahooDividend {
     amount: Option<f64>,
     #[serde(default)]
     date: Option<i64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +302,18 @@ fn valid_price(value: Option<f64>) -> Option<f64> {
 
 fn valid_percent(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite())
+}
+
+fn normalized_currency_code(value: Option<&str>) -> Option<String> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        currency::normalize_yahoo_currency(raw)
+            .map(|normalized| normalized.code.to_string())
+            .unwrap_or_else(|| raw.to_ascii_uppercase()),
+    )
 }
 
 fn valid_current_timestamp(value: Option<i64>, now: i64) -> Option<i64> {
@@ -389,7 +408,10 @@ fn percent_change(current: Option<f64>, anchor: Option<f64>) -> Option<f64> {
     }
 }
 
-fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, MarketError> {
+fn yahoo_bars_from_result(
+    result: &YahooChartResult,
+    price_scale: f64,
+) -> Result<Vec<YahooBar>, MarketError> {
     let timestamps = result.timestamp.clone().unwrap_or_default();
     let quote_series = result
         .indicators
@@ -402,8 +424,8 @@ fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, Ma
             "Yahoo Finance returned an unexpected price-history structure".into(),
         ));
     }
-    let closes = &quote_series[0].close;
-    if closes.len() != timestamps.len() {
+    let series = &quote_series[0];
+    if series.close.len() != timestamps.len() {
         return Err(MarketError(
             "Yahoo Finance returned mismatched price-history timestamps and values".into(),
         ));
@@ -411,14 +433,17 @@ fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, Ma
 
     let now = now_unix();
     let mut bars = Vec::<YahooBar>::with_capacity(timestamps.len());
-    for (timestamp, close) in timestamps.into_iter().zip(closes.iter().copied()) {
+    for (timestamp, close) in timestamps
+        .into_iter()
+        .zip(series.close.iter().copied())
+    {
         // A null close is normal for a timestamp where Yahoo has no trade. A
-        // present-but-invalid price or timestamp is not: fail the refresh so
-        // cached history is preserved instead of silently reshaping the chart.
+        // present-but-invalid close or timestamp is not: fail this refresh so a
+        // malformed live payload cannot silently reshape the chart.
         let Some(raw_close) = close else {
             continue;
         };
-        let close = valid_price(Some(raw_close)).ok_or_else(|| {
+        let close = valid_price(Some(raw_close * price_scale)).ok_or_else(|| {
             MarketError("Yahoo Finance returned an invalid history price".into())
         })?;
         if !valid_market_timestamp(timestamp, now) {
@@ -426,13 +451,14 @@ fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, Ma
                 "Yahoo Finance returned an invalid history timestamp".into(),
             ));
         }
+
         bars.push(YahooBar { timestamp, close });
     }
     bars.sort_by_key(|bar| bar.timestamp);
 
     let mut clean = Vec::<YahooBar>::with_capacity(bars.len());
     for bar in bars {
-        if let Some(previous) = clean.last() {
+        if let Some(previous) = clean.last_mut() {
             if previous.timestamp == bar.timestamp {
                 let tolerance = previous.close.abs().max(bar.close.abs()).max(1.0) * 1e-9;
                 if (previous.close - bar.close).abs() > tolerance {
@@ -448,13 +474,284 @@ fn yahoo_bars_from_result(result: &YahooChartResult) -> Result<Vec<YahooBar>, Ma
     Ok(clean)
 }
 
-fn canonical_range_anchor(metadata_anchor: Option<f64>) -> Option<f64> {
-    // The selected Yahoo chart request already defines the period. Its
-    // chartPreviousClose is therefore the only valid provider-level denominator
-    // for the displayed range return, including `max`. Never substitute a
-    // sampled candle: coarse weekly/monthly bars are visualization data and can
-    // begin after the true range boundary.
-    valid_price(metadata_anchor)
+/// Build the web-facing Yahoo chart request used only for the security-detail
+/// graph. The graph and the quote-page range badge are deliberately separate
+/// data products: sampled OHLC/chart metadata must not be used to infer the
+/// percentage Yahoo publishes in its Range Bar.
+fn yahoo_web_chart_url(symbol: &str, range: HistoryRange, include_extended_hours: bool) -> String {
+    let encoded = urlencoding::encode(symbol);
+    let include_pre_post = if include_extended_hours { "true" } else { "false" };
+    format!(
+        "{YAHOO_WEB_CHART_URL}/{encoded}?region=US&lang=en-US&includePrePost={include_pre_post}&interval={}&useYfid=true&range={}&events=capitalGains%7Cdiv%7Csplits&corsDomain=finance.yahoo.com&.tsrc=finance",
+        yahoo_interval(range),
+        yahoo_range(range),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct YahooQuotePageRangeBadges {
+    five_days: Option<f64>,
+    one_month: Option<f64>,
+    six_months: Option<f64>,
+    year_to_date: Option<f64>,
+    one_year: Option<f64>,
+    five_years: Option<f64>,
+    all: Option<f64>,
+}
+
+impl YahooQuotePageRangeBadges {
+    fn for_range(self, range: HistoryRange) -> Option<f64> {
+        match range {
+            HistoryRange::OneDay => None,
+            HistoryRange::FiveDays => self.five_days,
+            HistoryRange::OneMonth => self.one_month,
+            HistoryRange::SixMonths => self.six_months,
+            HistoryRange::YearToDate => self.year_to_date,
+            HistoryRange::OneYear => self.one_year,
+            HistoryRange::FiveYears => self.five_years,
+            HistoryRange::All => self.all,
+        }
+        .and_then(|value| valid_percent(Some(value)))
+    }
+
+    fn complete(self) -> bool {
+        [
+            self.five_days,
+            self.one_month,
+            self.six_months,
+            self.year_to_date,
+            self.one_year,
+            self.five_years,
+            self.all,
+        ]
+        .into_iter()
+        .all(|value| valid_percent(value).is_some())
+    }
+}
+
+fn html_entity_decode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'&' {
+            let ch = text[index..].chars().next().unwrap();
+            out.push(ch);
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let remaining = &text[index..];
+        let Some(end) = remaining.find(';').filter(|end| *end <= 16) else {
+            out.push('&');
+            index += 1;
+            continue;
+        };
+        let entity = &remaining[1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "nbsp" => Some(' '),
+            "percnt" => Some('%'),
+            "minus" => Some('−'),
+            "ndash" => Some('–'),
+            "mdash" => Some('—'),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+            }
+            _ if entity.starts_with('#') => entity[1..].parse::<u32>().ok().and_then(char::from_u32),
+            _ => None,
+        };
+        if let Some(ch) = decoded {
+            out.push(ch);
+            index += end + 1;
+        } else {
+            out.push('&');
+            index += 1;
+        }
+    }
+    out
+}
+
+fn html_fragment_visible_text(fragment: &str) -> String {
+    let lower = fragment.to_ascii_lowercase();
+    let mut text = String::with_capacity(fragment.len() / 3);
+    let mut cursor = 0usize;
+    while cursor < fragment.len() {
+        let rest = &fragment[cursor..];
+        let Some(tag_start_rel) = rest.find('<') else {
+            text.push_str(rest);
+            break;
+        };
+        let tag_start = cursor + tag_start_rel;
+        text.push_str(&fragment[cursor..tag_start]);
+
+        if lower[tag_start..].starts_with("<!--") {
+            if let Some(end_rel) = lower[tag_start + 4..].find("-->") {
+                cursor = tag_start + 4 + end_rel + 3;
+                text.push(' ');
+                continue;
+            }
+        }
+
+        let Some(tag_end_rel) = fragment[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel + 1;
+        let tag = lower[tag_start + 1..tag_end - 1].trim_start();
+        if tag.starts_with("script") || tag.starts_with("style") {
+            let close = if tag.starts_with("script") { "</script>" } else { "</style>" };
+            if let Some(close_rel) = lower[tag_end..].find(close) {
+                cursor = tag_end + close_rel + close.len();
+                text.push(' ');
+                continue;
+            }
+        }
+        cursor = tag_end;
+        text.push(' ');
+    }
+
+    let decoded = html_entity_decode(&text);
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_percent_before_first_percent(segment: &str) -> Option<f64> {
+    let percent = segment.find('%')?;
+    let prefix = &segment[..percent];
+    let mut start = prefix.len();
+    for (idx, ch) in prefix.char_indices().rev() {
+        if ch.is_ascii_digit()
+            || matches!(ch, '.' | ',' | '+' | '-' | '−' | '–' | '—')
+            || ch.is_whitespace()
+        {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+    let raw = prefix[start..]
+        .trim()
+        .replace(',', "")
+        .replace('−', "-")
+        .replace('–', "-")
+        .replace('—', "-")
+        .replace(' ', "");
+    raw.parse::<f64>().ok().and_then(|value| valid_percent(Some(value)))
+}
+
+fn parse_quote_page_range_badges_from_text(text: &str) -> Option<YahooQuotePageRangeBadges> {
+    let labels = ["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "All"];
+    let mut positions = Vec::<usize>::with_capacity(labels.len());
+    let mut cursor = 0usize;
+    for label in labels {
+        let relative = text[cursor..].find(label)?;
+        let position = cursor + relative;
+        positions.push(position);
+        cursor = position + label.len();
+    }
+
+    let segment = |index: usize| -> Option<&str> {
+        let start = positions[index] + labels[index].len();
+        let end = positions[index + 1];
+        text.get(start..end)
+    };
+    let tail_start = positions[7] + labels[7].len();
+    let tail_end = ["Key Events", "Baseline", "Mountain", "Advanced Chart", "Loading chart"]
+        .into_iter()
+        .filter_map(|marker| text[tail_start..].find(marker).map(|offset| tail_start + offset))
+        .min()
+        .unwrap_or_else(|| text.len().min(tail_start.saturating_add(256)));
+
+    let badges = YahooQuotePageRangeBadges {
+        five_days: parse_percent_before_first_percent(segment(1)?),
+        one_month: parse_percent_before_first_percent(segment(2)?),
+        six_months: parse_percent_before_first_percent(segment(3)?),
+        year_to_date: parse_percent_before_first_percent(segment(4)?),
+        one_year: parse_percent_before_first_percent(segment(5)?),
+        five_years: parse_percent_before_first_percent(segment(6)?),
+        all: parse_percent_before_first_percent(text.get(tail_start..tail_end)?),
+    };
+    badges.complete().then_some(badges)
+}
+
+fn parse_quote_page_range_badges(html: &str) -> Option<YahooQuotePageRangeBadges> {
+    // Yahoo server-renders the quote-page range bar for accessibility and search
+    // indexing. Iterate marker occurrences because the page can contain both an
+    // accessibility copy and serialized component data; only accept a complete,
+    // ordered 1D/5D/1M/6M/YTD/1Y/5Y/All range bar.
+    let lower = html.to_ascii_lowercase();
+    let marker = "chart range bar";
+    let mut search_from = 0usize;
+    while let Some(relative) = lower[search_from..].find(marker) {
+        let marker_pos = search_from + relative;
+        let content_start = lower[marker_pos..]
+            .find('>')
+            .map(|offset| marker_pos + offset + 1)
+            .unwrap_or(marker_pos + marker.len());
+        let content_end = html.len().min(content_start.saturating_add(160_000));
+        let visible = html_fragment_visible_text(&html[content_start..content_end]);
+        if let Some(badges) = parse_quote_page_range_badges_from_text(&visible) {
+            return Some(badges);
+        }
+        search_from = marker_pos + marker.len();
+    }
+    None
+}
+
+fn get_yahoo_quote_page_html(symbol: &str) -> Result<String, MarketError> {
+    let encoded = urlencoding::encode(symbol);
+    let url = format!("{YAHOO_QUOTE_PAGE_URL}/{encoded}/?p={encoded}&lang=en-US&region=US");
+    let mut response = agent()
+        .get(&url)
+        .header("Accept", "text/html,application/xhtml+xml")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .call()
+        .map_err(|error| {
+            if matches!(&error, ureq::Error::StatusCode(429)) {
+                rate_limit_error()
+            } else {
+                MarketError(format!("Yahoo Finance quote-page request failed: {error}"))
+            }
+        })?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| MarketError(format!("Could not read Yahoo Finance quote page: {error}")))?;
+    let trimmed = body.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err(MarketError("Yahoo Finance returned an empty quote page".into()));
+    }
+    if lower.contains("too many requests") || lower.contains("rate limit") {
+        return Err(rate_limit_error());
+    }
+    if lower.contains("consent.yahoo.com") && !lower.contains("chart range bar") {
+        return Err(MarketError("Yahoo Finance returned a consent page instead of quote data".into()));
+    }
+    Ok(body)
+}
+
+/// Exact quote-page range parity is intentionally treated as a separate market
+/// datum from chart OHLC. Yahoo's chart metadata (`chartPreviousClose`) is not
+/// the value displayed by the quote page for every symbol/window; sparse
+/// listings such as NTOA.MU make that divergence obvious. Read the percentage
+/// Yahoo itself server-renders in the quote-page range bar instead of guessing a
+/// denominator from candles or undocumented metadata. If Yahoo does not provide
+/// a complete range bar, fail closed rather than substitute an approximation.
+fn yahoo_quote_page_range_return(symbol: &str, range: HistoryRange) -> Result<Option<f64>, MarketError> {
+    if range == HistoryRange::OneDay {
+        return Ok(None);
+    }
+    let html = get_yahoo_quote_page_html(symbol)?;
+    let badges = parse_quote_page_range_badges(&html).ok_or_else(|| {
+        MarketError(format!(
+            "Yahoo Finance did not provide a complete quote-page range bar for {symbol}"
+        ))
+    })?;
+    Ok(badges.for_range(range))
 }
 
 fn freshest_regular_snapshot(
@@ -1073,34 +1370,63 @@ fn search_impl(query: &str) -> Result<Vec<SearchResult>, MarketError> {
             continue;
         }
 
+        let provider_symbol = quote.symbol.trim().to_string();
+        let explicit_currency = quote
+            .currency
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
         let name = quote
             .long_name
             .or(quote.short_name)
-            .unwrap_or_else(|| quote.symbol.clone());
+            .unwrap_or_else(|| provider_symbol.clone());
         let exchange = if quote.exchange.trim().is_empty() {
             quote.exchange_display.unwrap_or_else(|| "Market".into())
         } else {
             quote.exchange
         };
-        let currency = quote
-            .currency
-            .filter(|value| !value.trim().is_empty())
+        let raw_currency = explicit_currency
+            .clone()
             .unwrap_or_else(|| infer_currency(&exchange).to_string());
+        let normalized_currency = currency::normalize_yahoo_currency(&raw_currency);
+        let fallback_currency = normalized_currency
+            .map(|normalized| normalized.code.to_string())
+            .unwrap_or_else(|| raw_currency.trim().to_ascii_uppercase());
+        let price_scale = normalized_currency
+            .map(|normalized| normalized.scale)
+            .unwrap_or(1.0);
         let asset_type = quote
             .type_display
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| quote.quote_type.clone());
 
-        results.push(SearchResult {
-            code: display_symbol(&quote.symbol),
-            provider_symbol: quote.symbol,
+        let mut result = SearchResult {
+            code: display_symbol(&provider_symbol),
+            provider_symbol: provider_symbol.clone(),
             exchange,
             name,
             asset_type,
-            currency,
-            market_price: valid_price(quote.regular_market_price),
+            currency: fallback_currency,
+            market_price: valid_price(quote.regular_market_price.map(|price| price * price_scale)),
             change_percent: valid_percent(quote.regular_market_change_percent),
-        });
+        };
+
+        // Yahoo's search endpoint occasionally omits currency and can return a
+        // stale/precomputed percentage for thin regional listings. In that rare
+        // case, resolve the actual security through the quote/chart path. This
+        // keeps ordinary search fast while making symbols such as NTOA.MU use
+        // Yahoo's authoritative security metadata and price-derived day change.
+        if explicit_currency.is_none() {
+            if let Ok(fresh_quote) = quote_impl(&provider_symbol) {
+                if let Some(currency) = fresh_quote.currency {
+                    result.currency = currency;
+                }
+                result.market_price = Some(fresh_quote.close);
+                result.change_percent = fresh_quote.change_percent;
+            }
+        }
+
+        results.push(result);
     }
 
     Ok(results)
@@ -1129,68 +1455,84 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
             let mut quotes = response.quote_response.result.unwrap_or_default();
             if quotes.len() == 1 && symbol_matches(&quotes[0].symbol, symbol) {
                 let quote = quotes.remove(0);
-                if let Some((regular_close, regular_timestamp)) = valid_price(quote.regular_market_price)
-                    .zip(valid_current_timestamp(quote.regular_market_time, now))
+                let quote_currency = normalized_currency_code(quote.currency.as_deref());
+                let price_scale = quote
+                    .currency
+                    .as_deref()
+                    .and_then(currency::normalize_yahoo_currency)
+                    .map(|normalized| normalized.scale)
+                    .unwrap_or(1.0);
+                if let Some((regular_close, regular_timestamp)) = valid_price(
+                    quote.regular_market_price.map(|price| price * price_scale),
+                )
+                .zip(valid_current_timestamp(quote.regular_market_time, now))
                 {
-                    let regular_change = percent_change(
+                    // Never trust Yahoo's precomputed day percentage without a
+                    // usable denominator. Sparse/regional listings occasionally
+                    // expose a believable but stale regularMarketChangePercent.
+                    // If previous close is missing, fall through to the daily
+                    // chart path below and derive the change from actual closes.
+                    if let Some(regular_change) = percent_change(
                         Some(regular_close),
-                        quote.regular_market_previous_close,
-                    )
-                    .or_else(|| valid_percent(quote.regular_market_change_percent));
-                    let state = normalized_market_state(quote.market_state.as_deref());
-                    // Yahoo exposes an explicit capability bit for whether this
-                    // security actually has pre-/post-market data. Market state
-                    // alone is not enough: it can reflect the exchange/session
-                    // clock even for securities that do not trade extended hours.
-                    let supports_extended_hours = quote.has_pre_post_market_data == Some(true);
+                        quote.regular_market_previous_close.map(|price| price * price_scale),
+                    ) {
+                        let state = normalized_market_state(quote.market_state.as_deref());
+                        // Yahoo exposes an explicit capability bit for whether this
+                        // security actually has pre-/post-market data. Market state
+                        // alone is not enough: it can reflect the exchange/session
+                        // clock even for securities that do not trade extended hours.
+                        let supports_extended_hours = quote.has_pre_post_market_data == Some(true);
 
-                    let extended = if supports_extended_hours {
-                        match state.as_deref() {
-                            Some("PRE") => valid_price(quote.pre_market_price)
-                                .zip(valid_current_timestamp(quote.pre_market_time, now))
-                                .filter(|(_, timestamp)| *timestamp > regular_timestamp),
-                            Some("POST") => valid_price(quote.post_market_price)
-                                .zip(valid_current_timestamp(quote.post_market_time, now))
-                                .filter(|(_, timestamp)| *timestamp > regular_timestamp),
-                            _ => None,
+                        let extended = if supports_extended_hours {
+                            match state.as_deref() {
+                                Some("PRE") => valid_price(quote.pre_market_price.map(|price| price * price_scale))
+                                    .zip(valid_current_timestamp(quote.pre_market_time, now))
+                                    .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                                Some("POST") => valid_price(quote.post_market_price.map(|price| price * price_scale))
+                                    .zip(valid_current_timestamp(quote.post_market_time, now))
+                                    .filter(|(_, timestamp)| *timestamp > regular_timestamp),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some((close, timestamp)) = extended {
+                            // Derive the extended-hours move from the two prices in
+                            // this same quote response. This avoids trusting a second
+                            // percentage field whose semantics could drift.
+                            let extended_change_percent =
+                                percent_change(Some(close), Some(regular_close));
+                            return Ok(Quote {
+                                currency: quote_currency.clone(),
+                                timestamp,
+                                close,
+                                regular_timestamp,
+                                regular_close,
+                                change_percent: Some(regular_change),
+                                extended_change_percent,
+                                market_state: state,
+                            });
                         }
-                    } else {
-                        None
-                    };
 
-                    if let Some((close, timestamp)) = extended {
-                        // Derive the extended-hours move from the two prices in
-                        // this same quote response. This avoids trusting a second
-                        // percentage field whose semantics could drift.
-                        let extended_change_percent =
-                            percent_change(Some(close), Some(regular_close));
+                        // If Yahoo advertises PRE/POST without a usable extended
+                        // price+timestamp pair, never label the regular close as an
+                        // extended-hours trade.
+                        let display_state = match state.as_deref() {
+                            Some("PRE") | Some("POST") => Some("CLOSED".into()),
+                            _ => state,
+                        };
                         return Ok(Quote {
-                            timestamp,
-                            close,
+                            currency: quote_currency,
+                            timestamp: regular_timestamp,
+                            close: regular_close,
                             regular_timestamp,
                             regular_close,
-                            change_percent: regular_change,
-                            extended_change_percent,
-                            market_state: state,
+                            change_percent: Some(regular_change),
+                            extended_change_percent: None,
+                            market_state: display_state,
                         });
                     }
-
-                    // If Yahoo advertises PRE/POST without a usable extended
-                    // price+timestamp pair, never label the regular close as an
-                    // extended-hours trade.
-                    let display_state = match state.as_deref() {
-                        Some("PRE") | Some("POST") => Some("CLOSED".into()),
-                        _ => state,
-                    };
-                    return Ok(Quote {
-                        timestamp: regular_timestamp,
-                        close: regular_close,
-                        regular_timestamp,
-                        regular_close,
-                        change_percent: regular_change,
-                        extended_change_percent: None,
-                        market_state: display_state,
-                    });
                 }
             }
         }
@@ -1216,9 +1558,17 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     }
 
     let result = take_single_chart_result(envelope.chart.result, symbol)?;
-    let bars = yahoo_bars_from_result(&result)?;
+    let quote_currency = normalized_currency_code(result.meta.currency.as_deref());
+    let price_scale = result
+        .meta
+        .currency
+        .as_deref()
+        .and_then(currency::normalize_yahoo_currency)
+        .map(|normalized| normalized.scale)
+        .unwrap_or(1.0);
+    let bars = yahoo_bars_from_result(&result, price_scale)?;
 
-    let meta_snapshot = valid_price(result.meta.regular_market_price)
+    let meta_snapshot = valid_price(result.meta.regular_market_price.map(|price| price * price_scale))
         .zip(valid_current_timestamp(result.meta.regular_market_time, now));
     let bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
     let (close, timestamp) = match (meta_snapshot, bar_snapshot) {
@@ -1235,7 +1585,7 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     // `previousClose` is the semantic daily anchor. If Yahoo omits it, derive
     // the anchor from daily bars, taking care not to skip an extra session when
     // the meta snapshot is newer than the chart's final daily bar.
-    let previous_close = valid_price(result.meta.previous_close).or_else(|| {
+    let previous_close = valid_price(result.meta.previous_close.map(|price| price * price_scale)).or_else(|| {
         let last = bars.last()?;
         if same_exchange_day(timestamp, last.timestamp, result.meta.gmtoffset) {
             bars.get(bars.len().checked_sub(2)?).map(|bar| bar.close)
@@ -1247,6 +1597,7 @@ fn quote_impl(provider_symbol: &str) -> Result<Quote, MarketError> {
     let market_state = regular_only_market_state(result.meta.market_state.as_deref());
 
     Ok(Quote {
+        currency: quote_currency,
         timestamp,
         close,
         regular_timestamp: timestamp,
@@ -1385,16 +1736,27 @@ fn dividends_impl(provider_symbol: &str) -> Result<DividendHistory, MarketError>
 
     let result = take_single_chart_result(envelope.chart.result, symbol)?;
 
-    let currency = result
+    let raw_currency = result
         .meta
         .currency
         .clone()
         .filter(|value| !value.trim().is_empty());
+    let normalized_currency = raw_currency
+        .as_deref()
+        .and_then(currency::normalize_yahoo_currency);
+    let currency = normalized_currency
+        .map(|normalized| normalized.code.to_string())
+        .or_else(|| raw_currency.map(|value| value.trim().to_ascii_uppercase()));
+    let price_scale = normalized_currency.map(|normalized| normalized.scale).unwrap_or(1.0);
+    // Yahoo's chart metadata can say GBp/ZAc while dividend events are often
+    // already reported in GBP/ZAR. Keep a normalized price series only for the
+    // rare ambiguous event where Yahoo omits the dividend currency.
+    let normalized_bars = yahoo_bars_from_result(&result, price_scale).unwrap_or_default();
     let mut dividends = Vec::new();
     let mut splits = Vec::new();
     if let Some(events) = result.events {
         for dividend in events.dividends.into_values() {
-            let amount = valid_price(dividend.amount).ok_or_else(|| {
+            let raw_amount = valid_price(dividend.amount).ok_or_else(|| {
                 MarketError(format!(
                     "Yahoo Finance returned a malformed dividend amount for {symbol}"
                 ))
@@ -1404,11 +1766,48 @@ fn dividends_impl(provider_symbol: &str) -> Result<DividendHistory, MarketError>
                     "Yahoo Finance returned a malformed dividend date for {symbol}"
                 ))
             })?;
+
+            let event_currency = dividend
+                .currency
+                .as_deref()
+                .filter(|value| !value.trim().is_empty());
+            let event_normalized = event_currency.and_then(currency::normalize_yahoo_currency);
+            let (amount, dividend_currency) = if let Some(normalized) = event_normalized {
+                (raw_amount * normalized.scale, normalized.code.to_string())
+            } else if let Some(event_currency) = event_currency {
+                (raw_amount, event_currency.trim().to_ascii_uppercase())
+            } else {
+                // For GBp/ZAc metadata, Yahoo commonly returns dividend amounts
+                // in the major currency already. Mirror yfinance's conservative
+                // repair rule: only treat an unlabelled dividend as sub-units
+                // when leaving it unscaled would imply a >100% distribution.
+                let prior_close = normalized_bars
+                    .iter()
+                    .rev()
+                    .find(|bar| bar.timestamp <= timestamp)
+                    .map(|bar| bar.close);
+                let amount = if price_scale < 1.0
+                    && prior_close
+                        .filter(|close| *close > 0.0)
+                        .map(|close| raw_amount / close > 1.0)
+                        .unwrap_or(false)
+                {
+                    raw_amount * price_scale
+                } else {
+                    raw_amount
+                };
+                (amount, currency.clone().unwrap_or_default())
+            };
+            let amount = valid_price(Some(amount)).ok_or_else(|| {
+                MarketError(format!(
+                    "Yahoo Finance returned a malformed dividend amount for {symbol}"
+                ))
+            })?;
             dividends.push(DividendEvent {
                 provider_symbol: symbol.to_ascii_uppercase(),
                 timestamp,
                 amount,
-                currency: currency.clone().unwrap_or_default(),
+                currency: dividend_currency,
             });
         }
 
@@ -1543,13 +1942,7 @@ fn history_window_mode_impl(
         return Err(MarketError("This holding has no Yahoo Finance symbol".into()));
     }
 
-    let encoded = urlencoding::encode(symbol);
-    let include_pre_post = if include_extended_hours { "true" } else { "false" };
-    let url = format!(
-        "{CHART_URL}/{encoded}?range={}&interval={}&includePrePost={include_pre_post}&events=div%2Csplits%2CcapitalGains",
-        yahoo_range(range),
-        yahoo_interval(range)
-    );
+    let url = yahoo_web_chart_url(symbol, range, include_extended_hours);
     history_from_url(symbol, &url, Some(range), include_extended_hours)
 }
 
@@ -1607,7 +2000,13 @@ fn history_from_url(
         }
     }
 
-    let bars = yahoo_bars_from_result(&result)?;
+    let normalized_currency = result
+        .meta
+        .currency
+        .as_deref()
+        .and_then(currency::normalize_yahoo_currency);
+    let price_scale = normalized_currency.map(|normalized| normalized.scale).unwrap_or(1.0);
+    let bars = yahoo_bars_from_result(&result, price_scale)?;
     if bars.is_empty() {
         return Err(MarketError(format!(
             "Yahoo Finance returned no usable price history for {symbol}"
@@ -1623,7 +2022,7 @@ fn history_from_url(
         .collect::<Vec<_>>();
 
     let now = now_unix();
-    let meta_snapshot = valid_price(result.meta.regular_market_price)
+    let meta_snapshot = valid_price(result.meta.regular_market_price.map(|price| price * price_scale))
         .zip(valid_current_timestamp(result.meta.regular_market_time, now));
     let latest_bar_snapshot = bars.last().map(|bar| (bar.close, bar.timestamp));
 
@@ -1676,24 +2075,31 @@ fn history_from_url(
             regular_current_price,
         );
 
-    // Keep the rolling-period boundary atomic with this exact Yahoo chart
-    // response. The UI never derives a range return from sampled candles.
-    let range_anchor = range.and_then(|_| canonical_range_anchor(result.meta.chart_previous_close));
-    let range_return_percent = percent_change(regular_current_price, range_anchor)
-        .and_then(|value| valid_percent(Some(value)));
-
     let day_change_percent = match range {
         Some(_) => quote_snapshot
             .as_ref()
             .and_then(|quote| valid_percent(quote.change_percent))
             .or_else(|| {
                 percent_change(
-                    valid_price(result.meta.regular_market_price)
+                    valid_price(result.meta.regular_market_price.map(|price| price * price_scale))
                         .or(regular_current_price),
-                    result.meta.previous_close,
+                    result.meta.previous_close.map(|price| price * price_scale),
                 )
             })
             .and_then(|value| valid_percent(Some(value))),
+        None => None,
+    };
+
+    // Yahoo's visible quote-page range badges are a separate presentation datum
+    // from v8 chart metadata. In particular, `chartPreviousClose` can disagree
+    // with the actual 5D/1M/etc. badge for sparse and boundary-sensitive symbols.
+    // Use Yahoo's server-rendered range bar as the source of truth and fail
+    // closed if it is unavailable; never fall back to a guessed denominator.
+    let range_return_percent = match range {
+        Some(HistoryRange::OneDay) => day_change_percent,
+        Some(named_range) => yahoo_quote_page_range_return(symbol, named_range)
+            .ok()
+            .flatten(),
         None => None,
     };
 
@@ -1718,10 +2124,15 @@ fn history_from_url(
 
     Ok(History {
         points,
-        currency: result
-            .meta
-            .currency
-            .filter(|value| !value.trim().is_empty()),
+        currency: normalized_currency
+            .map(|normalized| normalized.code.to_string())
+            .or_else(|| {
+                result
+                    .meta
+                    .currency
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| value.trim().to_ascii_uppercase())
+            }),
         current_price,
         quote_timestamp,
         market_state: display_market_state,
@@ -1827,16 +2238,118 @@ mod tests {
     }
 
     #[test]
-    fn every_range_uses_only_same_response_metadata_anchor() {
-        assert_eq!(canonical_range_anchor(Some(99.5)), Some(99.5));
-        assert_eq!(canonical_range_anchor(None), None);
-        assert_eq!(canonical_range_anchor(Some(0.0)), None);
-        assert_eq!(canonical_range_anchor(Some(f64::NAN)), None);
+    fn yahoo_web_chart_request_is_graph_only_and_keeps_named_window_mapping() {
+        let url = yahoo_web_chart_url("NTOA.MU", HistoryRange::OneMonth, false);
+        assert!(url.starts_with("https://query1.finance.yahoo.com/v8/finance/chart/NTOA.MU?"));
+        assert!(url.contains("region=US"));
+        assert!(url.contains("lang=en-US"));
+        assert!(url.contains("includePrePost=false"));
+        assert!(url.contains("interval=1d"));
+        assert!(url.contains("useYfid=true"));
+        assert!(url.contains("range=1mo"));
+        assert!(url.contains("corsDomain=finance.yahoo.com"));
+        assert!(url.contains(".tsrc=finance"));
+    }
+
+    #[test]
+    fn quote_page_range_bar_parses_exact_published_percentages() {
+        let html = r#"
+            <main>
+              <div aria-label="Chart Range Bar">
+                <button>1D</button>
+                <button>5D</button><h3>-3.33%</h3>
+                <button>1M</button><h3>19.59%</h3>
+                <button>6M</button><h3>12.34%</h3>
+                <button>YTD</button><h3>20.16%</h3>
+                <button>1Y</button><h3>51.79%</h3>
+                <button>5Y</button><h3>120.12%</h3>
+                <button>All</button><h3>4,122.35%</h3>
+                <span>Baseline</span>
+              </div>
+            </main>
+        "#;
+        let badges = parse_quote_page_range_badges(html).expect("complete Yahoo Range Bar");
+        assert_eq!(badges.for_range(HistoryRange::FiveDays), Some(-3.33));
+        assert_eq!(badges.for_range(HistoryRange::OneMonth), Some(19.59));
+        assert_eq!(badges.for_range(HistoryRange::SixMonths), Some(12.34));
+        assert_eq!(badges.for_range(HistoryRange::YearToDate), Some(20.16));
+        assert_eq!(badges.for_range(HistoryRange::OneYear), Some(51.79));
+        assert_eq!(badges.for_range(HistoryRange::FiveYears), Some(120.12));
+        assert_eq!(badges.for_range(HistoryRange::All), Some(4_122.35));
+        assert_eq!(badges.for_range(HistoryRange::OneDay), None);
+    }
+
+    #[test]
+    fn quote_page_range_bar_handles_yahoo_html_fragmentation_and_entities() {
+        let html = r#"
+            <section aria-label="Chart Range Bar">
+              <span>1D</span>
+              <span>5D</span><h3>&minus;3.33<!-- -->%</h3>
+              <span>1M</span><h3>19.59<!-- -->%</h3>
+              <span>6M</span><h3>12.34%</h3>
+              <span>YTD</span><h3>20.16%</h3>
+              <span>1Y</span><h3>51.79%</h3>
+              <span>5Y</span><h3>120.12%</h3>
+              <span>All</span><h3>4,122.35<!-- -->%</h3>
+              <button>Advanced Chart</button>
+            </section>
+        "#;
+        let badges = parse_quote_page_range_badges(html).expect("fragmented Yahoo Range Bar");
+        assert_eq!(badges.for_range(HistoryRange::FiveDays), Some(-3.33));
+        assert_eq!(badges.for_range(HistoryRange::All), Some(4_122.35));
+    }
+
+    #[test]
+    fn quote_page_range_bar_skips_non_bar_marker_and_finds_complete_bar() {
+        let html = r#"
+            <script>window.__data = "Chart Range Bar 1D 5D 1M";</script>
+            <div aria-label="Chart Range Bar">
+              <button>1D</button>
+              <button>5D</button><h3>-6.10%</h3>
+              <button>1M</button><h3>-5.16%</h3>
+              <button>6M</button><h3>22.64%</h3>
+              <button>YTD</button><h3>20.16%</h3>
+              <button>1Y</button><h3>51.79%</h3>
+              <button>5Y</button><h3>120.12%</h3>
+              <button>All</button><h3>4,122.35%</h3>
+              <span>Loading chart</span>
+            </div>
+        "#;
+        let badges = parse_quote_page_range_badges(html).expect("second marker has complete Range Bar");
+        assert_eq!(badges.for_range(HistoryRange::FiveDays), Some(-6.10));
+        assert_eq!(badges.for_range(HistoryRange::OneMonth), Some(-5.16));
+        assert_eq!(badges.for_range(HistoryRange::YearToDate), Some(20.16));
+        assert_eq!(badges.for_range(HistoryRange::All), Some(4_122.35));
+    }
+
+    #[test]
+    fn quote_page_range_bar_rejects_incomplete_data_instead_of_guessing() {
+        let html = r#"
+            <div aria-label="Chart Range Bar">
+              <button>1D</button>
+              <button>5D</button><h3>-3.33%</h3>
+              <button>1M</button><h3>19.59%</h3>
+              <button>6M</button><h3>12.34%</h3>
+              <button>YTD</button><h3>20.16%</h3>
+              <button>1Y</button><h3>51.79%</h3>
+              <button>5Y</button><h3>120.12%</h3>
+              <button>All</button>
+              <span>Baseline</span>
+            </div>
+        "#;
+        assert!(parse_quote_page_range_badges(html).is_none());
+    }
+
+    #[test]
+    fn quote_page_percent_parser_accepts_unicode_minus_and_grouped_values() {
+        assert_eq!(parse_percent_before_first_percent(" −3.33 %"), Some(-3.33));
+        assert_eq!(parse_percent_before_first_percent(" 4,122.35 %"), Some(4_122.35));
     }
 
     #[test]
     fn newer_regular_snapshot_wins_and_quote_wins_ties() {
         let quote = Quote {
+            currency: Some("USD".into()),
             timestamp: 200,
             close: 105.0,
             regular_timestamp: 200,
@@ -1862,6 +2375,7 @@ mod tests {
     #[test]
     fn extended_price_does_not_replace_regular_range_numerator() {
         let quote = Quote {
+            currency: Some("USD".into()),
             timestamp: 250,
             close: 107.0,
             regular_timestamp: 200,
@@ -1923,6 +2437,7 @@ mod tests {
     #[test]
     fn untimestamped_or_invalid_snapshots_never_gain_fake_freshness() {
         let quote = Quote {
+            currency: Some("USD".into()),
             timestamp: 0,
             close: 110.0,
             regular_timestamp: 0,
@@ -1982,7 +2497,7 @@ mod tests {
             }),
             events: None,
         };
-        assert!(yahoo_bars_from_result(&result).is_err());
+        assert!(yahoo_bars_from_result(&result, 1.0).is_err());
     }
 
     #[test]
@@ -1997,7 +2512,7 @@ mod tests {
             }),
             events: None,
         };
-        assert!(yahoo_bars_from_result(&result).is_err());
+        assert!(yahoo_bars_from_result(&result, 1.0).is_err());
     }
 
     #[test]
@@ -2113,15 +2628,4 @@ mod tests {
         assert!(parse_upcoming_split_calendar(&payload, "TEST", 1_700_000_000, 2_000_000_000).is_err());
     }
 
-    #[test]
-    fn range_anchor_is_allowed_to_differ_for_each_range() {
-        let current = Some(125.0);
-        let anchors = [120.0, 110.0, 100.0, 80.0];
-        let returns = anchors
-            .into_iter()
-            .map(|anchor| percent_change(current, Some(anchor)).unwrap())
-            .collect::<Vec<_>>();
-
-        assert!(returns.windows(2).all(|pair| pair[0] != pair[1]));
-    }
 }
