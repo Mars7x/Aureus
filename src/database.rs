@@ -1255,20 +1255,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn positions_needing_refresh(&self, max_age_seconds: i64) -> Result<Vec<Position>> {
-        let now = unix_timestamp();
-        Ok(self
-            .load_positions()?
-            .into_iter()
-            .filter(|position| {
-                position
-                    .quote_updated_at
-                    .map(|updated| now.saturating_sub(updated) >= max_age_seconds)
-                    .unwrap_or(true)
-            })
-            .collect())
-    }
-
     pub fn load_transactions(&self) -> Result<Vec<Transaction>> {
         let mut statement = self.connection.prepare(
             "SELECT t.id, t.account_id, a.name, t.code, t.exchange, t.provider_symbol, t.name,\n\
@@ -2304,19 +2290,6 @@ impl Database {
             params![item_id, currency],
         )?;
         Ok(())
-    }
-
-    pub fn watchlist_needing_refresh(&self, max_age_seconds: i64) -> Result<Vec<WatchlistItem>> {
-        let now = unix_timestamp();
-        Ok(self
-            .load_watchlist()?
-            .into_iter()
-            .filter(|item| {
-                item.quote_updated_at
-                    .map(|updated| now.saturating_sub(updated) >= max_age_seconds)
-                    .unwrap_or(true)
-            })
-            .collect())
     }
 
     pub fn fx_rate(&self, pair: &str) -> Result<Option<FxRate>> {

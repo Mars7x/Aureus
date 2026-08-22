@@ -156,25 +156,8 @@ impl Position {
         &self.provider_symbol
     }
 
-    pub fn cost_basis(&self) -> f64 {
-        self.shares * self.average_cost
-    }
-
     pub fn market_value(&self) -> Option<f64> {
         self.last_price.map(|price| self.shares * price)
-    }
-
-    pub fn total_gain(&self) -> Option<f64> {
-        self.market_value().map(|value| value - self.cost_basis())
-    }
-
-    pub fn total_return_percent(&self) -> Option<f64> {
-        let basis = self.cost_basis();
-        if basis.abs() < f64::EPSILON {
-            Some(0.0)
-        } else {
-            self.total_gain().map(|gain| gain / basis * 100.0)
-        }
     }
 }
 
@@ -235,12 +218,9 @@ mod tests {
     }
 
     #[test]
-    fn calculates_position_totals_from_average_cost() {
+    fn calculates_position_market_value() {
         let position = position();
-        assert_eq!(position.cost_basis(), 200.0);
         assert_eq!(position.market_value(), Some(250.0));
-        assert_eq!(position.total_gain(), Some(50.0));
-        assert_eq!(position.total_return_percent(), Some(25.0));
     }
 
     #[test]
