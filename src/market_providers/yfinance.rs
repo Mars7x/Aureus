@@ -504,6 +504,7 @@ struct YahooQuotePageRangeBadges {
 struct CachedYahooQuotePageRangeBadges {
     badges: YahooQuotePageRangeBadges,
     fetched_at: i64,
+    regular_price: Option<f64>,
 }
 
 impl YahooQuotePageRangeBadges {
@@ -789,6 +790,7 @@ fn yahoo_quote_page_range_badges(
             CachedYahooQuotePageRangeBadges {
                 badges,
                 fetched_at: now,
+                regular_price: None,
             },
         );
     }
@@ -802,12 +804,84 @@ fn yahoo_quote_page_range_badges(
 /// Yahoo itself server-renders in the quote-page range bar instead of guessing a
 /// denominator from candles or undocumented metadata. If Yahoo does not provide
 /// a complete range bar, fail closed rather than substitute an approximation.
-fn yahoo_quote_page_range_return(symbol: &str, range: HistoryRange) -> Result<Option<f64>, MarketError> {
-    if range == HistoryRange::OneDay {
-        return Ok(None);
+fn range_badges_still_match_quote(
+    badges: YahooQuotePageRangeBadges,
+    cached_regular_price: f64,
+    current_regular_price: f64,
+) -> bool {
+    let Some(cached_regular_price) = valid_price(Some(cached_regular_price)) else {
+        return false;
+    };
+    let Some(current_regular_price) = valid_price(Some(current_regular_price)) else {
+        return false;
+    };
+
+    // Yahoo displays these badges to two decimal places. Reuse the cached page
+    // only while moving from the quote price captured alongside that page to the
+    // newest live quote would leave every displayed badge unchanged. This uses
+    // the cached percentage only as a cache-coherency check; Aureus still shows
+    // Yahoo's published value and never substitutes a reconstructed percentage.
+    let price_ratio = current_regular_price / cached_regular_price;
+    [
+        badges.five_days,
+        badges.one_month,
+        badges.six_months,
+        badges.year_to_date,
+        badges.one_year,
+        badges.five_years,
+        badges.all,
+    ]
+    .into_iter()
+    .flatten()
+    .all(|cached_percent| {
+        let implied_percent = price_ratio * (100.0 + cached_percent) - 100.0;
+        implied_percent.is_finite()
+            && (cached_percent * 100.0).round() == (implied_percent * 100.0).round()
+    })
+}
+
+fn range_badges_for_live_quote(
+    symbol: &str,
+    badges: YahooQuotePageRangeBadges,
+    regular_price: Option<f64>,
+) -> Result<YahooQuotePageRangeBadges, MarketError> {
+    let Some(current_regular_price) = valid_price(regular_price) else {
+        return Ok(badges);
+    };
+    let key = symbol.trim().to_ascii_uppercase();
+
+    let needs_refresh = if let Ok(mut cache) = range_badge_cache().lock() {
+        if let Some(cached) = cache.get_mut(&key) {
+            match cached.regular_price {
+                Some(cached_regular_price) => !range_badges_still_match_quote(
+                    cached.badges,
+                    cached_regular_price,
+                    current_regular_price,
+                ),
+                None => {
+                    cached.regular_price = Some(current_regular_price);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !needs_refresh {
+        return Ok(badges);
     }
-    let badges = yahoo_quote_page_range_badges(symbol)?;
-    Ok(badges.for_range(range))
+
+    invalidate_security_detail_snapshot(symbol);
+    let fresh = yahoo_quote_page_range_badges(symbol)?;
+    if let Ok(mut cache) = range_badge_cache().lock() {
+        if let Some(cached) = cache.get_mut(&key) {
+            cached.regular_price = Some(current_regular_price);
+        }
+    }
+    Ok(fresh)
 }
 
 fn freshest_regular_snapshot(
@@ -2172,16 +2246,22 @@ fn history_from_url(
     // closed if it is unavailable; never fall back to a guessed denominator.
     let range_return_percent = match range {
         Some(HistoryRange::OneDay) => day_change_percent,
-        Some(named_range) => match range_badges_worker {
-            Some(worker) => worker
-                .join()
-                .ok()
-                .and_then(Result::ok)
-                .and_then(|badges| badges.for_range(named_range)),
-            None => yahoo_quote_page_range_return(symbol, named_range)
-                .ok()
-                .flatten(),
-        },
+        Some(named_range) => {
+            let badges = match range_badges_worker {
+                Some(worker) => worker.join().ok().and_then(Result::ok),
+                None => yahoo_quote_page_range_badges(symbol).ok(),
+            };
+            badges
+                .and_then(|badges| {
+                    range_badges_for_live_quote(
+                        symbol,
+                        badges,
+                        quote_snapshot.as_ref().map(|quote| quote.regular_close),
+                    )
+                    .ok()
+                })
+                .and_then(|badges| badges.for_range(named_range))
+        }
         None => None,
     };
 
@@ -2420,6 +2500,36 @@ mod tests {
             </div>
         "#;
         assert!(parse_quote_page_range_badges(html).is_none());
+    }
+
+    #[test]
+    fn cached_range_badges_can_survive_price_moves_that_do_not_change_displayed_values() {
+        let badges = YahooQuotePageRangeBadges {
+            five_days: Some(1.23),
+            one_month: Some(2.34),
+            six_months: Some(3.45),
+            year_to_date: Some(4.56),
+            one_year: Some(5.67),
+            five_years: Some(6.78),
+            all: Some(7.89),
+        };
+
+        assert!(range_badges_still_match_quote(badges, 100.0, 100.0001));
+    }
+
+    #[test]
+    fn cached_range_badges_refresh_when_live_price_changes_displayed_percentage() {
+        let badges = YahooQuotePageRangeBadges {
+            five_days: Some(-3.33),
+            one_month: Some(19.59),
+            six_months: Some(24.10),
+            year_to_date: Some(20.16),
+            one_year: Some(30.25),
+            five_years: Some(105.50),
+            all: Some(4_122.35),
+        };
+
+        assert!(!range_badges_still_match_quote(badges, 282.37, 282.38));
     }
 
     #[test]
