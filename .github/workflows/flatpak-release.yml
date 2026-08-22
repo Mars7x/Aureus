@@ -33,7 +33,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
 
     steps:
@@ -48,7 +48,7 @@ jobs:
           bundle: Aureus-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.flatpak
           manifest-path: flatpak/io.github.Mars7x.Aureus.yml
           arch: ${{ matrix.arch }}
-          cache-key: flatpak-builder-${{ github.sha }}
+          cache-key: flatpak-builder-${{ matrix.arch }}-${{ github.sha }}
           artifact-name: Aureus-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.flatpak
 
   upload:
