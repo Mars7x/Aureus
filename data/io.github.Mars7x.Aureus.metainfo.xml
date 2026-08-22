@@ -2,51 +2,104 @@
 <component type="desktop-application">
   <id>io.github.Mars7x.Aureus</id>
   <name>Aureus</name>
-  <summary>A native stock portfolio tracker</summary>
+  <summary>A clean portfolio tracker that just works</summary>
+
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
+
   <developer id="io.github.Mars7x">
     <name>Mars7x</name>
   </developer>
+
   <description>
-    <p>Aureus is a GTK4 and libadwaita portfolio tracker with activity-based holdings, account cash, dividends, portfolio history, stock search, a watchlist, reports, backups, and an adaptive interface.</p>
+    <p>
+      Aureus is a native GTK4 and libadwaita portfolio tracker for Linux. Track
+      multiple investment accounts, holdings, trades, cash activity, dividends,
+      portfolio performance, and watchlists in an adaptive interface.
+    </p>
+    <p>
+      Aureus supports 25 account and portfolio currencies, historical
+      exchange-rate-aware performance, stock search, PDF reports, and local
+      portfolio backups. Market data is provided by Yahoo Finance, with Bank of
+      Canada data used for supported exchange-rate history and reference rates.
+    </p>
   </description>
+
   <url type="homepage">https://github.com/Mars7x/Aureus</url>
   <url type="bugtracker">https://github.com/Mars7x/Aureus/issues</url>
+  <url type="vcs-browser">https://github.com/Mars7x/Aureus</url>
+
+  <keywords>
+    <keyword>portfolio</keyword>
+    <keyword>stocks</keyword>
+    <keyword>investments</keyword>
+    <keyword>dividends</keyword>
+    <keyword>finance</keyword>
+  </keywords>
+
   <launchable type="desktop-id">io.github.Mars7x.Aureus.desktop</launchable>
   <provides>
     <binary>aureus</binary>
   </provides>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://github.com/user-attachments/assets/d379c477-b03b-45ce-8f4e-5a998c46fb94</image>
+      <caption>Portfolio overview</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://github.com/user-attachments/assets/fdbaa30b-0146-4844-ad06-1a1acb247ec7</image>
+      <caption>Portfolio activity and analysis</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://github.com/user-attachments/assets/bb636df6-bd4c-4cb0-b43f-6d4733b732f3</image>
+      <caption>Adaptive portfolio view</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://github.com/user-attachments/assets/c7f1e319-8c32-4b7c-94d7-4a4fa17c917e</image>
+      <caption>Adaptive stock view</caption>
+    </screenshot>
+  </screenshots>
+
   <content_rating type="oars-1.1" />
+
   <releases>
-    <release version="1.1.2" date="2026-08-21">
+    <release type="stable" version="1.2.0" date="2026-08-22">
       <description>
-        <p>Expands Aureus to 25 supported account and portfolio currencies with a user-selectable Portfolio Currency, Yahoo Finance current exchange rates, Bank of Canada historical and reference rates, cross-currency portfolio valuation, historical FX-aware performance and reports, normalized Yahoo quote sub-units, and safer account-currency handling. Also improves portfolio range accuracy, strengthens Aureus theme enforcement, and refines toast styling.</p>
+        <p>Aureus 1.2.0 adds full multi-currency portfolio support and major market-data accuracy improvements.</p>
+        <ul>
+          <li>Support 25 account and portfolio currencies with a configurable Portfolio Currency.</li>
+          <li>Use historical exchange rates for portfolio performance, dividends, and reports.</li>
+          <li>Preserve native account, transaction, settlement, and fee currencies for cross-currency activity.</li>
+          <li>Match Yahoo Finance range performance for 5D, 1M, 6M, YTD, 1Y, 5Y, and All.</li>
+          <li>Keep persisted quotes as last-known fallback values while requesting live prices during normal use.</li>
+          <li>Improve portfolio range stability, refresh behavior, theme enforcement, and toast presentation.</li>
+        </ul>
       </description>
     </release>
-    <release version="1.1.1" date="2026-08-11">
+    <release type="stable" version="1.1.1" date="2026-08-11">
       <description>
-        <p>Polishes Aureus dialogs and adaptive layouts, standardizes bottom action forms, fixes narrow-window scaling on Overview and stock pages, and remembers the selected Overview chart range between launches.</p>
+        <p>Polishes dialogs and adaptive layouts, standardizes bottom action forms, fixes narrow-window scaling, and remembers the selected Overview chart range between launches.</p>
       </description>
     </release>
-    <release version="1.1.0" date="2026-08-11">
+    <release type="stable" version="1.1.0" date="2026-08-11">
       <description>
-        <p>Adds exchange-aware pre-market and after-hours pricing with eligible extended-hours data on 1D stock charts, improves Yahoo Finance accuracy and resilience across quote and history ranges, and keeps chart colors aligned with canonical returns. Adds upcoming forward and reverse stock splits, automatic split-aware share accounting, restored-portfolio corporate-action reconciliation, payment-date dividend cash credits with a per-account opt-out, and further Allocation interaction and rendering refinements.</p>
+        <p>Adds session-aware market pricing, extended-hours 1D charts, automatic stock-split handling, dividend cash credits, improved Yahoo Finance resilience, and Allocation refinements.</p>
       </description>
     </release>
-    <release version="1.0.2" date="2026-08-10">
+    <release type="stable" version="1.0.2" date="2026-08-10">
       <description>
-        <p>Refines pull-to-refresh and Allocation rendering, redesigns Dividends with a current-year Annual view and ownership-aware history, removes the detached dollar-stem artifact from the dividend headline, gives populated Recent Distributions a reliable Adwaita boxed-list surface, aligns Edit Account with Aureus's shared bottom-pill form actions, allows accounts with holdings or activity to be removed after an explicit destructive-data warning, uses gain/loss colors for Watchlist sparklines, and refines Allocation with a lighter ring, a cleaner breakdown, exact 100.0% displayed rounding, synchronized row/slice hover and selection, keyboard-accessible allocation rows, and an empty center until a stock is focused. Upcoming cards are now keyboard focusable. Updates the About tagline to “A clean portfolio tracker that just works”.</p>
+        <p>Improves Dividends, Allocation, pull-to-refresh, account removal, Watchlist sparklines, adaptive dialogs, and general interface polish.</p>
       </description>
     </release>
-    <release version="1.0.1" date="2026-08-10">
+    <release type="stable" version="1.0.1" date="2026-08-10">
       <description>
         <p>Fixes same-day 1D portfolio return calculations and adds Bank of Canada attribution for exchange-rate data.</p>
       </description>
     </release>
-    <release version="1.0.0" date="2026-08-10">
+    <release type="stable" version="1.0.0" date="2026-08-10">
       <description>
-        <p>Initial Aureus 1.0 release with portfolio tracking, account cash and transfers, dividends, interactive history charts, reporting, backups, and adaptive GTK4/libadwaita navigation.</p>
+        <p>Initial release with portfolio tracking, accounts, cash activity, dividends, interactive history charts, reporting, backups, stock search, and watchlists.</p>
       </description>
     </release>
   </releases>
