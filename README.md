@@ -35,7 +35,7 @@ Alternatively, use [Builder](https://apps.gnome.org/Builder/)
 ## Built with
 - GTK4 and libadwaita for UI
 - Yahoo Finance for market data
-- Bank of Canada for CAD/USD exchange rates
+- Bank of Canada for currency exchange rates
 - SQLite for local portfolio storage
 - GPT 5.6 Sol for logic
 - Used [Planify](https://flathub.org/apps/io.github.alainm23.planify) colour scheme for libadwaita colours
