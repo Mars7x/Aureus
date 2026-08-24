@@ -1057,9 +1057,6 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
     database
         .sync_positions_from_activity()
         .map_err(|error| format!("Could not synchronize portfolio positions: {error}"))?;
-    database
-        .sync_paid_dividends_to_cash()
-        .map_err(|error| format!("Could not synchronize dividend cash: {error}"))?;
     let initial_portfolio_history_range = database
         .setting(PORTFOLIO_HISTORY_RANGE_KEY)
         .ok()
@@ -2010,12 +2007,6 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
                 )));
                 return glib::ControlFlow::Continue;
             }
-            if let Err(error) = refs.state.database.sync_paid_dividends_to_cash() {
-                refs.toast_overlay.add_toast(Toast::new(&format!(
-                    "Could not synchronize dividend cash: {error}"
-                )));
-                return glib::ControlFlow::Continue;
-            }
             refs.refresh();
             glib::ControlFlow::Continue
         });
@@ -2037,17 +2028,11 @@ fn build_setup_page(
     currency.set_model(Some(&currency_model));
     currency.set_selected(u32::MAX);
 
-    let dividend_cash = SwitchRow::new();
-    dividend_cash.set_title("Add Dividends to Cash");
-    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
-    dividend_cash.set_active(true);
-
     let account_group = PreferencesGroup::builder()
         .title("First Account")
         .build();
     account_group.add(&name);
     account_group.add(&currency);
-    account_group.add(&dividend_cash);
 
     let create = Button::builder()
         .label("Create Account")
@@ -2138,7 +2123,6 @@ fn build_setup_page(
         let root_stack = root_stack.clone();
         let name = name.clone();
         let currency = currency.clone();
-        let dividend_cash = dividend_cash.clone();
         let create_for_callback = create.clone();
         create.connect_clicked(move |_| {
             let account_name = name.text().trim().to_string();
@@ -2153,19 +2137,6 @@ fn build_setup_page(
 
             match refs.state.database.add_account(&account) {
                 Ok(account_id) => {
-                    if !dividend_cash.is_active() {
-                        if let Err(error) = refs
-                            .state
-                            .database
-                            .set_dividend_cash_enabled(account_id, false)
-                        {
-                            let _ = refs.state.database.delete_account(account_id);
-                            refs.toast_overlay.add_toast(Toast::new(&format!(
-                                "Could not save dividend cash setting: {error}"
-                            )));
-                            return;
-                        }
-                    }
                     let _ = refs
                         .state
                         .database
@@ -5310,7 +5281,6 @@ fn install_window_actions(
             dialog.connect_response(Some("remove"), move |_, _| {
                 match database.delete_activity_for_holding(account_id, &provider_symbol) {
                     Ok(changed) if changed > 0 => {
-                        let _ = refs.state.database.sync_paid_dividends_to_cash();
                         refs.refresh();
                         refresh_portfolio_history_async(refs.clone(), false);
                         refs.toast_overlay
@@ -7348,10 +7318,6 @@ fn reconcile_restored_portfolio_async(refs: UiRefs, announce: bool) {
         if refs.state.database.sync_positions_from_activity().is_err() {
             failed = true;
         }
-        if refs.state.database.sync_paid_dividends_to_cash().is_err() {
-            failed = true;
-        }
-
         if !failed {
             if refs
                 .state
@@ -9216,7 +9182,6 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
                     .database
                     .set_dividends_fetched(&detail.provider_symbol);
                 let _ = detail.app.state.database.sync_positions_from_activity();
-                let _ = detail.app.state.database.sync_paid_dividends_to_cash();
                 refresh_with_loaded_crossfade(detail.app.clone());
                 update_position_dividend_widgets(&detail, &history.events, true);
                 crossfade_loaded_label(
@@ -9766,15 +9731,9 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     currency.set_model(Some(&currency_model));
     currency.set_selected(currency_index_or_default(&base_currency(&refs.state)));
 
-    let dividend_cash = SwitchRow::new();
-    dividend_cash.set_title("Add Dividends to Cash");
-    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
-    dividend_cash.set_active(true);
-
     let group = PreferencesGroup::new();
     group.add(&name);
     group.add(&currency);
-    group.add(&dividend_cash);
 
     let body = dialog_body();
     body.append(&group);
@@ -9820,7 +9779,6 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
         let refs = refs.clone();
         let name = name.clone();
         let currency = currency.clone();
-        let dividend_cash = dividend_cash.clone();
         add.connect_clicked(move |_| {
             let account_name = name.text().trim().to_string();
             if account_name.is_empty() {
@@ -9837,19 +9795,6 @@ fn present_add_account_dialog(parent: &ApplicationWindow, refs: UiRefs) {
             };
             match refs.state.database.add_account(&account) {
                 Ok(account_id) => {
-                    if !dividend_cash.is_active() {
-                        if let Err(error) = refs
-                            .state
-                            .database
-                            .set_dividend_cash_enabled(account_id, false)
-                        {
-                            let _ = refs.state.database.delete_account(account_id);
-                            refs.toast_overlay.add_toast(Toast::new(&format!(
-                                "Could not save dividend cash setting: {error}"
-                            )));
-                            return;
-                        }
-                    }
                     let _ = refs
                         .state
                         .database
@@ -10399,20 +10344,9 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
         currency.set_subtitle("Currency is fixed after cash or activity is recorded");
     }
 
-    let dividend_cash = SwitchRow::new();
-    dividend_cash.set_title("Add Dividends to Cash");
-    dividend_cash.set_subtitle("Automatically credit dividend payments to this account on the payment date");
-    dividend_cash.set_active(
-        refs.state
-            .database
-            .dividend_cash_enabled(account.id)
-            .unwrap_or(true),
-    );
-
     let group = PreferencesGroup::new();
     group.add(&name);
     group.add(&currency);
-    group.add(&dividend_cash);
 
     let body = dialog_body();
     body.append(&group);
@@ -10467,17 +10401,6 @@ fn present_edit_account_dialog(parent: &ApplicationWindow, refs: UiRefs, account
                 currency_at(currency.selected()),
             ) {
                 Ok(()) => {
-                    if let Err(error) = refs
-                        .state
-                        .database
-                        .set_dividend_cash_enabled(account_id, dividend_cash.is_active())
-                    {
-                        refs.toast_overlay.add_toast(Toast::new(&format!(
-                            "Could not update dividend cash setting: {error}"
-                        )));
-                        return;
-                    }
-                    let _ = refs.state.database.sync_paid_dividends_to_cash();
                     refs.refresh();
                     refs.toast_overlay.add_toast(Toast::new("Account updated"));
                     dialog.close();
@@ -11121,7 +11044,6 @@ fn rebuild_transactions_list(
                         confirm.connect_response(Some("delete"), move |_, _| {
                             match refs.state.database.delete_transaction(transaction_id) {
                                 Ok(true) => {
-                                    let _ = refs.state.database.sync_paid_dividends_to_cash();
                                     rebuild_transactions_list(
                                         &list,
                                         &stack,
@@ -12048,8 +11970,6 @@ fn present_add_activity_dialog_with_context(
                         LAST_ACCOUNT_ID_KEY,
                         &selected_account.id.to_string(),
                     );
-                    let _ = refs.state.database.sync_paid_dividends_to_cash();
-
                     let all_positions = refs.state.database.load_positions().unwrap_or_default();
                     if let Some(position) = all_positions
                         .iter()
@@ -12439,7 +12359,6 @@ fn present_edit_transaction_dialog(
                 kind != "OPEN" && settle_cash.is_active(),
             ) {
                 Ok(()) => {
-                    let _ = refs.state.database.sync_paid_dividends_to_cash();
                     rebuild_transactions_list(
                         &list,
                         &stack,
@@ -14271,8 +14190,6 @@ fn refresh_portfolio_history_async(refs: UiRefs, announce: bool) {
             );
         }
 
-        let _ = refs.state.database.sync_paid_dividends_to_cash();
-
         update_portfolio_history_from_cache(&refs);
         if announce && result.failures > 0 {
             let message = if result.histories.is_empty() && result.fx_histories.is_empty() {
@@ -14352,7 +14269,6 @@ fn refresh_dividends_async(refs: UiRefs, positions: Vec<Position>, announce: boo
         }
 
         let _ = refs.state.database.sync_positions_from_activity();
-        let _ = refs.state.database.sync_paid_dividends_to_cash();
         refresh_with_loaded_crossfade(refs.clone());
         refresh_portfolio_history_async(refs.clone(), false);
 
@@ -14572,7 +14488,6 @@ fn refresh_market_async(
         }
         let fx_failed = fx_failures > 0;
 
-        let _ = refs.state.database.sync_paid_dividends_to_cash();
         refresh_with_loaded_crossfade(refs.clone());
 
         if announce {

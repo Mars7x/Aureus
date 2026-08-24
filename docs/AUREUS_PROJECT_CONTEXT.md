@@ -18,8 +18,8 @@ Current repository anchors at the time this document was written:
 - GTK crate: 0.11.4 with GNOME 50 features
 - libadwaita crate: 0.9.2 with libadwaita 1.9 features
 - Flatpak runtime/SDK: GNOME 50
-- SQLite schema version: 19
-- Backup export format: 6; supported import formats: 5 and 6
+- SQLite schema version: 20
+- Backup export format: 7; supported import formats: 5, 6, and 7
 - Market-data cache/provider generation: `yfinance-v20-yahoo-quote-range-bar`
 - Active market-data provider: Yahoo Finance
 - Primary local database: SQLite through bundled `rusqlite`
@@ -47,7 +47,7 @@ Core capabilities:
 - Opening positions, buys, sells, holding transfers
 - Account cash ledger and cash transfers
 - Optional trade settlement against account cash
-- Dividend tracking and optional paid-dividend cash credits
+- Historical dividend tracking and estimates
 - Automatic split/corporate-action reconciliation
 - Portfolio allocation
 - Portfolio history/performance from 1D through All
@@ -107,11 +107,10 @@ Important persistent settings include:
 - `last-account-id`
 - `use-aureus-theme`
 - `portfolio-history-range`
-- per-account dividend-cash settings
 
 ### `src/database.rs`
 
-Owns SQLite schema, migrations, activity/cash consistency, position reconstruction, corporate actions, dividend cash synchronization, caches, and backup/restore validation.
+Owns SQLite schema, migrations, activity/cash consistency, position reconstruction, corporate actions, dividend caches, and backup/restore validation.
 
 Unknown database schema versions must fail visibly. Never silently delete/reset user data to recover from a schema mismatch.
 
@@ -304,11 +303,13 @@ Edits/deletes to dated cash activity must continue to respect ledger validity. D
 Dividend behavior:
 
 - Dividend history is cached separately from quote history.
-- Paid dividends can generate cash entries.
-- Dividend cash crediting is configurable per account.
-- The preference and start timestamp are persisted per account.
-- The same generated dividend cash activity must remain consistent across Dividends, Transactions/activity views, account cash, and account detail.
-- Cross-currency dividend cash/reporting uses historical FX appropriate to the payment date.
+- The Dividends page and dividend reports reconstruct historical income from known
+  distributions and the shares recorded as held on each ex-dividend date.
+- Dividend refreshes are display-only. They never create, update, remove, or reconcile
+  account cash.
+- Existing dividend cash entries created by older releases remain normal preserved
+  financial history, including through backup/restore.
+- Cross-currency dividend reporting uses historical FX appropriate to the distribution.
 
 Corporate actions:
 
@@ -422,7 +423,7 @@ Cached history may remain visible during refresh. Avoid blanking/jumping the cha
 
 ## 13. Database and caches
 
-Current schema version: 19.
+Current schema version: 20.
 
 Core tables include:
 
@@ -437,7 +438,6 @@ Core tables include:
 - `history_fetches`
 - `dividend_history`
 - `split_history`
-- `dividend_payments`
 - `dividend_fetches`
 - `fx_history`
 
@@ -461,16 +461,15 @@ Current backup format stores:
 - `format_version`
 - Portfolio Currency (`base_currency` internally)
 - accounts and native currencies
-- per-account dividend cash preference
 - watchlist metadata
 - transactions
 - fee currency
 - settlement amount/currency
 - cash entries
 
-Current export format: 6.
+Current export format: 7.
 
-Current import compatibility: formats 5 and 6.
+Current import compatibility: formats 5, 6, and 7.
 
 Backup restore validates supported currencies, accounts, transaction values, settlement consistency, and cash activity before importing.
 
@@ -558,7 +557,8 @@ Before accepting a change in these areas, explicitly verify the relevant items.
 
 ### Dividends/splits
 
-- Dividend-to-cash preference is respected per account.
+- Dividend refreshes never mutate account cash.
+- Existing dividend cash from older releases remains preserved.
 - Historical dividend conversion uses the appropriate historical FX.
 - Split reconciliation remains idempotent.
 - Failed future-split lookup does not erase cached future announcements.
@@ -568,7 +568,7 @@ Before accepting a change in these areas, explicitly verify the relevant items.
 
 - Migration preserves old data.
 - Unsupported schema fails rather than resets.
-- Backup round-trip preserves currencies, settlement data, cash, activity, watchlist, and dividend preference.
+- Backup round-trip preserves currencies, settlement data, cash, activity, and watchlist.
 
 ### UI
 

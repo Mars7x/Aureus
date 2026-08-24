@@ -89,17 +89,19 @@ Aureus supports exactly these 25 selectable account/Portfolio Currency codes:
 - Deleting an account removes its holdings/activity through the existing database relationships and cleanup behavior.
 - Cash-ledger edits must not make later dated cash invalid/negative where the ledger rules prohibit it.
 - Account transfers use paired same-currency cash activity or holding moves that preserve cost basis.
-- Paid dividends can be credited to account cash when the account preference is enabled.
-- Preserve the per-account dividend-to-cash preference and its backup/restore behavior.
+- Dividends are provider-backed historical/display data only. They must never create,
+  update, remove, or otherwise reconcile account cash automatically.
+- Preserve cash entries created by older releases; retiring dividend automation must
+  not delete or rewrite existing financial history.
 - Corporate actions, including splits and announced future splits, must remain idempotent and safe across refreshes/restores.
 - A restored backup is intentionally marked for corporate-action reconciliation.
 
 ### Storage, migrations, and backups
 
-- Current database schema version is 19.
+- Current database schema version is 20.
 - Never silently reset or destroy an unknown/newer database. Fail visibly instead.
 - Any schema change requires a forward migration, schema-version bump, validation, and regression tests.
-- Current backup export format is version 6; imports support versions 5 and 6.
+- Current backup export format is version 7; imports support versions 5, 6, and 7.
 - Backups are portable financial records. Preserve native currencies and user-entered historical amounts exactly.
 - Provider caches/history are rebuildable and should not be treated as the authoritative portable record.
 

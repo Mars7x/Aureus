@@ -308,11 +308,11 @@ Historical candles and FX reference data can still use appropriate caches.
 
 A 15-minute FX cache is not the same thing as a 15-minute security-quote freshness policy.
 
-## 11. Dividend cash and transfers
+## 11. Historical dividend cash behavior and transfers
 
-Dividend cash behavior evolved from display-only dividend data into reconciled account cash activity.
+Dividend cash behavior once evolved from display-only dividend data into reconciled account cash activity.
 
-Important invariants:
+Historical behavior at that point included:
 
 - paid dividend cash entries are generated consistently
 - per-account dividend-cash enable/disable preference is respected
@@ -329,9 +329,9 @@ Transfers were added with the goal of preserving accounting identity:
 
 Backups evolved to preserve more of the activity model and user preferences while leaving provider caches reconstructible.
 
-Current export format is version 6; current code imports versions 5 and 6.
+At that point, export format was version 6 and imports supported versions 5 and 6.
 
-The backup carries Portfolio Currency, accounts/currencies, watchlist, transaction currency/fees/settlement data, cash activity, and dividend-cash preference.
+That backup carried Portfolio Currency, accounts/currencies, watchlist, transaction currency/fees/settlement data, cash activity, and the former dividend-cash preference.
 
 Restored portfolios are marked for corporate-action reconciliation so later provider refresh can reapply split history safely.
 
@@ -395,3 +395,17 @@ For non-1D ranges, Aureus now overlaps the independent Yahoo chart, live-quote, 
 Manual refresh explicitly invalidates the short-lived snapshot so it still reaches Yahoo. The cache is in-memory only and does not replace persisted chart history or the live-quote freshness policy. If the range bar cannot be validated, Aureus continues to fail closed rather than reconstructing an approximate percentage.
 
 The concise public release note is: improved performance when switching security chart ranges.
+
+## 18. Dividend automation retirement
+
+Dividend cash automation was removed after the 1.2.1 clean base. Aureus now keeps
+dividends as provider-backed historical/display data and reconstructs historical income
+from recorded holdings on each ex-dividend date.
+
+Dividend refreshes never create or reconcile account cash. The account preference and
+automatic payment queue were removed from the UI, runtime, schema, and backup format.
+Existing dividend cash entries created by older releases remain preserved financial
+history and are not deleted or rewritten by the schema-20 migration.
+
+Backup format 7 removes the retired account preference; imports remain compatible with
+formats 5 and 6.
