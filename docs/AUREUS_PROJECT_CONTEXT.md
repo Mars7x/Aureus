@@ -8,7 +8,7 @@ Aureus is a simple native portfolio tracker built for Linux desktop and mobile d
 
 Current repository anchors at the time this document was written:
 
-- Version: `1.2.1`
+- Version: `1.3.0`
 - App ID: `io.github.Mars7x.Aureus`
 - Binary/package: `aureus`
 - Author: Mars7x

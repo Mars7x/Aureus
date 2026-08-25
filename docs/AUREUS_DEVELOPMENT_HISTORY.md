@@ -409,3 +409,10 @@ history and are not deleted or rewritten by the schema-20 migration.
 
 Backup format 7 removes the retired account preference; imports remain compatible with
 formats 5 and 6.
+
+## 19. 1.3.0 release line
+
+The dividend automation retirement is released as Aureus 1.3.0. The application keeps
+provider-backed dividend history, annual estimates, and reporting while never changing
+account cash automatically. Existing dividend cash entries from older releases remain
+preserved financial history.
