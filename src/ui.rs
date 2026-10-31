@@ -36,7 +36,6 @@ const BASE_CURRENCY_KEY: &str = "base-currency";
 const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
 const BRAND_LOGOS_KEY: &str = "fetch-brand-logos";
-const BRAND_LOGO_ATTRIBUTION_NAME: &str = "aureus-brand-logo-attribution";
 const PORTFOLIO_HISTORY_RANGE_KEY: &str = "portfolio-history-range";
 const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
 const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v20-yahoo-quote-range-bar";
@@ -211,23 +210,6 @@ fn request_brand_logo(avatar: &Avatar, provider_symbol: &str) {
     });
 }
 
-/// Elbstream's free tier requires a visible link wherever its logos appear.
-fn brand_logo_attribution() -> Label {
-    let label = Label::builder()
-        .label(format!(
-            "Logos by <a href=\"{}\">Elbstream</a>",
-            crate::stock_image::BRAND_LOGO_ATTRIBUTION_URL
-        ))
-        .use_markup(true)
-        .halign(Align::Center)
-        .margin_top(6)
-        .css_classes(["dim-label"])
-        .visible(crate::stock_image::brand_logos_enabled())
-        .build();
-    label.set_widget_name(BRAND_LOGO_ATTRIBUTION_NAME);
-    label
-}
-
 fn brand_logos_preference(state: &AppState) -> bool {
     !matches!(
         state
@@ -240,17 +222,15 @@ fn brand_logos_preference(state: &AppState) -> bool {
     )
 }
 
-/// Re-applies stock pictures and attribution visibility after the brand-logo
-/// preference changes, without rebuilding pages that are already open.
+/// Re-applies stock pictures after the brand-logo preference changes, without
+/// rebuilding pages that are already open.
 fn refresh_brand_logo_widgets(root: &gtk::Widget) {
     let enabled = crate::stock_image::brand_logos_enabled();
     let prefix = "aureus-stock-picture-";
     let mut widgets = vec![root.clone()];
     while let Some(widget) = widgets.pop() {
         let name = widget.widget_name();
-        if name == BRAND_LOGO_ATTRIBUTION_NAME {
-            widget.set_visible(enabled);
-        } else if let (Some(key), Ok(avatar)) = (
+        if let (Some(key), Ok(avatar)) = (
             name.strip_prefix(prefix),
             widget.clone().downcast::<Avatar>(),
         ) {
@@ -2405,7 +2385,6 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
         .build();
     holdings_column.append(&section_heading("Holdings"));
     holdings_column.append(&refs.overview_list);
-    holdings_column.append(&brand_logo_attribution());
 
     let allocation_column = GtkBox::builder()
         .orientation(Orientation::Vertical)
@@ -2893,7 +2872,6 @@ fn build_search_page(refs: &UiRefs) -> gtk::Widget {
     content.set_margin_top(8);
     content.append(&feedback);
     content.append(&result_list);
-    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     scroller.set_vexpand(true);
@@ -3088,7 +3066,6 @@ fn set_search_keyboard_highlight(list: &ListBox, selected: Option<usize>) {
 fn build_watchlist_page(refs: &UiRefs) -> gtk::Widget {
     let content = page_content_box();
     content.append(&refs.watchlist_list);
-    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     refs.page_scroll_adjustments
@@ -6944,7 +6921,7 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     brand_logos_row.set_title("Show Brand Logos");
     brand_logos_row.set_subtitle(&format!(
         "Download stock logos from <a href=\"{}\">Elbstream</a>. Custom stock pictures always take priority",
-        crate::stock_image::BRAND_LOGO_ATTRIBUTION_URL
+        crate::stock_image::BRAND_LOGO_SOURCE_URL
     ));
     brand_logos_row.set_subtitle_selectable(false);
     brand_logos_row.set_use_markup(true);
@@ -7700,7 +7677,6 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     content.append(&range_box);
     content.append(&section_heading("Security"));
     content.append(&details);
-    content.append(&brand_logo_attribution());
     let scroller = page_scroller(&content, 900);
     let pull_refresh = build_detail_pull_refresh(&scroller);
 
@@ -8702,7 +8678,6 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     } else {
         content.append(&Label::builder().label("No account activity yet").halign(Align::Start).css_classes(["dim-label"]).build());
     }
-    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     let header = HeaderBar::new();
@@ -9057,7 +9032,6 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     content.append(&dividend_metrics);
     content.append(&dividend_status);
     content.append(&dividend_list);
-    content.append(&brand_logo_attribution());
     let scroller = page_scroller(&content, 900);
     let pull_refresh = build_detail_pull_refresh(&scroller);
 
@@ -11566,7 +11540,6 @@ fn present_add_activity_dialog_with_context(
     search_body.append(&search);
     search_body.append(&search_feedback);
     search_body.append(&result_list);
-    search_body.append(&brand_logo_attribution());
     let search_scroller = dialog_scroller(&search_body, 560);
 
     let account = ComboRow::new();

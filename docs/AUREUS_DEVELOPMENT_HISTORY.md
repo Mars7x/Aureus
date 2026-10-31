@@ -436,7 +436,7 @@ Brand logos were the remaining roadmap item after 1.3.0. Sources evaluated:
 - Logo.dev: needs a token.
 - Elbstream (Parqet's logo API, which moved from `assets.parqet.com` to `api.elbstream.com`): no key, square avatar-ready tiles, accepts Yahoo provider symbols with exchange suffixes (RY.TO, NTOA.MU as Nintendo, XEQT.TO as iShares, BRK-B), and returns a clean 404 for unknown symbols. The free tier requires a visible link to Elbstream wherever logos appear.
 
-The user chose Elbstream, with a `Show Brand Logos` preference that is on by default. Fetching sends held and watched symbols to Elbstream, which is why it is a preference. Custom stock pictures always take priority, logos are rebuildable cache data, and each page that shows logos carries the attribution. See section 16 of the project context for the current rules.
+The user chose Elbstream, with a `Show Brand Logos` preference that is on by default. Fetching sends held and watched symbols to Elbstream, which is why it is a preference. Custom stock pictures always take priority, logos are rebuildable cache data. See section 16 of the project context for the current rules.
 
 ## 22. Middle-dot separators removed
 
@@ -451,3 +451,5 @@ and because derived positions and reports take their name from the latest
 transaction, a transferred holding could display that note as its security name. New
 transfers write `Name (transfer to X)`, derived position and report names strip the
 note, and older stored notes are reworded only at display time.
+
+The first version put a "Logos by Elbstream" link under every page that showed logos, to meet the free tier's attribution terms. The developer then had those per-page labels removed. Elbstream stays credited in the About dialog and linked from the preference.

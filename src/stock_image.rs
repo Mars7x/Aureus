@@ -18,10 +18,9 @@ const MAX_STOCK_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const STORED_STOCK_IMAGE_DIMENSION: u32 = 512;
 
 /// Elbstream (formerly Parqet) serves square brand logos keyed by exchange
-/// symbol, including Yahoo-style suffixes such as `RY.TO` and `NTOA.MU`. Its
-/// free tier requires a visible, linked attribution wherever logos appear.
+/// symbol, including Yahoo-style suffixes such as `RY.TO` and `NTOA.MU`.
 const BRAND_LOGO_URL: &str = "https://api.elbstream.com/logos/symbol";
-pub const BRAND_LOGO_ATTRIBUTION_URL: &str = "https://elbstream.com";
+pub const BRAND_LOGO_SOURCE_URL: &str = "https://elbstream.com";
 const BRAND_LOGO_REQUEST_SIZE: u32 = 256;
 const MAX_BRAND_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 const BRAND_LOGO_REFRESH_SECONDS: u64 = 30 * 24 * 60 * 60;

@@ -500,8 +500,8 @@ Each stock avatar shows, in order of precedence:
 Brand logos:
 
 - Source: Elbstream (formerly Parqet's logo API), `https://api.elbstream.com/logos/symbol/<provider symbol>?format=png&size=256`. It accepts Yahoo provider symbols, including exchange suffixes such as `RY.TO` and `NTOA.MU`. No API key is used.
-- Elbstream's free tier requires a visible link to Elbstream on any page that shows a logo. `brand_logo_attribution()` adds a "Logos by Elbstream" link under every page or dialog that shows stock avatars (Overview holdings, Watchlist, Search, the add-activity search, security detail, account detail, position detail) and the About dialog credits it. Any new page that shows stock avatars must include the attribution.
-- Preference key: `fetch-brand-logos`, on by default. When it is off, nothing is requested, cached logos are hidden and the attribution disappears. Custom pictures are unaffected.
+- Elbstream is credited in the About dialog and linked from the `Show Brand Logos` preference. By the developer's decision, pages that show logos carry no per-page "Logos by Elbstream" label, although Elbstream's free tier asks for a visible link wherever logos appear.
+- Preference key: `fetch-brand-logos`, on by default. When it is off, nothing is requested and cached logos are hidden. Custom pictures are unaffected.
 - No request is made for stocks that have a custom picture.
 - Logos are rebuildable cache data in the XDG cache directory (`brand-logos/`), not portable financial records, and are not in backups.
 - Cached logos refresh after 30 days. A 404 is Elbstream's authoritative "no logo" answer: it is remembered with a `.missing` marker for 7 days. Transient failures are not remembered and retry on the next display.
@@ -601,7 +601,6 @@ Before accepting a change in these areas, explicitly verify the relevant items.
 - Pull-to-refresh and Ctrl+R continue to work.
 - Portfolio range persistence remains intact.
 - No unrelated CSS/color regressions.
-- Pages that show stock avatars still show the Elbstream attribution while brand logos are on.
 - Custom stock pictures still take priority over brand logos.
 
 ## 21. Working style for future changes
