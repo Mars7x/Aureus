@@ -154,22 +154,60 @@ fn stock_avatar(provider_symbol: &str, fallback_text: &str, size: i32) -> Avatar
     avatar
 }
 
+#[derive(Clone)]
+struct StockPicture {
+    texture: gtk::gdk::Texture,
+    colors: Vec<(f64, f64, f64)>,
+}
+
+thread_local! {
+    /// Decoded stock pictures keyed by picture key. Every page rebuild creates
+    /// new avatars, and decoding the PNG plus sampling its colors each time was
+    /// the largest cost of a refresh. `None` records that a symbol has no
+    /// picture so the files are not probed again.
+    static STOCK_PICTURES: RefCell<HashMap<String, Option<StockPicture>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn stock_picture(provider_symbol: &str) -> Option<StockPicture> {
+    let key = crate::stock_image::picture_key(provider_symbol);
+    if let Some(cached) = STOCK_PICTURES.with(|cache| cache.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let picture = crate::stock_image::load_display_image(provider_symbol).and_then(|data| {
+        let bytes = glib::Bytes::from_owned(data.bytes);
+        gtk::gdk::Texture::from_bytes(&bytes)
+            .ok()
+            .map(|texture| StockPicture {
+                texture,
+                colors: data.colors,
+            })
+    });
+    STOCK_PICTURES.with(|cache| cache.borrow_mut().insert(key, picture.clone()));
+    picture
+}
+
+/// Must be called whenever a custom picture or brand logo changes on disk, or
+/// when the brand-logo preference changes what should be displayed.
+fn invalidate_stock_picture(provider_symbol: &str) {
+    let key = crate::stock_image::picture_key(provider_symbol);
+    STOCK_PICTURES.with(|cache| cache.borrow_mut().remove(&key));
+}
+
+fn invalidate_all_stock_pictures() {
+    STOCK_PICTURES.with(|cache| cache.borrow_mut().clear());
+}
+
 fn apply_saved_stock_image(avatar: &Avatar, provider_symbol: &str) {
-    let Some(data) = crate::stock_image::load_display_image(provider_symbol) else {
-        avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
-        return;
-    };
-    let bytes = glib::Bytes::from_owned(data.bytes);
-    if let Ok(texture) = gtk::gdk::Texture::from_bytes(&bytes) {
-        avatar.set_custom_image(Some(&texture));
-    } else {
-        avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
+    match stock_picture(provider_symbol) {
+        Some(picture) => avatar.set_custom_image(Some(&picture.texture)),
+        None => avatar.set_custom_image(None::<&gtk::gdk::Paintable>),
     }
 }
 
 fn stock_image_colors(provider_symbol: &str) -> Vec<(f64, f64, f64)> {
-    crate::stock_image::load_display_image(provider_symbol)
-        .map(|image| image.colors)
+    stock_picture(provider_symbol)
+        .map(|picture| picture.colors)
         .unwrap_or_default()
 }
 
@@ -183,27 +221,28 @@ fn request_brand_logo(avatar: &Avatar, provider_symbol: &str) {
         return;
     }
     let symbol = provider_symbol.to_string();
-    let (sender, receiver) = mpsc::channel::<bool>();
+    let (sender, receiver) = mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let fetched = crate::stock_image::fetch_brand_logo(&symbol).unwrap_or(false);
+        // A 404 can also remove a previously cached logo, so the result only
+        // matters as a signal that the cache may have changed.
+        let _ = crate::stock_image::fetch_brand_logo(&symbol);
         crate::stock_image::finish_brand_logo_request(&symbol);
-        let _ = sender.send(fetched);
+        let _ = sender.send(());
     });
 
     let avatar_weak = avatar.downgrade();
     let symbol = provider_symbol.to_string();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        let fetched = match receiver.try_recv() {
-            Ok(fetched) => fetched,
+        match receiver.try_recv() {
+            Ok(()) => {}
             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
             Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
-        };
-        if fetched {
-            if let Some(avatar) = avatar_weak.upgrade() {
-                match avatar.root() {
-                    Some(root) => refresh_stock_picture_widgets(root.upcast_ref(), &symbol),
-                    None => apply_saved_stock_image(&avatar, &symbol),
-                }
+        }
+        invalidate_stock_picture(&symbol);
+        if let Some(avatar) = avatar_weak.upgrade() {
+            match avatar.root() {
+                Some(root) => refresh_stock_picture_widgets(root.upcast_ref(), &symbol),
+                None => apply_saved_stock_image(&avatar, &symbol),
             }
         }
         glib::ControlFlow::Break
@@ -223,9 +262,10 @@ fn brand_logos_preference(state: &AppState) -> bool {
 }
 
 /// Re-applies stock pictures after the brand-logo preference changes, without
-/// rebuilding pages that are already open.
+/// rebuilding pages that are already open. Avatar names only carry the
+/// sanitized picture key, so logo requests are left to the page rebuild, which
+/// knows the real provider symbols.
 fn refresh_brand_logo_widgets(root: &gtk::Widget) {
-    let enabled = crate::stock_image::brand_logos_enabled();
     let prefix = "aureus-stock-picture-";
     let mut widgets = vec![root.clone()];
     while let Some(widget) = widgets.pop() {
@@ -235,9 +275,6 @@ fn refresh_brand_logo_widgets(root: &gtk::Widget) {
             widget.clone().downcast::<Avatar>(),
         ) {
             apply_saved_stock_image(&avatar, key);
-            if enabled {
-                request_brand_logo(&avatar, key);
-            }
         }
         let mut child = widget.first_child();
         while let Some(current) = child {
@@ -248,6 +285,7 @@ fn refresh_brand_logo_widgets(root: &gtk::Widget) {
 }
 
 fn refresh_stock_picture_widgets(root: &gtk::Widget, provider_symbol: &str) {
+    invalidate_stock_picture(provider_symbol);
     let target = format!(
         "aureus-stock-picture-{}",
         crate::stock_image::picture_key(provider_symbol)
@@ -309,6 +347,7 @@ fn present_choose_stock_picture(
 
         match crate::stock_image::save_stock_image(&provider_symbol, &path).await {
             Ok(data) => {
+                invalidate_stock_picture(&provider_symbol);
                 let bytes = glib::Bytes::from_owned(data.bytes);
                 match gtk::gdk::Texture::from_bytes(&bytes) {
                     Ok(_) => {
@@ -371,6 +410,7 @@ fn present_stock_picture_actions(
         dialog.connect_response(Some("delete"), move |_, _| {
             match crate::stock_image::remove_stock_image(&provider_symbol) {
                 Ok(_) => {
+                    invalidate_stock_picture(&provider_symbol);
                     if let Some(parent) = parent_weak.upgrade() {
                         let root: gtk::Widget = parent.upcast();
                         refresh_stock_picture_widgets(&root, &provider_symbol);
@@ -7011,6 +7051,7 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
                 return;
             }
             crate::stock_image::set_brand_logos_enabled(row.is_active());
+            invalidate_all_stock_pictures();
             refs.refresh();
             if let Some(parent) = parent_weak.upgrade() {
                 refresh_brand_logo_widgets(parent.upcast_ref());

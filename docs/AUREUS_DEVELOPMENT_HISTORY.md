@@ -453,3 +453,11 @@ transfers write `Name (transfer to X)`, derived position and report names strip 
 note, and older stored notes are reworded only at display time.
 
 The first version put a "Logos by Elbstream" link under every page that showed logos, to meet the free tier's attribution terms. The developer then had those per-page labels removed. Elbstream stays credited in the About dialog and linked from the preference.
+
+## 23. Stock picture cache
+
+A performance pass measured a release build against a copy of a real portfolio. Network work (quotes, history, FX, dividends, search) already runs on background threads, and price loading was deliberately left unchanged. Within a UI refresh, stock avatars were the largest cost: every rebuild re-read each picture file, decoded the PNG, sampled its allocation colors and built a new texture, about 1.7 ms per avatar. Overview, Watchlist, Search and allocation all rebuild avatars.
+
+Decoded pictures are now cached in memory per symbol and invalidated whenever a picture changes, which brings that step to about 0.02 ms per cached avatar. Chart drawing was already bounded (point reduction and binary-search hover) and was left as is.
+
+The same pass fixed a brand-logo bug: after the preference was toggled, open avatars requested logos using their sanitized picture key, so a symbol such as `^GSPC` would be requested as `_GSPC`. Logo requests now come only from page rebuilds, which know the real provider symbol.

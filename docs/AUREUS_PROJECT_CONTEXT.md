@@ -508,6 +508,7 @@ Brand logos:
 - Downloads are limited to 2 MB, decoded under the same limits as custom pictures and re-encoded as a bounded PNG before caching.
 - Requests run on a background thread with one in-flight request per symbol. When a logo arrives, every avatar for that symbol in the window updates.
 - Allocation colors use the displayed picture, so they follow the brand logo when no custom picture exists.
+- The UI keeps decoded pictures (texture plus allocation colors) in an in-memory cache keyed by picture key, including a "no picture" entry. Anything that changes a picture on disk or what should be shown must invalidate it: saving or deleting a custom picture, every finished logo request (a 404 can remove a cached logo), and toggling the brand-logo preference.
 
 ## 17. Packaging and distribution
 
