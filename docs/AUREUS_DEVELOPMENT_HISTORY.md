@@ -473,3 +473,7 @@ Windows builds were added as an experimental target: MSYS2 UCRT64 builds the rel
 The Accounts icon (`aureus-credit-card-symbolic`) was reported missing. Both custom symbolic icons were only installed into `share/icons/hicolor`, so any run without that install (development runs, and the new Windows bundle unless packaged exactly) fell back to GTK's missing-icon placeholder. The SVGs themselves render correctly. They are now compiled into the binary as a GResource by `build.rs` and added to the icon theme at startup; the Flatpak manifest and Windows packaging install only the app icon.
 
 The README screenshots were recreated from a demo portfolio (RY, XEQT, ENB, SHOP in a CAD TFSA) and are stored in `docs/screenshots/`.
+
+## 26. macOS builds
+
+macOS was added as an experimental target. No code changes were needed. The release workflow builds with Homebrew on Apple Silicon and Intel runners, and `scripts/package-macos.sh` turns the build into an ad-hoc signed `Aureus.app` with its dylibs, pixbuf loaders, schemas and icons, plus a launcher script that points GTK at them. The bundle is not notarized. It had not been run on a Mac when this was written.

@@ -96,10 +96,49 @@ jobs:
           path: dist/Aureus-${{ env.RELEASE_TAG }}-windows-x86_64.zip
           if-no-files-found: error
 
+  macos:
+    name: macOS ${{ matrix.arch }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install dependencies
+        run: |
+          brew install gtk4 libadwaita librsvg adwaita-icon-theme hicolor-icon-theme dylibbundler pkgconf
+          rustup update stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: scripts/package-macos.sh "Aureus-${RELEASE_TAG}-macos-${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aureus-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.zip
+          path: dist/Aureus-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
   upload:
     name: Upload release assets
-    needs: [flatpak, windows]
-    # A Windows failure must not hold back the Flatpak assets of a release.
+    needs: [flatpak, windows, macos]
+    # A Windows or macOS failure must not hold back the Flatpak assets of a
+    # release.
     if: >-
       always() &&
       needs.flatpak.result == 'success' &&

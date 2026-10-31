@@ -525,13 +525,21 @@ Windows builds are experimental:
 - Release builds use the Windows GUI subsystem, so no console window opens.
 - Keep code portable: no Linux-only crates or paths outside `cfg(target_os = "linux")`. Glycin was removed together with custom stock pictures because its sandbox is Linux-only.
 
+macOS builds are experimental:
+
+- Built in CI with Homebrew (GTK4, libadwaita, librsvg, icon themes, dylibbundler) for Apple Silicon (`macos-15`) and Intel (`macos-15-intel`).
+- `scripts/package-macos.sh` builds `Aureus.app`: the binary and pixbuf loaders in `Contents/Resources`, every Homebrew dylib in `Contents/Frameworks` (rewritten by dylibbundler), schemas, Adwaita and app icons, an `.icns` icon and `Info.plist`. `Contents/MacOS/Aureus` is a launcher script that points GTK at the bundled schemas, icons and pixbuf loaders; it rewrites the loader cache template into `~/Library/Caches/io.github.Mars7x.Aureus` on each start because that cache needs absolute paths.
+- The bundle is ad-hoc signed, not notarized, so users confirm the first launch (Control-click, Open).
+- GTK maps `<Primary>` shortcuts to Cmd on macOS.
+
 ### Release workflow
 
 `.github/workflows/release.yml` runs when a GitHub release is published, or manually with a tag or branch:
 
 - Flatpak bundles for x86_64 and aarch64 in the GNOME 50 Flathub container.
 - A Windows x86_64 zip from MSYS2.
-- The upload job attaches all builds to the release. It runs when the Flatpak builds succeed, so a Windows failure cannot hold back the Flatpak assets; the zip is attached only when it was built. A manual run with `upload` off only produces workflow artifacts, which is how to test a branch.
+- macOS arm64 and x86_64 zips containing `Aureus.app`.
+- The upload job attaches all builds to the release. It runs when the Flatpak builds succeed, so a Windows or macOS failure cannot hold back the Flatpak assets; zips are attached only when they were built. A manual run with `upload` off only produces workflow artifacts, which is how to test a branch.
 
 To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub release with a `vX.Y.Z` tag.
 

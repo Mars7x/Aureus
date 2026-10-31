@@ -22,7 +22,7 @@ If the current source and these documents ever disagree, the current source is a
 - License: GPL-3.0-or-later
 - Current release line: `1.3.0`
 - Native Rust application using GTK4 and libadwaita.
-- Flatpak is the primary packaging target. Windows zips are built in CI as an experimental target.
+- Flatpak is the primary packaging target. Windows and macOS builds are produced in CI as experimental targets.
 - Current development environment is Fedora Silverblue with GNOME Builder.
 
 Do not rename the application, app ID, binary, package, or repository unless explicitly requested.
@@ -123,7 +123,8 @@ Aureus supports exactly these 25 selectable account/Portfolio Currency codes:
 - `build.rs` / `data/aureus.gresource.xml` — custom symbolic icons compiled into the binary as a GResource.
 - `flatpak/io.github.Mars7x.Aureus.yml` — Flatpak build manifest.
 - `scripts/package-windows.sh` — bundles an MSYS2 release build into the Windows zip.
-- `.github/workflows/release.yml` — builds Flatpak and Windows release assets when a release is published.
+- `scripts/package-macos.sh` — bundles a Homebrew release build into `Aureus.app`.
+- `.github/workflows/release.yml` — builds Flatpak, Windows and macOS release assets when a release is published.
 - `data/io.github.Mars7x.Aureus.desktop` — desktop launcher metadata.
 - `data/io.github.Mars7x.Aureus.metainfo.xml` — optional AppStream metadata for the current distribution model; keep it minimal.
 
@@ -149,7 +150,7 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-For Flatpak packaging, use the existing manifest or `./build-flatpak.sh`. GNOME Builder is also a supported build path. Keep the code portable to Windows: Linux-only crates or paths must stay behind `cfg(target_os = "linux")`.
+For Flatpak packaging, use the existing manifest or `./build-flatpak.sh`. GNOME Builder is also a supported build path. Keep the code portable to Windows and macOS: Linux-only crates or paths must stay behind `cfg(target_os = "linux")`.
 
 When metadata is changed and the tools are available, also validate the desktop/AppStream files. Aureus is not currently targeting Flathub, so do not expand metadata solely to satisfy optional Flathub presentation conventions unless requested.
 
