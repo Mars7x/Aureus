@@ -37,8 +37,12 @@ loader_args=()
 for loader in "${loaders}"/*.so; do
     loader_args+=(-x "${loader}")
 done
+# Loaders such as librsvg's reference their libraries through @rpath, which
+# dylibbundler cannot resolve on its own; without a search path it prompts
+# for the location forever. The release workflow also caps this step's time.
 dylibbundler --overwrite-dir --bundle-deps --no-codesign \
     -x "${resources}/bin/aureus" "${loader_args[@]}" \
+    -s "${brew_prefix}/lib" \
     -d "${contents}/Frameworks/" -p "@executable_path/../../Frameworks/"
 
 cp "${brew_prefix}/share/glib-2.0/schemas/gschemas.compiled" "${resources}/share/glib-2.0/schemas/"
