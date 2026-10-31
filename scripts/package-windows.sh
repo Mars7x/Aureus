@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Bundles the MSYS2 UCRT64 release build of Aureus into a portable folder and
-# zip under dist/. Run from the repository root in an MSYS2 UCRT64 shell after
-# `cargo build --release --locked`.
+# Bundles an MSYS2 release build of Aureus into a portable folder and zip
+# under dist/. Run from the repository root in an MSYS2 UCRT64 (x86_64) or
+# CLANGARM64 (ARM64) shell after `cargo build --release --locked`.
 #
 # Usage: scripts/package-windows.sh <bundle-name>
 set -euo pipefail
 
 name="${1:?usage: scripts/package-windows.sh <bundle-name>}"
-prefix="${MINGW_PREFIX:?run this inside an MSYS2 UCRT64 shell}"
+prefix="${MINGW_PREFIX:?run this inside an MSYS2 UCRT64 or CLANGARM64 shell}"
 dist="dist/${name}"
 
 rm -rf "${dist}" "dist/${name}.zip"

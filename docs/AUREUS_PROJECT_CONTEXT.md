@@ -519,7 +519,7 @@ Primary packaging is Flatpak with:
 
 Windows builds are experimental:
 
-- Built in CI with MSYS2 UCRT64 (GTK4, libadwaita, librsvg, Adwaita icon theme, Rust).
+- Built in CI with MSYS2 (GTK4, libadwaita, librsvg, Adwaita icon theme, Rust): UCRT64 for x86_64 on `windows-2025` and CLANGARM64 for ARM64 on `windows-11-arm`.
 - `scripts/package-windows.sh` turns the release build into a portable zip that mirrors the MSYS2 prefix (`bin/`, `lib/`, `share/`): the executable and every MSYS2 DLL it and the GdkPixbuf loaders link against, the pixbuf loaders, compiled GSettings schemas, the Adwaita icon theme and the Aureus icons. Users run `bin\aureus.exe`.
 - Data lives in `%LOCALAPPDATA%\io.github.Mars7x.Aureus` (`storage::data_root` adds the app ID outside Flatpak).
 - Release builds use the Windows GUI subsystem, so no console window opens.
@@ -527,7 +527,7 @@ Windows builds are experimental:
 
 macOS builds are experimental:
 
-- Built in CI with Homebrew (GTK4, libadwaita, librsvg, icon themes, dylibbundler) for Apple Silicon (`macos-15`) and Intel (`macos-15-intel`).
+- Built in CI with Homebrew (GTK4, libadwaita, librsvg, icon themes, dylibbundler) for Apple Silicon only (`macos-15`). Intel Macs are deliberately not supported.
 - `scripts/package-macos.sh` builds `Aureus.app`: the binary and pixbuf loaders in `Contents/Resources`, every Homebrew dylib in `Contents/Frameworks` (rewritten by dylibbundler), schemas, Adwaita and app icons, an `.icns` icon and `Info.plist`. `Contents/MacOS/Aureus` is a launcher script that points GTK at the bundled schemas, icons and pixbuf loaders; it rewrites the loader cache template into `~/Library/Caches/io.github.Mars7x.Aureus` on each start because that cache needs absolute paths.
 - The bundle is ad-hoc signed, not notarized, so users confirm the first launch (Control-click, Open).
 - GTK maps `<Primary>` shortcuts to Cmd on macOS.
@@ -537,8 +537,8 @@ macOS builds are experimental:
 `.github/workflows/release.yml` runs when a GitHub release is published, or manually with a tag or branch:
 
 - Flatpak bundles for x86_64 and aarch64 in the GNOME 50 Flathub container.
-- A Windows x86_64 zip from MSYS2.
-- macOS arm64 and x86_64 zips containing `Aureus.app`.
+- Windows x86_64 and ARM64 zips from MSYS2.
+- A macOS arm64 zip containing `Aureus.app`.
 - The upload job attaches all builds to the release. It runs when the Flatpak builds succeed, so a Windows or macOS failure cannot hold back the Flatpak assets; zips are attached only when they were built. A manual run with `upload` off only produces workflow artifacts, which is how to test a branch.
 
 To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub release with a `vX.Y.Z` tag.

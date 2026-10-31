@@ -55,8 +55,22 @@ jobs:
           artifact-name: Aureus-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.flatpak
 
   windows:
-    name: Windows x86_64
-    runs-on: windows-2025
+    name: Windows ${{ matrix.arch }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            msystem: UCRT64
+            compiler: gcc
+          - arch: arm64
+            runner: windows-11-arm
+            msystem: CLANGARM64
+            compiler: clang
+
+    runs-on: ${{ matrix.runner }}
 
     defaults:
       run:
@@ -71,11 +85,11 @@ jobs:
       - name: Set up MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: zip
           pacboy: >-
-            gcc:p
+            ${{ matrix.compiler }}:p
             pkgconf:p
             rust:p
             gtk4:p
@@ -87,28 +101,18 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package
-        run: scripts/package-windows.sh "Aureus-${RELEASE_TAG}-windows-x86_64"
+        run: scripts/package-windows.sh "Aureus-${RELEASE_TAG}-windows-${{ matrix.arch }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Aureus-${{ env.RELEASE_TAG }}-windows-x86_64.zip
-          path: dist/Aureus-${{ env.RELEASE_TAG }}-windows-x86_64.zip
+          name: Aureus-${{ env.RELEASE_TAG }}-windows-${{ matrix.arch }}.zip
+          path: dist/Aureus-${{ env.RELEASE_TAG }}-windows-${{ matrix.arch }}.zip
           if-no-files-found: error
 
   macos:
-    name: macOS ${{ matrix.arch }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-15
-          - arch: x86_64
-            runner: macos-15-intel
-
-    runs-on: ${{ matrix.runner }}
+    name: macOS arm64
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
@@ -127,13 +131,13 @@ jobs:
 
       - name: Package
         timeout-minutes: 15
-        run: scripts/package-macos.sh "Aureus-${RELEASE_TAG}-macos-${{ matrix.arch }}"
+        run: scripts/package-macos.sh "Aureus-${RELEASE_TAG}-macos-arm64"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Aureus-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.zip
-          path: dist/Aureus-${{ env.RELEASE_TAG }}-macos-${{ matrix.arch }}.zip
+          name: Aureus-${{ env.RELEASE_TAG }}-macos-arm64.zip
+          path: dist/Aureus-${{ env.RELEASE_TAG }}-macos-arm64.zip
           if-no-files-found: error
 
   upload:
