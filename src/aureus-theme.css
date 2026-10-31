@@ -1,19 +1,21 @@
+/* Aureus surface palette. The accent is intentionally left to the system so
+ * Aureus follows the user's chosen libadwaita accent colour. */
 :root {
-    --window-bg-color: #181818;
-    --view-bg-color: #181818;
-    --popover-bg-color: #202020;
-    --dialog-bg-color: #202020;
+    --window-bg-color: #101010;
+    --view-bg-color: #101010;
+    --popover-bg-color: #191919;
+    --dialog-bg-color: #191919;
 
-    --sidebar-bg-color: #1f1f1f;
-    --secondary-sidebar-bg-color: #1f1f1f;
-    --sidebar-backdrop-color: #1f1f1f;
-    --secondary-sidebar-backdrop-color: #1f1f1f;
+    --sidebar-bg-color: #171717;
+    --secondary-sidebar-bg-color: #171717;
+    --sidebar-backdrop-color: #171717;
+    --secondary-sidebar-backdrop-color: #171717;
 
-    --card-bg-color: #222222;
-    --headerbar-bg-color: #181818;
+    --card-bg-color: #1c1c1c;
+    --headerbar-bg-color: #101010;
 }
 
 toast {
-    background-color: #303030;
-    border: 1px solid #3a3a3a;
+    background-color: #252525;
+    border: 1px solid #303030;
 }

@@ -416,3 +416,12 @@ The dividend automation retirement is released as Aureus 1.3.0. The application 
 provider-backed dividend history, annual estimates, and reporting while never changing
 account cash automatically. Existing dividend cash entries from older releases remain
 preserved financial history.
+
+## 20. Own theme palette
+
+The Planify-inspired Aureus Theme colours were replaced with the developer's own GTK
+palette from Mars7x/mygtktheme: darker window/view surfaces, matching headerbar, and
+slightly lifted sidebar, card, popover, and dialog surfaces. The source theme's teal
+accent was deliberately not carried over; Aureus follows the system accent colour.
+The source theme's Planify-specific named colours and close-button styling were also
+left out to keep custom CSS minimal.

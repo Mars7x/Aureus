@@ -89,7 +89,8 @@ Theme behavior:
 - When disabled, follow the system/libadwaita appearance.
 - Custom CSS should remain minimal and targeted.
 - Toast-specific styling is acceptable; unrelated widget colors should not be changed as collateral damage.
-- The established color direction was inspired by Planify's libadwaita color treatment, but future changes should preserve Aureus's current visual identity rather than repeatedly restyling it.
+- The Aureus Theme palette comes from the developer's own GTK colours (Mars7x/mygtktheme) and only sets surface colours (window, view, sidebar, card, popover, dialog, headerbar) plus toasts. Preserve this visual identity rather than repeatedly restyling it.
+- Aureus never sets an accent colour. Charts and accent-styled widgets follow the system libadwaita accent.
 
 ## 4. Repository architecture
 
