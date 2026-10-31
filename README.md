@@ -33,15 +33,15 @@ NOK, PEN, PLN, SGD, ZAR, SEK, TWD, THB, TRY, BRL.
 ## Screenshots
 
 <div align="center">
-  <img width="1183" alt="Screenshot From 2026-08-21 14-22-51" src="https://github.com/user-attachments/assets/d379c477-b03b-45ce-8f4e-5a998c46fb94" style="background: transparent;" />
+  <img width="1133" alt="Overview on desktop" src="docs/screenshots/overview-desktop.png" />
 
-  <img width="1183" alt="Screenshot From 2026-08-21 14-23-00" src="https://github.com/user-attachments/assets/fdbaa30b-0146-4844-ad06-1a1acb247ec7" style="background: transparent;" />
+  <img width="1133" alt="Dividends on desktop" src="docs/screenshots/dividends-desktop.png" />
 
   <br />
 
-  <img width="410" alt="Screenshot From 2026-08-21 14-23-16" src="https://github.com/user-attachments/assets/bb636df6-bd4c-4cb0-b43f-6d4733b732f3" />
+  <img width="360" alt="Overview on mobile" src="docs/screenshots/overview-mobile.png" />
   &nbsp;&nbsp;
-  <img width="410" alt="Screenshot From 2026-08-21 14-23-21" src="https://github.com/user-attachments/assets/c7f1e319-8c32-4b7c-94d7-4a4fa17c917e" />
+  <img width="360" alt="Dividends on mobile" src="docs/screenshots/dividends-mobile.png" />
 </div>
 
 ## How it works
