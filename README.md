@@ -10,9 +10,7 @@ layouts.
 
 > **Note:** AI tools were used in developing this project.
 
-## Status
-
-Current release: 1.3.0.
+## Features
 
 - **Accounts and activity:** multiple accounts, each in its own native
   currency, with trades, cash activity, transfers between accounts and
@@ -23,7 +21,6 @@ Current release: 1.3.0.
   history from Yahoo Finance.
 - **Reports and backups:** PDF report export and portable backup and restore.
 - **Platform:** Linux, packaged as a Flatpak.
-- **Not done:** brand logos.
 
 ### Supported currencies
 
