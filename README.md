@@ -19,6 +19,8 @@ layouts.
   historical exchange rates for past performance.
 - **Market data:** live quotes, charts, search, a watchlist and dividend
   history from Yahoo Finance.
+- **Brand logos:** stock logos from Elbstream, which can be turned off in
+  Preferences. Your own stock pictures always take priority.
 - **Reports and backups:** PDF report export and portable backup and restore.
 - **Platform:** Linux, packaged as a Flatpak.
 
@@ -80,8 +82,10 @@ cargo test
 
 ## Legal
 
-This is an independent project, not affiliated with or endorsed by Yahoo or
-the Bank of Canada. Market data and exchange rates are provided by their
-respective sources and may be delayed or incomplete.
+This is an independent project, not affiliated with or endorsed by Yahoo,
+the Bank of Canada or Elbstream. Market data and exchange rates are provided
+by their respective sources and may be delayed or incomplete. Brand logos are
+provided by [Elbstream](https://elbstream.com) and remain trademarks of their
+owners.
 
 Licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
