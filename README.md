@@ -20,9 +20,10 @@ layouts.
 - **Market data:** live quotes, charts, search, a watchlist and dividend
   history from Yahoo Finance.
 - **Brand logos:** stock logos from Elbstream, which can be turned off in
-  Preferences. Your own stock pictures always take priority.
+  Preferences.
 - **Reports and backups:** PDF report export and portable backup and restore.
-- **Platform:** Linux, packaged as a Flatpak.
+- **Platform:** Linux, packaged as a Flatpak. Windows builds are
+  experimental.
 
 ### Supported currencies
 
@@ -74,6 +75,23 @@ need Rust 1.92 or newer and the GTK4 and libadwaita development packages:
 cargo run
 cargo test
 ```
+
+### Windows
+
+Windows builds are experimental. Each release includes a zip: extract it and
+run `bin\aureus.exe`. To build it yourself, install
+[MSYS2](https://www.msys2.org/) and, in a UCRT64 shell, run:
+
+```bash
+pacman -S --needed zip mingw-w64-ucrt-x86_64-{gcc,pkgconf,rust,gtk4,libadwaita,librsvg,adwaita-icon-theme}
+cargo build --release --locked
+scripts/package-windows.sh Aureus-windows-x86_64
+```
+
+### Releases
+
+Publishing a GitHub release builds the Flatpak bundles (x86_64 and aarch64)
+and the Windows zip, and attaches them to the release.
 
 ## Documentation
 
