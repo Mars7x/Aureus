@@ -22,7 +22,7 @@ layouts.
 - **Brand logos:** stock logos from Elbstream, which can be turned off in
   Preferences.
 - **Reports and backups:** PDF report export and portable backup and restore.
-- **Platform:** Linux, packaged as a Flatpak. Windows builds are
+- **Platform:** Linux, packaged as a Flatpak. Windows and macOS builds are
   experimental.
 
 ### Supported currencies
@@ -88,10 +88,23 @@ cargo build --release --locked
 scripts/package-windows.sh Aureus-windows-x86_64
 ```
 
+### macOS
+
+macOS builds are experimental. Each release includes zips for Apple Silicon
+(arm64) and Intel (x86_64): extract it and move `Aureus.app` to Applications.
+Aureus is not notarized, so the first time you open it, Control-click the app
+and choose Open. To build it yourself with [Homebrew](https://brew.sh/):
+
+```bash
+brew install gtk4 libadwaita librsvg adwaita-icon-theme hicolor-icon-theme dylibbundler pkgconf
+cargo build --release --locked
+scripts/package-macos.sh Aureus-macos
+```
+
 ### Releases
 
-Publishing a GitHub release builds the Flatpak bundles (x86_64 and aarch64)
-and the Windows zip, and attaches them to the release.
+Publishing a GitHub release builds the Flatpak bundles (x86_64 and aarch64),
+the Windows zip and the macOS zips, and attaches them to the release.
 
 ## Documentation
 
