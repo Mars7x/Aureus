@@ -78,20 +78,21 @@ cargo test
 
 ### Windows
 
-Windows builds are experimental. Each release includes a zip: extract it and
-run `bin\aureus.exe`. To build it yourself, install
-[MSYS2](https://www.msys2.org/) and, in a UCRT64 shell, run:
+Windows builds are experimental. Each release includes zips for x86_64 and
+ARM64: extract one and run `bin\aureus.exe`. To build it yourself, install
+[MSYS2](https://www.msys2.org/) and, in a UCRT64 shell (or CLANGARM64 on ARM,
+with the `mingw-w64-clang-aarch64-` packages and `clang` instead of `gcc`), run:
 
 ```bash
 pacman -S --needed zip mingw-w64-ucrt-x86_64-{gcc,pkgconf,rust,gtk4,libadwaita,librsvg,adwaita-icon-theme}
 cargo build --release --locked
-scripts/package-windows.sh Aureus-windows-x86_64
+scripts/package-windows.sh Aureus-windows
 ```
 
 ### macOS
 
-macOS builds are experimental. Each release includes zips for Apple Silicon
-(arm64) and Intel (x86_64): extract it and move `Aureus.app` to Applications.
+macOS builds are experimental and support Apple Silicon Macs. Each release
+includes a zip: extract it and move `Aureus.app` to Applications.
 Aureus is not notarized, so the first time you open it, Control-click the app
 and choose Open. To build it yourself with [Homebrew](https://brew.sh/):
 
@@ -104,7 +105,8 @@ scripts/package-macos.sh Aureus-macos
 ### Releases
 
 Publishing a GitHub release builds the Flatpak bundles (x86_64 and aarch64),
-the Windows zip and the macOS zips, and attaches them to the release.
+the Windows zips (x86_64 and ARM64) and the macOS zip (Apple Silicon), and
+attaches them to the release.
 
 ## Documentation
 
