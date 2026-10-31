@@ -25,10 +25,16 @@ cp target/release/aureus "${resources}/bin/aureus"
 cp -L "${brew_prefix}"/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so "${loaders}/"
 
 # The loader cache needs absolute paths, so the launcher rewrites this
-# template for the bundle's location on every start. It must be generated
-# before dylibbundler rewrites the loaders' library paths.
-gdk-pixbuf-query-loaders "${loaders}"/*.so \
-    | sed "s|${loaders}|@LOADERS@|g" > "${resources}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache.in"
+# template for the bundle's location on every start. Query Homebrew's own
+# loaders, which can still resolve their @rpath libraries, and point each entry
+# at the bundled copy with the same file name.
+cache_template="${resources}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache.in"
+gdk-pixbuf-query-loaders "${brew_prefix}"/lib/gdk-pixbuf-2.0/2.10.0/loaders/*.so \
+    | sed -E 's|^"[^"]*/(libpixbufloader[^"/]*)"|"@LOADERS@/\1"|' > "${cache_template}"
+if ! grep -q '"@LOADERS@/libpixbufloader_svg.so"' "${cache_template}"; then
+    echo "The SVG pixbuf loader is missing from the loader cache" >&2
+    exit 1
+fi
 
 # Copy every Homebrew dylib the executable and loaders use into
 # Contents/Frameworks and point them at the bundled copies. The loaders run
