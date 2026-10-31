@@ -44,18 +44,6 @@ NOK, PEN, PLN, SGD, ZAR, SEK, TWD, THB, TRY, BRL.
   <img width="360" alt="Dividends on mobile" src="docs/screenshots/dividends-mobile.png" />
 </div>
 
-## How it works
-
-1. **Storage.** Accounts, transactions, cash activity and corporate actions
-   are stored locally in SQLite. Changing the Portfolio Currency only changes
-   presentation; stored amounts and account currencies are never rewritten.
-2. **Market data.** Quotes, price history, search, dividends and splits come
-   from Yahoo Finance. Quotes are requested live; cached values are only an
-   offline fallback.
-3. **Exchange rates.** Current rates come from Yahoo Finance with Bank of
-   Canada as a fallback. Historical rates use Bank of Canada observations,
-   with Yahoo Finance filling gaps.
-
 ## Building and running
 
 You need Flatpak and `flatpak-builder` with the Flathub remote configured. The
