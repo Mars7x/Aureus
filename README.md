@@ -84,7 +84,4 @@ This is an independent project, not affiliated with or endorsed by Yahoo or
 the Bank of Canada. Market data and exchange rates are provided by their
 respective sources and may be delayed or incomplete.
 
-The libadwaita colour scheme is based on
-[Planify](https://flathub.org/apps/io.github.alainm23.planify).
-
 Licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
