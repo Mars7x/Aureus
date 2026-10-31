@@ -1,4 +1,4 @@
-name: Build Flatpak Release
+name: Build Release
 
 on:
   release:
@@ -7,9 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build"
+        description: "Tag or branch to build"
         required: true
-        default: "v1.3.0"
+      upload:
+        description: "Upload the builds to the GitHub release with this tag"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -18,8 +21,8 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
 
 jobs:
-  build:
-    name: Build ${{ matrix.arch }}
+  flatpak:
+    name: Flatpak ${{ matrix.arch }}
 
     strategy:
       fail-fast: false
@@ -51,16 +54,63 @@ jobs:
           cache-key: flatpak-builder-${{ matrix.arch }}-${{ github.sha }}
           artifact-name: Aureus-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.flatpak
 
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2025
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: zip
+          pacboy: >-
+            gcc:p
+            pkgconf:p
+            rust:p
+            gtk4:p
+            libadwaita:p
+            librsvg:p
+            adwaita-icon-theme:p
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: scripts/package-windows.sh "Aureus-${RELEASE_TAG}-windows-x86_64"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aureus-${{ env.RELEASE_TAG }}-windows-x86_64.zip
+          path: dist/Aureus-${{ env.RELEASE_TAG }}-windows-x86_64.zip
+          if-no-files-found: error
+
   upload:
     name: Upload release assets
-    needs: build
+    needs: [flatpak, windows]
+    # A Windows failure must not hold back the Flatpak assets of a release.
+    if: >-
+      always() &&
+      needs.flatpak.result == 'success' &&
+      (github.event_name == 'release' || inputs.upload)
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Download Flatpak artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: Aureus-*.flatpak
+          pattern: Aureus-*
           path: release-assets
           merge-multiple: true
 
@@ -68,7 +118,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          shopt -s nullglob
           gh release upload "${RELEASE_TAG}" \
             release-assets/*.flatpak \
+            release-assets/*.zip \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber

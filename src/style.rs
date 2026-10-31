@@ -118,35 +118,6 @@ list.dividend-history-list.boxed-list > row:last-child {
   border-bottom-left-radius: 12px;
   border-bottom-right-radius: 12px;
 }
-
-/* Stock pictures intentionally are not GtkButtons: native button chrome can
- * extend beyond a circular avatar. The control is constrained to the avatar
- * footprint, and only pointer hover adds a tint over the image itself. */
-.stock-picture-control,
-.stock-picture-control:hover,
-.stock-picture-control:focus,
-.stock-picture-control:focus-visible {
-  min-width: 0;
-  min-height: 0;
-  padding: 0;
-  margin: 0;
-  border: none;
-  border-radius: 9999px;
-  background: transparent;
-  background-image: none;
-  box-shadow: none;
-  outline: none;
-}
-
-.stock-picture-hover-tint {
-  border-radius: 9999px;
-  background-color: rgba(255, 255, 255, 0);
-  transition: background-color 120ms ease;
-}
-
-.stock-picture-control:hover .stock-picture-hover-tint {
-  background-color: rgba(255, 255, 255, 0.10);
-}
 "#;
 
 pub fn install() {

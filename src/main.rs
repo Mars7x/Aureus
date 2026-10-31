@@ -1,3 +1,6 @@
+// Release builds on Windows are GUI applications without a console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod allocation_ring;
 mod chart;
 mod currency;

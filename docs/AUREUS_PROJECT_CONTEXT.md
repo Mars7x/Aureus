@@ -52,7 +52,7 @@ Core capabilities:
 - Portfolio allocation
 - Portfolio history/performance from 1D through All
 - Stock search and watchlist
-- Brand logos for stocks, with optional custom stock pictures
+- Brand logos for stocks
 - Security-detail history from 1D through All
 - PDF reports
 - Portable backups
@@ -60,7 +60,6 @@ Core capabilities:
 
 Roadmap items that have been discussed but are not current behavior:
 
-- Windows support
 - Android support
 
 Do not treat roadmap items as implemented.
@@ -165,7 +164,7 @@ Yahoo-specific implementation for:
 - `dividend_chart.rs` — dividend chart
 - `sparkline.rs` — compact watchlist/history visuals
 - `report.rs` — Cairo PDF reports
-- `stock_image.rs` — custom stock pictures and fetched brand logos, with decode/size safety limits
+- `stock_image.rs` — fetched brand logos, with decode/size safety limits
 - `storage.rs` — app data/cache paths and durable file operations
 - `style.rs` / `aureus-theme.css` — theme installation and layout CSS
 
@@ -489,26 +488,19 @@ Report totals and cross-account values must follow Portfolio Currency and use hi
 
 Do not silently invent a historical conversion when required rate data cannot be established reliably.
 
-## 16. Stock pictures and brand logos
+## 16. Brand logos
 
-Each stock avatar shows, in order of precedence:
-
-1. the user's custom stock picture (stored in the data directory, `stock-pictures/`)
-2. a cached brand logo, when the `Show Brand Logos` preference is on
-3. the libadwaita initials fallback
-
-Brand logos:
+Each stock avatar shows a cached brand logo when the `Show Brand Logos` preference is on, and otherwise the libadwaita initials fallback. Choosing a custom stock picture was removed; old pictures left in the data directory's `stock-pictures/` folder are no longer read and are not deleted.
 
 - Source: Elbstream (formerly Parqet's logo API), `https://api.elbstream.com/logos/symbol/<provider symbol>?format=png&size=256`. It accepts Yahoo provider symbols, including exchange suffixes such as `RY.TO` and `NTOA.MU`. No API key is used.
 - Elbstream is credited in the About dialog and linked from the `Show Brand Logos` preference. By the developer's decision, pages that show logos carry no per-page "Logos by Elbstream" label, although Elbstream's free tier asks for a visible link wherever logos appear.
-- Preference key: `fetch-brand-logos`, on by default. When it is off, nothing is requested and cached logos are hidden. Custom pictures are unaffected.
-- No request is made for stocks that have a custom picture.
+- Preference key: `fetch-brand-logos`, on by default. When it is off, nothing is requested and cached logos are hidden.
 - Logos are rebuildable cache data in the XDG cache directory (`brand-logos/`), not portable financial records, and are not in backups.
 - Cached logos refresh after 30 days. A 404 is Elbstream's authoritative "no logo" answer: it is remembered with a `.missing` marker for 7 days. Transient failures are not remembered and retry on the next display.
-- Downloads are limited to 2 MB, decoded under the same limits as custom pictures and re-encoded as a bounded PNG before caching.
+- Downloads are limited to 2 MB, decoded with the `image` crate under fixed size limits and re-encoded as a bounded PNG before caching.
 - Requests run on a background thread with one in-flight request per symbol. When a logo arrives, every avatar for that symbol in the window updates.
-- Allocation colors use the displayed picture, so they follow the brand logo when no custom picture exists.
-- The UI keeps decoded pictures (texture plus allocation colors) in an in-memory cache keyed by picture key, including a "no picture" entry. Anything that changes a picture on disk or what should be shown must invalidate it: saving or deleting a custom picture, every finished logo request (a 404 can remove a cached logo), and toggling the brand-logo preference.
+- Allocation colors follow the brand logo.
+- The UI keeps decoded logos (texture plus allocation colors) in an in-memory cache keyed by picture key, including a "no logo" entry. It must be invalidated after every finished logo request (a 404 can remove a cached logo) and when the brand-logo preference changes.
 
 ## 17. Packaging and distribution
 
@@ -523,6 +515,24 @@ Primary packaging is Flatpak with:
 - network runtime permission
 
 `build-flatpak.sh` is a convenience wrapper around `flatpak-builder` and uses `build-dir`.
+
+Windows builds are experimental:
+
+- Built in CI with MSYS2 UCRT64 (GTK4, libadwaita, librsvg, Adwaita icon theme, Rust).
+- `scripts/package-windows.sh` turns the release build into a portable zip that mirrors the MSYS2 prefix (`bin/`, `lib/`, `share/`): the executable and every MSYS2 DLL it and the GdkPixbuf loaders link against, the pixbuf loaders, compiled GSettings schemas, the Adwaita icon theme and the Aureus icons. Users run `bin\aureus.exe`.
+- Data lives in `%LOCALAPPDATA%\io.github.Mars7x.Aureus` (`storage::data_root` adds the app ID outside Flatpak).
+- Release builds use the Windows GUI subsystem, so no console window opens.
+- Keep code portable: no Linux-only crates or paths outside `cfg(target_os = "linux")`. Glycin was removed together with custom stock pictures because its sandbox is Linux-only.
+
+### Release workflow
+
+`.github/workflows/release.yml` runs when a GitHub release is published, or manually with a tag or branch:
+
+- Flatpak bundles for x86_64 and aarch64 in the GNOME 50 Flathub container.
+- A Windows x86_64 zip from MSYS2.
+- The upload job attaches all builds to the release. It runs when the Flatpak builds succeed, so a Windows failure cannot hold back the Flatpak assets; the zip is attached only when it was built. A manual run with `upload` off only produces workflow artifacts, which is how to test a branch.
+
+To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub release with a `vX.Y.Z` tag.
 
 Aureus is not currently being uploaded to Flathub.
 
@@ -602,7 +612,6 @@ Before accepting a change in these areas, explicitly verify the relevant items.
 - Pull-to-refresh and Ctrl+R continue to work.
 - Portfolio range persistence remains intact.
 - No unrelated CSS/color regressions.
-- Custom stock pictures still take priority over brand logos.
 
 ## 21. Working style for future changes
 

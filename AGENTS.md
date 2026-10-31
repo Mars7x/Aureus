@@ -22,7 +22,7 @@ If the current source and these documents ever disagree, the current source is a
 - License: GPL-3.0-or-later
 - Current release line: `1.3.0`
 - Native Rust application using GTK4 and libadwaita.
-- Flatpak is the primary packaging target.
+- Flatpak is the primary packaging target. Windows zips are built in CI as an experimental target.
 - Current development environment is Fedora Silverblue with GNOME Builder.
 
 Do not rename the application, app ID, binary, package, or repository unless explicitly requested.
@@ -117,10 +117,12 @@ Aureus supports exactly these 25 selectable account/Portfolio Currency codes:
 - `src/market_providers/yfinance.rs` — Yahoo implementation, quote/history/search/dividend/split parsing, exact quote-page range-bar parsing.
 - `src/chart.rs`, `src/dividend_chart.rs`, `src/sparkline.rs`, `src/allocation_ring.rs` — custom visual widgets.
 - `src/report.rs` — PDF report generation.
-- `src/stock_image.rs` — stock image handling and safety limits.
+- `src/stock_image.rs` — brand-logo fetching, caching and image safety limits.
 - `src/storage.rs` — application data/cache paths and durable file handling.
 - `src/style.rs` / `src/aureus-theme.css` — Aureus theme and minimal layout styling.
 - `flatpak/io.github.Mars7x.Aureus.yml` — Flatpak build manifest.
+- `scripts/package-windows.sh` — bundles an MSYS2 release build into the Windows zip.
+- `.github/workflows/release.yml` — builds Flatpak and Windows release assets when a release is published.
 - `data/io.github.Mars7x.Aureus.desktop` — desktop launcher metadata.
 - `data/io.github.Mars7x.Aureus.metainfo.xml` — optional AppStream metadata for the current distribution model; keep it minimal.
 
@@ -146,7 +148,7 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-For Flatpak packaging, use the existing manifest or `./build-flatpak.sh`. GNOME Builder is also a supported build path.
+For Flatpak packaging, use the existing manifest or `./build-flatpak.sh`. GNOME Builder is also a supported build path. Keep the code portable to Windows: Linux-only crates or paths must stay behind `cfg(target_os = "linux")`.
 
 When metadata is changed and the tools are available, also validate the desktop/AppStream files. Aureus is not currently targeting Flathub, so do not expand metadata solely to satisfy optional Flathub presentation conventions unless requested.
 

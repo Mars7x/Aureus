@@ -187,8 +187,8 @@ fn stock_picture(provider_symbol: &str) -> Option<StockPicture> {
     picture
 }
 
-/// Must be called whenever a custom picture or brand logo changes on disk, or
-/// when the brand-logo preference changes what should be displayed.
+/// Must be called whenever a brand logo changes on disk, or when the
+/// brand-logo preference changes what should be displayed.
 fn invalidate_stock_picture(provider_symbol: &str) {
     let key = crate::stock_image::picture_key(provider_symbol);
     STOCK_PICTURES.with(|cache| cache.borrow_mut().remove(&key));
@@ -212,8 +212,7 @@ fn stock_image_colors(provider_symbol: &str) -> Vec<(f64, f64, f64)> {
 }
 
 /// Downloads a missing or stale brand logo in the background, then updates
-/// every avatar for that symbol still in the window. Custom pictures always
-/// win, so no request is made for stocks that have one.
+/// every avatar for that symbol still in the window.
 fn request_brand_logo(avatar: &Avatar, provider_symbol: &str) {
     if !crate::stock_image::brand_logo_needs_fetch(provider_symbol)
         || !crate::stock_image::begin_brand_logo_request(provider_symbol)
@@ -303,198 +302,6 @@ fn refresh_stock_picture_widgets(root: &gtk::Widget, provider_symbol: &str) {
             widgets.push(current);
         }
     }
-}
-
-fn present_choose_stock_picture(
-    parent: &ApplicationWindow,
-    refs: UiRefs,
-    provider_symbol: String,
-) {
-    let parent = parent.clone();
-    glib::MainContext::default().spawn_local(async move {
-        let dialog = FileDialog::new();
-        dialog.set_title("Choose Stock Picture");
-        dialog.set_accept_label(Some("Choose"));
-
-        // Build the chooser filter from the image loaders that are actually
-        // configured in Glycin at runtime. Unsupported file types therefore
-        // never appear as selectable stock pictures.
-        let supported_mime_types = glycin::Loader::supported_mime_types().await;
-        if supported_mime_types.is_empty() {
-            refs.toast_overlay
-                .add_toast(Toast::new("No supported image loaders are available"));
-            return;
-        }
-
-        let image_filter = gtk::FileFilter::new();
-        image_filter.set_name(Some("Supported Images"));
-        for mime_type in supported_mime_types {
-            image_filter.add_mime_type(mime_type.as_str());
-        }
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&image_filter);
-        dialog.set_filters(Some(&filters));
-        dialog.set_default_filter(Some(&image_filter));
-
-        let Ok(file) = dialog.open_future(Some(&parent)).await else {
-            return;
-        };
-        let Some(path) = file.path() else {
-            refs.toast_overlay
-                .add_toast(Toast::new("The selected picture could not be opened"));
-            return;
-        };
-
-        match crate::stock_image::save_stock_image(&provider_symbol, &path).await {
-            Ok(data) => {
-                invalidate_stock_picture(&provider_symbol);
-                let bytes = glib::Bytes::from_owned(data.bytes);
-                match gtk::gdk::Texture::from_bytes(&bytes) {
-                    Ok(_) => {
-                        let root: gtk::Widget = parent.clone().upcast();
-                        refresh_stock_picture_widgets(&root, &provider_symbol);
-                        refs.refresh();
-                        refs.toast_overlay
-                            .add_toast(Toast::new("Stock picture updated"));
-                    }
-                    Err(error) => refs.toast_overlay.add_toast(Toast::new(
-                        &format!("Could not display stock picture: {error}"),
-                    )),
-                }
-            }
-            Err(error) => refs.toast_overlay.add_toast(Toast::new(&format!(
-                "Could not use stock picture: {error}"
-            ))),
-        }
-    });
-}
-
-fn present_stock_picture_actions(
-    parent: &ApplicationWindow,
-    refs: UiRefs,
-    provider_symbol: String,
-) {
-    let has_picture = crate::stock_image::has_stock_image(&provider_symbol);
-    let dialog = AlertDialog::builder()
-        .heading("Stock Picture")
-        .body(if has_picture {
-            "Select a replacement picture or delete the current one"
-        } else {
-            "Select a picture for this stock"
-        })
-        .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("select", "Select Picture");
-    if has_picture {
-        dialog.add_response("delete", "Delete Picture");
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-    }
-    dialog.set_default_response(Some("select"));
-    dialog.set_close_response("cancel");
-
-    {
-        let parent_weak = parent.downgrade();
-        let refs = refs.clone();
-        let provider_symbol = provider_symbol.clone();
-        dialog.connect_response(Some("select"), move |_, _| {
-            if let Some(parent) = parent_weak.upgrade() {
-                present_choose_stock_picture(&parent, refs.clone(), provider_symbol.clone());
-            }
-        });
-    }
-
-    if has_picture {
-        let parent_weak = parent.downgrade();
-        let refs = refs.clone();
-        let provider_symbol = provider_symbol.clone();
-        dialog.connect_response(Some("delete"), move |_, _| {
-            match crate::stock_image::remove_stock_image(&provider_symbol) {
-                Ok(_) => {
-                    invalidate_stock_picture(&provider_symbol);
-                    if let Some(parent) = parent_weak.upgrade() {
-                        let root: gtk::Widget = parent.upcast();
-                        refresh_stock_picture_widgets(&root, &provider_symbol);
-                    }
-                    refs.refresh();
-                    refs.toast_overlay.add_toast(Toast::new("Stock picture deleted"));
-                }
-                Err(error) => refs.toast_overlay.add_toast(Toast::new(&format!(
-                    "Could not delete stock picture: {error}"
-                ))),
-            }
-        });
-    }
-
-    dialog.present(Some(parent));
-}
-
-fn stock_picture_control(avatar: &Avatar, size: i32) -> Overlay {
-    avatar.add_css_class("stock-picture-avatar");
-    avatar.set_size_request(size, size);
-
-    let hover_tint = GtkBox::new(Orientation::Horizontal, 0);
-    hover_tint.set_can_target(false);
-    hover_tint.set_size_request(size, size);
-    hover_tint.set_halign(Align::Center);
-    hover_tint.set_valign(Align::Center);
-    hover_tint.add_css_class("stock-picture-hover-tint");
-
-    // GtkBox stretches children across its cross-axis by default. The previous
-    // Overlay therefore grew to the full hero-card height, and the focus tint
-    // exposed that stretched allocation as the tall gray oval around the avatar.
-    // Keep the interactive overlay physically locked to the avatar dimensions;
-    // hover feedback can then never paint outside the circular picture.
-    let overlay = Overlay::new();
-    overlay.set_child(Some(avatar));
-    overlay.add_overlay(&hover_tint);
-    overlay.set_size_request(size, size);
-    overlay.set_halign(Align::Start);
-    overlay.set_valign(Align::Center);
-    overlay.set_hexpand(false);
-    overlay.set_vexpand(false);
-    overlay.set_tooltip_text(Some("Change stock picture"));
-    overlay.set_focusable(true);
-    overlay.set_overflow(gtk::Overflow::Hidden);
-    overlay.add_css_class("stock-picture-control");
-    overlay
-}
-
-fn connect_stock_picture_control(control: &Overlay, refs: UiRefs, provider_symbol: String) {
-    let click = gtk::GestureClick::new();
-    {
-        let control = control.clone();
-        let refs = refs.clone();
-        let provider_symbol = provider_symbol.clone();
-        click.connect_released(move |_, _, _, _| {
-            let Some(root) = control.root() else {
-                return;
-            };
-            let Ok(window) = root.downcast::<ApplicationWindow>() else {
-                return;
-            };
-            present_stock_picture_actions(&window, refs.clone(), provider_symbol.clone());
-        });
-    }
-    control.add_controller(click);
-
-    let keys = EventControllerKey::new();
-    {
-        let control = control.clone();
-        keys.connect_key_pressed(move |_, key, _, _| {
-            if key != gtk::gdk::Key::Return && key != gtk::gdk::Key::KP_Enter {
-                return glib::Propagation::Proceed;
-            }
-            let Some(root) = control.root() else {
-                return glib::Propagation::Stop;
-            };
-            let Ok(window) = root.downcast::<ApplicationWindow>() else {
-                return glib::Propagation::Stop;
-            };
-            present_stock_picture_actions(&window, refs.clone(), provider_symbol.clone());
-            glib::Propagation::Stop
-        });
-    }
-    control.add_controller(keys);
 }
 
 fn allocation_colors_collide(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
@@ -6960,7 +6767,7 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     let brand_logos_row = SwitchRow::new();
     brand_logos_row.set_title("Show Brand Logos");
     brand_logos_row.set_subtitle(&format!(
-        "Download stock logos from <a href=\"{}\">Elbstream</a>. Custom stock pictures always take priority",
+        "Download stock logos from <a href=\"{}\">Elbstream</a>",
         crate::stock_image::BRAND_LOGO_SOURCE_URL
     ));
     brand_logos_row.set_subtitle_selectable(false);
@@ -7581,8 +7388,9 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         .css_classes(["card", "detail-hero"])
         .build();
     let stock_picture = stock_avatar(&asset.provider_symbol, &asset.code, 56);
-    let stock_picture_control = stock_picture_control(&stock_picture, 56);
-    hero.append(&stock_picture_control);
+    stock_picture.set_halign(Align::Start);
+    stock_picture.set_valign(Align::Center);
+    hero.append(&stock_picture);
     let hero_text = GtkBox::builder()
         .orientation(Orientation::Vertical)
         .spacing(5)
@@ -7775,12 +7583,6 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         shortcut_refresh: shortcut_refresh.clone(),
         generation: Rc::new(Cell::new(0)),
     };
-
-    connect_stock_picture_control(
-        &stock_picture_control,
-        refs.clone(),
-        asset.provider_symbol.clone(),
-    );
 
     {
         let refs = refs.clone();
@@ -8864,8 +8666,9 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         .css_classes(["card", "detail-hero"])
         .build();
     let stock_picture = stock_avatar(&position.provider_symbol, &position.code, 56);
-    let stock_picture_control = stock_picture_control(&stock_picture, 56);
-    hero.append(&stock_picture_control);
+    stock_picture.set_halign(Align::Start);
+    stock_picture.set_valign(Align::Center);
+    hero.append(&stock_picture);
     let hero_text = GtkBox::builder()
         .orientation(Orientation::Vertical)
         .spacing(5)
@@ -9146,12 +8949,6 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
         pull_refresh: pull_refresh.clone(),
         shortcut_refresh: shortcut_refresh.clone(),
     };
-
-    connect_stock_picture_control(
-        &stock_picture_control,
-        refs.clone(),
-        position.provider_symbol.clone(),
-    );
 
     {
         let refs = refs.clone();

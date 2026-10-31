@@ -7,11 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use image::GenericImageView;
-use gtk::gdk::prelude::TextureExt;
 
 use crate::storage;
 
-const MAX_STOCK_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STOCK_IMAGE_DIMENSION: u32 = 4096;
 const MAX_STOCK_IMAGE_PIXELS: u64 = 16_777_216;
 const MAX_STOCK_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
@@ -35,21 +33,8 @@ pub struct StockImageData {
     pub colors: Vec<(f64, f64, f64)>,
 }
 
-pub fn load_stock_image(provider_symbol: &str) -> Result<Option<StockImageData>, String> {
-    let path = stock_image_path(provider_symbol)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path).map_err(|error| format!("Could not read stock picture: {error}"))?;
-    stock_image_from_bytes(bytes).map(Some)
-}
-
-/// Picture shown for a stock: the user's own picture always wins, then a
-/// cached brand logo when brand logos are enabled.
+/// Cached brand logo shown for a stock when brand logos are enabled.
 pub fn load_display_image(provider_symbol: &str) -> Option<StockImageData> {
-    if let Ok(Some(image)) = load_stock_image(provider_symbol) {
-        return Some(image);
-    }
     if !brand_logos_enabled() {
         return None;
     }
@@ -70,7 +55,7 @@ pub fn set_brand_logos_enabled(enabled: bool) {
 /// refreshed occasionally, and symbols the service does not know are retried
 /// only after a longer delay.
 pub fn brand_logo_needs_fetch(provider_symbol: &str) -> bool {
-    if !brand_logos_enabled() || has_stock_image(provider_symbol) {
+    if !brand_logos_enabled() {
         return false;
     }
     let (Ok(logo), Ok(missing)) = (
@@ -163,8 +148,8 @@ pub fn fetch_brand_logo(provider_symbol: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Decodes untrusted downloaded bytes under the same limits as user pictures
-/// and re-encodes them as a bounded PNG, so the cache never holds raw responses.
+/// Decodes untrusted downloaded bytes under fixed size limits and re-encodes
+/// them as a bounded PNG, so the cache never holds raw responses.
 fn normalize_brand_logo(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let decoded = decode_raster_with_limits(bytes)
         .ok_or_else(|| "The brand logo is not a supported image".to_string())?;
@@ -197,132 +182,12 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn save_stock_image(
-    provider_symbol: &str,
-    source: &Path,
-) -> Result<StockImageData, String> {
-    let metadata = fs::metadata(source)
-        .map_err(|error| format!("Could not read selected picture: {error}"))?;
-    if metadata.len() > MAX_STOCK_IMAGE_BYTES as u64 {
-        return Err("The selected picture is larger than 8 MB".into());
-    }
-
-    // Glycin is the GNOME image-loading path. It detects the real file type,
-    // decodes it in its loader sandbox, and handles raster and vector formats
-    // (including SVG) through the configured runtime loaders.
-    let file = gtk::gio::File::for_path(source);
-
-    // Prefer Glycin's normal sandbox selection. In installed Flatpaks this
-    // normally uses flatpak-spawn for an additional image-loader sandbox.
-    // Local Builder/flatpak-builder development runs are not always installed
-    // under the final app ID, so that nested sandbox can fail to launch even
-    // though the configured image loader itself is available. If that happens,
-    // retry Glycin without the nested sandbox; Aureus is still contained by its
-    // surrounding Flatpak sandbox.
-    let glycin_image = match glycin::Loader::new(file.clone()).load().await {
-        Ok(image) => image,
-        Err(sandbox_error) => {
-            let mut fallback_loader = glycin::Loader::new(file);
-            fallback_loader.sandbox_selector(glycin::SandboxSelector::NotSandboxed);
-            fallback_loader.load().await.map_err(|loader_error| {
-                format!(
-                    "Glycin could not load this image (sandboxed: {sandbox_error}; fallback: {loader_error})"
-                )
-            })?
-        }
-    };
-
-    let details = glycin_image.details();
-    validate_dimensions(details.width(), details.height())?;
-    let (target_width, target_height) = fitted_dimensions(
-        details.width(),
-        details.height(),
-        STORED_STOCK_IMAGE_DIMENSION,
-    );
-
-    let frame = glycin_image
-        .specific_frame(glycin::FrameRequest::new().scale(target_width, target_height))
-        .await
-        .map_err(|_| "Could not decode the selected picture".to_string())?;
-    validate_dimensions(frame.width(), frame.height())?;
-
-    // FrameRequest scaling is advisory, so normalize once more after converting
-    // the Glycin frame to PNG. This guarantees stored pictures remain bounded.
-    let texture = frame.texture();
-    let png = texture.save_to_png_bytes();
-    let decoded = decode_raster_with_limits(png.as_ref())
-        .ok_or_else(|| "Could not prepare the selected picture".to_string())?;
-    validate_image_dimensions(&decoded)?;
-
-    let normalized_image = if decoded.width() > STORED_STOCK_IMAGE_DIMENSION
-        || decoded.height() > STORED_STOCK_IMAGE_DIMENSION
-    {
-        decoded.thumbnail(STORED_STOCK_IMAGE_DIMENSION, STORED_STOCK_IMAGE_DIMENSION)
-    } else {
-        decoded
-    };
-    let colors = dominant_colors(&normalized_image);
-    let mut normalized = Cursor::new(Vec::new());
-    normalized_image
-        .write_to(&mut normalized, image::ImageFormat::Png)
-        .map_err(|error| format!("Could not prepare stock picture: {error}"))?;
-    let image = StockImageData {
-        bytes: normalized.into_inner(),
-        colors,
-    };
-
-    let path = stock_image_path(provider_symbol)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Could not create stock picture folder: {error}"))?;
-    }
-    let temporary = path.with_extension("img.tmp");
-    fs::write(&temporary, &image.bytes)
-        .map_err(|error| format!("Could not save stock picture: {error}"))?;
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(format!("Could not finish saving stock picture: {error}"));
-    }
-    Ok(image)
-}
-
-pub fn has_stock_image(provider_symbol: &str) -> bool {
-    stock_image_path(provider_symbol)
-        .map(|path| path.exists())
-        .unwrap_or(false)
-}
-
-pub fn remove_stock_image(provider_symbol: &str) -> Result<bool, String> {
-    let path = stock_image_path(provider_symbol)?;
-    if !path.exists() {
-        return Ok(false);
-    }
-    fs::remove_file(path).map_err(|error| format!("Could not delete stock picture: {error}"))?;
-    Ok(true)
-}
-
 fn stock_image_from_bytes(bytes: Vec<u8>) -> Result<StockImageData, String> {
     let image = decode_raster_with_limits(&bytes)
-        .ok_or_else(|| "Could not decode saved stock picture".to_string())?;
+        .ok_or_else(|| "Could not decode cached brand logo".to_string())?;
     validate_image_dimensions(&image)?;
     let colors = dominant_colors(&image);
     Ok(StockImageData { bytes, colors })
-}
-
-fn fitted_dimensions(width: u32, height: u32, maximum: u32) -> (u32, u32) {
-    if width <= maximum && height <= maximum {
-        return (width.max(1), height.max(1));
-    }
-
-    if width >= height {
-        let scaled_height = ((u64::from(height) * u64::from(maximum)) / u64::from(width))
-            .max(1) as u32;
-        (maximum, scaled_height)
-    } else {
-        let scaled_width = ((u64::from(width) * u64::from(maximum)) / u64::from(height))
-            .max(1) as u32;
-        (scaled_width, maximum)
-    }
 }
 
 fn stock_image_limits() -> image::Limits {
@@ -354,7 +219,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
         || height > MAX_STOCK_IMAGE_DIMENSION
         || pixels > MAX_STOCK_IMAGE_PIXELS
     {
-        return Err("The selected picture is too large to render safely".into());
+        return Err("The image is too large to render safely".into());
     }
     Ok(())
 }
@@ -436,14 +301,6 @@ pub fn picture_key(provider_symbol: &str) -> String {
             }
         })
         .collect()
-}
-
-fn stock_image_path(provider_symbol: &str) -> Result<PathBuf, String> {
-    let safe = picture_key(provider_symbol);
-    if safe.is_empty() {
-        return Err("Missing stock symbol".into());
-    }
-    Ok(storage::stock_pictures_dir().join(format!("{safe}.img")))
 }
 
 fn brand_logo_path(provider_symbol: &str) -> Result<PathBuf, String> {

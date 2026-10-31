@@ -21,10 +21,6 @@ pub fn database_path() -> PathBuf {
     data_root().join("portfolio.db")
 }
 
-pub fn stock_pictures_dir() -> PathBuf {
-    data_root().join("stock-pictures")
-}
-
 /// Root for rebuildable Aureus caches. Like `data_root`, Flatpak already
 /// namespaces the XDG cache directory per application.
 pub fn cache_root() -> PathBuf {

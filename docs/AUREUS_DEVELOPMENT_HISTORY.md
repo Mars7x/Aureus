@@ -461,3 +461,9 @@ A performance pass measured a release build against a copy of a real portfolio. 
 Decoded pictures are now cached in memory per symbol and invalidated whenever a picture changes, which brings that step to about 0.02 ms per cached avatar. Chart drawing was already bounded (point reduction and binary-search hover) and was left as is.
 
 The same pass fixed a brand-logo bug: after the preference was toggled, open avatars requested logos using their sanitized picture key, so a symbol such as `^GSPC` would be requested as `_GSPC`. Logo requests now come only from page rebuilds, which know the real provider symbol.
+
+## 24. Custom pictures removed, Windows builds, release workflow
+
+Choosing a custom stock picture was removed at the developer's request; brand logos are now the only stock pictures. This also removed the Glycin dependency, whose sandboxed loaders (libseccomp, memfd, nix) only build on Linux and were the main obstacle to a Windows build. Brand logos already decoded with the `image` crate.
+
+Windows builds were added as an experimental target: MSYS2 UCRT64 builds the release binary and `scripts/package-windows.sh` bundles it with its DLLs, GdkPixbuf loaders, schemas and icons. The release workflow was renamed from `flatpak-release.yml` to `release.yml`, gained the Windows job, and can be run manually without uploading to test a branch. The Windows build had not yet been run in CI or tested on Windows when this was written.
