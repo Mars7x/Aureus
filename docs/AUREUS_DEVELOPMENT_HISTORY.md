@@ -437,3 +437,17 @@ Brand logos were the remaining roadmap item after 1.3.0. Sources evaluated:
 - Elbstream (Parqet's logo API, which moved from `assets.parqet.com` to `api.elbstream.com`): no key, square avatar-ready tiles, accepts Yahoo provider symbols with exchange suffixes (RY.TO, NTOA.MU as Nintendo, XEQT.TO as iShares, BRK-B), and returns a clean 404 for unknown symbols. The free tier requires a visible link to Elbstream wherever logos appear.
 
 The user chose Elbstream, with a `Show Brand Logos` preference that is on by default. Fetching sends held and watched symbols to Elbstream, which is why it is a preference. Custom stock pictures always take priority, logos are rebuildable cache data, and each page that shows logos carries the attribution. See section 16 of the project context for the current rules.
+
+## 22. Middle-dot separators removed
+
+The UI used " · " to join many pieces of text (upcoming cards, holding rows, quote
+status, dividend notes, activity rows, pickers). The developer felt this read as
+generated rather than designed. Separators were replaced by structure first
+(title/subtitle splits, separate coloured labels such as search results' daily change)
+and plain wording second (commas, parentheses, "in"/"on").
+
+Holding transfers had been writing `Name · Transfer to X` into the transaction name,
+and because derived positions and reports take their name from the latest
+transaction, a transferred holding could display that note as its security name. New
+transfers write `Name (transfer to X)`, derived position and report names strip the
+note, and older stored notes are reworded only at display time.

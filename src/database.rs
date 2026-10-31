@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::currency;
 use crate::model::{
-    Account, CashEntry, DividendEvent, FxRate, NewAccount, NewTransaction, NewWatchlistItem, Position,
-    PricePoint, SplitEvent, Transaction, WatchlistItem,
+    security_name, transfer_transaction_name, Account, CashEntry, DividendEvent, FxRate, NewAccount,
+    NewTransaction, NewWatchlistItem, Position, PricePoint, SplitEvent, Transaction, WatchlistItem,
 };
 use crate::storage;
 
@@ -902,7 +902,7 @@ impl Database {
                         code: code.trim().to_ascii_uppercase(),
                         exchange: exchange.trim().to_ascii_uppercase(),
                         provider_symbol: symbol.clone(),
-                        name: name.trim().to_string(),
+                        name: security_name(&kind, name.trim()),
                         currency: currency.trim().to_ascii_uppercase(),
                         shares: 0.0,
                         cost_basis: 0.0,
@@ -910,7 +910,7 @@ impl Database {
                     state.code = code.trim().to_ascii_uppercase();
                     state.exchange = exchange.trim().to_ascii_uppercase();
                     state.provider_symbol = symbol;
-                    state.name = name.trim().to_string();
+                    state.name = security_name(&kind, name.trim());
                     state.currency = currency.trim().to_ascii_uppercase();
 
                     match kind.as_str() {
@@ -1838,7 +1838,7 @@ impl Database {
                     &position.code,
                     &position.exchange,
                     &position.provider_symbol,
-                    format!("{} · Transfer to {}", position.name, to_name),
+                    transfer_transaction_name(&position.name, "to", &to_name),
                     trade_date.trim(),
                     timestamp,
                     shares,
@@ -1857,7 +1857,7 @@ impl Database {
                     &position.code,
                     &position.exchange,
                     &position.provider_symbol,
-                    format!("{} · Transfer from {}", position.name, from_name),
+                    transfer_transaction_name(&position.name, "from", &from_name),
                     trade_date.trim(),
                     timestamp,
                     shares,

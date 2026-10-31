@@ -193,9 +193,56 @@ pub fn convert_currency(
     Some(value * from_cad / to_cad)
 }
 
+/// Holding transfers store the counterpart account after the security name.
+/// Older releases wrote `Name · Transfer to X`; current releases write
+/// `Name (transfer to X)`. Returns the security name, direction and account.
+fn split_transfer_note(name: &str) -> Option<(&str, &'static str, &str)> {
+    for direction in ["to", "from"] {
+        let legacy = format!(" · Transfer {direction} ");
+        if let Some(index) = name.rfind(&legacy) {
+            return Some((&name[..index], direction, &name[index + legacy.len()..]));
+        }
+        let current = format!(" (transfer {direction} ");
+        if let (Some(index), Some(inner)) = (name.rfind(&current), name.strip_suffix(')')) {
+            if index + current.len() <= inner.len() {
+                return Some((&name[..index], direction, &inner[index + current.len()..]));
+            }
+        }
+    }
+    None
+}
+
+pub fn transfer_transaction_name(security_name: &str, direction: &str, account: &str) -> String {
+    format!("{security_name} (transfer {direction} {account})")
+}
+
+/// Security name without any transfer note, for derived positions and reports.
+pub fn security_name(transaction_type: &str, name: &str) -> String {
+    if !matches!(transaction_type, "TRANSFER_IN" | "TRANSFER_OUT") {
+        return name.to_string();
+    }
+    split_transfer_note(name)
+        .map(|(security, _, _)| security.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Stored transaction names shown in the UI. Legacy transfer notes are
+/// presented in the current wording; the stored record is never rewritten.
+pub fn display_transaction_name(name: &str) -> String {
+    match split_transfer_note(name) {
+        Some((security, direction, account)) => {
+            transfer_transaction_name(security, direction, account)
+        }
+        None => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{convert_currency, FxRates, Position};
+    use super::{
+        convert_currency, display_transaction_name, security_name, transfer_transaction_name, FxRates,
+        Position,
+    };
 
     fn position() -> Position {
         Position {
@@ -235,5 +282,29 @@ mod tests {
         assert_eq!(convert_currency(42.0, "CAD", "CAD", &rates), Some(42.0));
         assert_eq!(convert_currency(0.0, "JPY", "CAD", &rates), Some(0.0));
         assert_eq!(convert_currency(42.0, "JPY", "CAD", &rates), None);
+    }
+
+    #[test]
+    fn transfer_notes_split_from_security_names() {
+        let legacy = "Vanguard S&P 500 Index ETF · Transfer to RRSP";
+        let current = "Vanguard S&P 500 Index ETF (transfer from TFSA)";
+        assert_eq!(security_name("TRANSFER_OUT", legacy), "Vanguard S&P 500 Index ETF");
+        assert_eq!(security_name("TRANSFER_IN", current), "Vanguard S&P 500 Index ETF");
+        assert_eq!(
+            display_transaction_name(legacy),
+            "Vanguard S&P 500 Index ETF (transfer to RRSP)"
+        );
+        assert_eq!(display_transaction_name(current), current);
+        assert_eq!(
+            transfer_transaction_name("Name", "from", "TFSA"),
+            "Name (transfer from TFSA)"
+        );
+    }
+
+    #[test]
+    fn ordinary_names_are_left_alone() {
+        assert_eq!(security_name("BUY", "Acme (transfer to X)"), "Acme (transfer to X)");
+        assert_eq!(security_name("TRANSFER_IN", "Acme Holdings"), "Acme Holdings");
+        assert_eq!(display_transaction_name("Acme Holdings"), "Acme Holdings");
     }
 }

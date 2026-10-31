@@ -28,7 +28,7 @@ use crate::fx::{self, FxQuote};
 use crate::market_data::{self, DividendHistory, History, HistoryRange, Quote, SearchResult};
 use crate::sparkline::Sparkline;
 use crate::model::{
-    convert_currency, Account, CashEntry, DividendEvent, FxRates, NewAccount, NewTransaction, NewWatchlistItem,
+    convert_currency, display_transaction_name, security_name, Account, CashEntry, DividendEvent, FxRates, NewAccount, NewTransaction, NewWatchlistItem,
     Position, PricePoint, SplitEvent, Transaction, WatchlistItem,
 };
 
@@ -864,7 +864,7 @@ impl UiRefs {
             self.investment_return.set_label("—");
             self.cost_basis.set_label("—");
             self.quote_note
-                .set_label("Reconciling restored portfolio · holdings temporarily hidden");
+                .set_label("Reconciling restored portfolio, holdings temporarily hidden");
 
             // Watchlist data is independent of portfolio share accounting, so it
             // remains usable while restored holdings are being reconciled.
@@ -2743,11 +2743,11 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
         for (timestamp, amount, estimated) in &future_ex {
             items.push((
                 *timestamp,
-                format!("{} · Ex-dividend", position.code),
+                position.code.clone(),
                 if *estimated {
-                    format!("Estimated ex-dividend · {}", format_distribution_date(*timestamp))
+                    format!("Ex-dividend {} (estimated)", format_distribution_date(*timestamp))
                 } else {
-                    format!("Ex-dividend date · {}", format_distribution_date(*timestamp))
+                    format!("Ex-dividend {}", format_distribution_date(*timestamp))
                 },
                 if *amount > 0.0 {
                     format!("{} per share", format_currency(*amount, &position.currency))
@@ -2762,8 +2762,8 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
             payment_dates.insert(payment);
             items.push((
                 payment,
-                format!("{} · Dividend payment", position.code),
-                format!("Payment date · {}", format_distribution_date(payment)),
+                position.code.clone(),
+                format!("Payment on {}", format_distribution_date(payment)),
                 if fallback_amount > 0.0 {
                     format!("{} per share", format_currency(fallback_amount, &position.currency))
                 } else {
@@ -2787,8 +2787,8 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
                 }
                 items.push((
                     payment,
-                    format!("{} · Dividend payment", position.code),
-                    format!("Estimated payment · {}", format_distribution_date(payment)),
+                    position.code.clone(),
+                    format!("Payment on {} (estimated)", format_distribution_date(payment)),
                     if *amount > 0.0 {
                         format!("{} per share", format_currency(*amount, &position.currency))
                     } else {
@@ -2806,11 +2806,11 @@ fn rebuild_upcoming_actions(refs: &UiRefs, positions: &[Position]) {
             .into_iter()
             .filter(|split| split.timestamp > now && split.timestamp <= horizon)
         {
-            let kind = if split.ratio < 1.0 { "Reverse Split" } else { "Split" };
+            let kind = if split.ratio < 1.0 { "Reverse split" } else { "Split" };
             items.push((
                 split.timestamp,
-                format!("{} · {kind}", position.code),
-                format!("Effective date · {}", format_distribution_date(split.timestamp)),
+                position.code.clone(),
+                format!("{kind} effective {}", format_distribution_date(split.timestamp)),
                 split_ratio_text(split.ratio),
             ));
         }
@@ -3208,7 +3208,6 @@ enum DividendPeriod {
 struct RecentDistribution {
     timestamp: i64,
     code: String,
-    name: String,
     amount_per_share: f64,
     native_currency: String,
     estimated_base_value: Option<f64>,
@@ -3451,7 +3450,6 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
     #[derive(Clone)]
     struct GroupedHolding {
         code: String,
-        name: String,
         currency: String,
         shares: f64,
     }
@@ -3464,7 +3462,6 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
             .and_modify(|holding| holding.shares += position.shares)
             .or_insert_with(|| GroupedHolding {
                 code: position.code.clone(),
-                name: position.name.clone(),
                 currency: position.currency.clone(),
                 shares: position.shares,
             });
@@ -3561,7 +3558,6 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
             recent.push(RecentDistribution {
                 timestamp: event.timestamp,
                 code: holding.code.clone(),
-                name: holding.name.clone(),
                 amount_per_share: event.amount,
                 native_currency: event_currency.to_string(),
                 estimated_base_value: base_value,
@@ -3650,12 +3646,12 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
         _ => "— yield".to_string(),
     };
     let monthly_text = if selected_complete {
-        format!("{} avg/mo", format_currency(selected_total / 12.0, base))
+        format!("{} per month on average", format_currency(selected_total / 12.0, base))
     } else {
-        "—/mo".to_string()
+        "— per month".to_string()
     };
     refs.dividend_yield
-        .set_label(&format!("{yield_text} · {monthly_text}"));
+        .set_label(&format!("{yield_text}, {monthly_text}"));
 
     if chart_values.iter().any(|(_, value, _)| *value > 0.0) {
         refs.dividend_chart.set_values(chart_values, base);
@@ -3678,14 +3674,10 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
     recent.truncate(16);
     for distribution in recent {
         let row = ActionRow::builder()
-            .title(&format!(
-                "{} · {}",
-                distribution.code,
-                format_distribution_date(distribution.timestamp)
-            ))
+            .title(&distribution.code)
             .subtitle(&format!(
-                "{} · {} per share",
-                distribution.name,
+                "{}, {} per share",
+                format_distribution_date(distribution.timestamp),
                 format_currency(
                     distribution.amount_per_share,
                     &distribution.native_currency
@@ -3724,18 +3716,18 @@ fn rebuild_dividend_page(refs: &UiRefs, positions: &[Position], base: &str, fx_r
     // year immediately below it. Annual names the current year because its
     // selector label intentionally describes the mode rather than the year.
     let period_note = match selected_period {
-        DividendPeriod::Annual => format!("{current_year} · received + estimated"),
+        DividendPeriod::Annual => format!("{current_year}, received and estimated"),
         DividendPeriod::Year(_) => "Received while held".to_string(),
     };
     let mut note = if fetched_symbols < holdings.len() {
-        format!("{period_note} · updating cached dividend data")
+        format!("{period_note}, updating cached dividend data")
     } else if found_any {
         period_note
     } else {
         "No distributions found".to_string()
     };
     if !selected_complete {
-        note.push_str(" · unsupported currencies excluded from totals");
+        note.push_str(", unsupported currencies excluded from totals");
     }
     refs.dividend_status.set_label(&note);
 }
@@ -4569,9 +4561,9 @@ fn cash_holding_row(account: &Account, base: &str, fx_rates: &FxRates) -> ListBo
     );
     content.append(&top);
 
-    let mut subtitle = format!("{} · {}", account.name.clone(), account.currency);
+    let mut subtitle = format!("{} ({})", account.name, account.currency);
     if account.currency != base {
-        subtitle.push_str(&format!(" · {} native", format_currency(account.cash, &account.currency)));
+        subtitle.push_str(&format!(", {} native", format_currency(account.cash, &account.currency)));
     }
     content.append(
         &Label::builder()
@@ -4613,10 +4605,10 @@ fn rebuild_accounts_list(
         let total = holdings_total.map(|holdings| holdings + account.cash);
 
         let subtitle = format!(
-            "{} · {} cash · {}",
-            account.currency,
+            "{} cash, {} ({})",
             format_currency(account.cash, &account.currency),
-            holding_count_text(count)
+            holding_count_text(count),
+            account.currency
         );
         let row = ListBoxRow::new();
         row.set_selectable(false);
@@ -4745,7 +4737,7 @@ fn rebuild_watchlist_list(refs: &UiRefs, items: &[WatchlistItem]) {
         details.append(
             &Label::builder()
                 .label(&format!(
-                    "{} · {}",
+                    "{}, {}",
                     friendly_exchange(&item.exchange),
                     item.currency
                 ))
@@ -4811,11 +4803,15 @@ fn quote_health_text(
         return "Quote unavailable".into();
     };
     let Some(updated_at) = quote_updated_at else {
-        return "Cached quote · time unknown".into();
+        return "Cached quote, time unknown".into();
     };
     let now = current_unix_timestamp();
     let state = market_data::quote_state_label(market_state, updated_at, now);
-    format!("{} · {}", state, relative_time(updated_at))
+    quote_time_text(&state, updated_at)
+}
+
+fn quote_time_text(state: &str, timestamp: i64) -> String {
+    format!("{state}, updated {}", relative_time(timestamp))
 }
 
 fn quote_health_css_class(text: &str) -> &'static str {
@@ -4953,16 +4949,22 @@ fn position_row(
     }
     content.append(&top);
 
-    let subtitle = format!(
-        "{} · {} · {} · {}",
-        position.name,
-        friendly_exchange(&position.exchange),
-        shares_text(position.shares),
-        position.account_name
+    content.append(
+        &Label::builder()
+            .label(holding_name(&position.name))
+            .halign(Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build(),
     );
     content.append(
         &Label::builder()
-            .label(&subtitle)
+            .label(format!(
+                "{} in {}, {}",
+                shares_text(position.shares),
+                position.account_name,
+                friendly_exchange(&position.exchange)
+            ))
             .halign(Align::Start)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
@@ -5807,7 +5809,7 @@ fn present_reports_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     account.set_title("Account");
     let account_model = StringList::new(&[]);
     for item in &accounts {
-        account_model.append(&format!("{} · {}", item.name, item.currency));
+        account_model.append(&format!("{} ({})", item.name, item.currency));
     }
     account.set_model(Some(&account_model));
     let preferred_account = refs
@@ -6251,13 +6253,13 @@ fn report_holding_states_as_of(
                 let symbol = transaction.provider_symbol.to_ascii_uppercase();
                 let state = states.entry(symbol.clone()).or_insert_with(|| ReportHoldingState {
                     code: transaction.code.clone(),
-                    name: transaction.name.clone(),
+                    name: security_name(&transaction.transaction_type, &transaction.name),
                     provider_symbol: symbol,
                     currency: transaction.currency.clone(),
                     ..Default::default()
                 });
                 state.code = transaction.code.clone();
-                state.name = transaction.name.clone();
+                state.name = security_name(&transaction.transaction_type, &transaction.name);
                 state.currency = transaction.currency.clone();
                 match transaction.transaction_type.as_str() {
                     "BUY" | "OPEN" => {
@@ -7257,7 +7259,7 @@ fn apply_import_backup(
             // response could write stale provider data into the restored portfolio.
             invalidate_root_refresh_generations(&refs);
             refs.toast_overlay
-                .add_toast(Toast::new("Backup imported · reconciling portfolio"));
+                .add_toast(Toast::new("Backup imported, reconciling portfolio"));
             if let Some(after_import) = after_import {
                 apply_appearance(&refs.state);
                 refs.refresh();
@@ -7463,7 +7465,7 @@ fn reconcile_restored_portfolio_async(refs: UiRefs, announce: bool) {
             // any manual refresh instead of treating partial data as complete.
             refs.refresh();
             refs.toast_overlay.add_toast(Toast::new(
-                "Could not finish backup reconciliation · reconnect and refresh",
+                "Could not finish backup reconciliation, reconnect and refresh",
             ));
         } else {
             refresh_after_reconciliation(refs.clone());
@@ -7570,7 +7572,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
         .build();
     let hero_metadata = Label::builder()
         .label(&format!(
-            "{} · {} · {}",
+            "{}\n{}, {}",
             asset.name,
             friendly_exchange(&asset.exchange),
             asset.currency
@@ -7846,7 +7848,7 @@ fn apply_watch_detail_currency(detail: &WatchDetailRefs, candidate: Option<&str>
     *detail.currency.borrow_mut() = candidate.clone();
     detail.currency_value.set_label(&candidate);
     detail.hero_metadata.set_label(&format!(
-        "{} · {} · {}",
+        "{}\n{}, {}",
         detail.name,
         friendly_exchange(&detail.exchange),
         candidate
@@ -7924,7 +7926,7 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                     quote.timestamp,
                     current_unix_timestamp(),
                 );
-                let status_text = format!("{} · {}", quote_state, relative_time(quote.timestamp));
+                let status_text = quote_time_text(&quote_state, quote.timestamp);
                 let change = quote.change_percent;
                 let market_state = quote.market_state.clone();
                 let extended_change = quote.extended_change_percent;
@@ -7976,10 +7978,10 @@ fn refresh_watch_detail_quote(detail: WatchDetailRefs) {
                 detail.quote_refresh_spinner.stop();
                 detail.quote_refresh_spinner.set_visible(false);
                 let health = market_data::quote_health_from_error(&error);
-                set_quote_status(&detail.quote_status, &format!("{} · using cached value", health));
+                set_quote_status(&detail.quote_status, &format!("{health}, using cached value"));
                 detail
                     .quote_refresh_status
-                    .set_label(&format!("{} · using cached value", health));
+                    .set_label(&format!("{health}, using cached value"));
                 let status_box = detail.quote_refresh_box.clone();
                 glib::timeout_add_local_once(Duration::from_millis(2200), move || {
                     status_box.set_visible(false);
@@ -8066,7 +8068,7 @@ fn load_watch_history_range(
             detail.day_change.set_label(&format!("Loading {} change…", range.label()));
             detail.day_change.add_css_class("dim-label");
             set_gain_class(&detail.day_change, 0.0);
-            detail.history_status.set_label("Cached history · updating range");
+            detail.history_status.set_label("Cached history, updating range");
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -8084,7 +8086,7 @@ fn load_watch_history_range(
         detail.history_status.set_label(if announce {
             "Refreshing history"
         } else {
-            "Cached history · updating"
+            "Cached history, updating"
         });
     }
     let symbol = detail.provider_symbol.clone();
@@ -8181,7 +8183,7 @@ fn load_watch_history_range(
                             current_unix_timestamp(),
                         );
                         let status_text =
-                            format!("{} · {}", quote_state, relative_time(history.quote_timestamp));
+                            quote_time_text(&quote_state, history.quote_timestamp);
                         let detail_for_quote = detail.clone();
                         let market_state = history.market_state.clone();
                         let extended_change = history.extended_change_percent;
@@ -8208,7 +8210,7 @@ fn load_watch_history_range(
                 if detail.generation.get() == load.generation {
                     if had_cache {
                         detail.history_status.set_label(
-                            "Update failed · showing cached history",
+                            "Update failed, showing cached history",
                         );
                         detail.range_return.set_label("—");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -8372,7 +8374,7 @@ fn update_watch_history_summary(
     let high_low = if low.is_finite() && high.is_finite() {
         let resolved_currency = detail.currency.borrow().clone();
         format!(
-            "Low {} · High {} · {} points",
+            "Low {}, high {}, {} points",
             format_currency(low, &resolved_currency),
             format_currency(high, &resolved_currency),
             points.len()
@@ -8519,7 +8521,7 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     hero.append(
         &Label::builder()
             .label(&format!(
-                "{} cash · {}",
+                "{} cash, {}",
                 format_currency(account.cash, &account.currency),
                 holding_count_text(positions.len())
             ))
@@ -8601,13 +8603,13 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
         let title = match transaction.transaction_type.as_str() {
             "BUY" => format!("Buy {}", transaction.code),
             "SELL" => format!("Sell {}", transaction.code),
-            "OPEN" => format!("Opening Position · {}", transaction.code),
+            "OPEN" => format!("Opening Position: {}", transaction.code),
             "TRANSFER_OUT" => format!("Transfer Out {}", transaction.code),
             "TRANSFER_IN" => format!("Transfer In {}", transaction.code),
-            other => format!("{} · {}", other, transaction.code),
+            other => format!("{} {}", other, transaction.code),
         };
         let subtitle = format!(
-            "{} · {} shares at {}",
+            "{}, {} shares at {}",
             format_distribution_date(transaction.timestamp),
             trim_number(transaction.shares),
             format_currency(transaction.price, &transaction.currency)
@@ -8856,8 +8858,8 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     hero_text.append(
         &Label::builder()
             .label(&format!(
-                "{} · {} · {}",
-                position.name,
+                "{}\n{}, {}",
+                holding_name(&position.name),
                 friendly_exchange(&position.exchange),
                 position.currency
             ))
@@ -9245,7 +9247,7 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
             .unwrap_or(true);
     if !needs_refresh {
         detail.status.set_label(if had_cache {
-            "Trailing 12 months · estimated at current shares"
+            "Trailing 12 months, estimated at current shares"
         } else {
             "No distributions found"
         });
@@ -9256,7 +9258,7 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
     }
 
     detail.status.set_label(if had_cache {
-        "Cached dividend history · updating"
+        "Cached dividend history, updating"
     } else {
         "Loading dividend history"
     });
@@ -9320,7 +9322,7 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
                     if history.events.is_empty() {
                         "No distributions found"
                     } else {
-                        "Updated just now · estimated at current shares"
+                        "Updated just now, estimated at current shares"
                     },
                 );
             }
@@ -9328,7 +9330,7 @@ fn load_position_dividends(detail: DividendDetailRefs, announce: bool) {
                 if had_cache {
                     detail
                         .status
-                        .set_label("Update failed · showing cached dividend history");
+                        .set_label("Update failed, showing cached dividend history");
                 } else {
                     detail.status.set_label(&error);
                 }
@@ -9492,7 +9494,7 @@ fn load_history_range(
             set_gain_class(&detail.day_change, 0.0);
             detail
                 .history_status
-                .set_label("Cached history · updating range");
+                .set_label("Cached history, updating range");
         } else {
             detail.chart.set_message("Loading price history");
             detail.range_return.set_label("—");
@@ -9516,7 +9518,7 @@ fn load_history_range(
         detail.history_status.set_label(if announce {
             "Refreshing history"
         } else {
-            "Cached history · updating"
+            "Cached history, updating"
         });
     }
 
@@ -9612,7 +9614,7 @@ fn load_history_range(
                 if detail.generation.get() == load.generation {
                     if had_cache {
                         detail.history_status.set_label(
-                            "Update failed · showing cached history",
+                            "Update failed, showing cached history",
                         );
                         detail.range_return.set_label("—");
                         detail.day_change.set_label(history_range_unavailable_label(load.range));
@@ -9729,7 +9731,7 @@ fn update_detail_quote(detail: &DetailRefs, history: &History, animate: bool) {
         history.quote_timestamp,
         current_unix_timestamp(),
     );
-    let status_text = format!("{} · {}", state, relative_time(history.quote_timestamp));
+    let status_text = quote_time_text(&state, history.quote_timestamp);
     let update_day = detail.active_range.get() == HistoryRange::OneDay;
     let change = history.day_change_percent;
     let market_state = history.market_state.clone();
@@ -9822,7 +9824,7 @@ fn update_history_summary(
     let low = points.iter().map(|point| point.close).fold(f64::INFINITY, f64::min);
     let high = points.iter().map(|point| point.close).fold(f64::NEG_INFINITY, f64::max);
     let high_low = format!(
-        "Low {} · High {} · {} points",
+        "Low {}, high {}, {} points",
         format_currency(low, &detail.currency),
         format_currency(high, &detail.currency),
         points.len()
@@ -9968,7 +9970,7 @@ fn present_manage_cash_dialog(parent: &ApplicationWindow, refs: UiRefs, account:
         .css_classes(["title-1"])
         .build();
     let account_label = Label::builder()
-        .label(&format!("{} · {}", account.name, account.currency))
+        .label(&format!("{} ({})", account.name, account.currency))
         .halign(Align::Center)
         .css_classes(["dim-label"])
         .build();
@@ -10292,7 +10294,7 @@ fn present_transfer_dialog(parent: &ApplicationWindow, refs: UiRefs, from_accoun
     let holding_model = StringList::new(&[]);
     for position in &positions {
         holding_model.append(&format!(
-            "{} · {} shares",
+            "{} ({} shares)",
             position.code,
             trim_number(position.shares)
         ));
@@ -10951,7 +10953,7 @@ fn rebuild_transactions_list(
                     "Deposit"
                 };
                 let subtitle = if is_dividend || is_transfer {
-                    format!("{} · {}", account_name, entry.currency)
+                    format!("{} ({})", account_name, entry.currency)
                 } else {
                     account_name.clone()
                 };
@@ -11049,7 +11051,7 @@ fn rebuild_transactions_list(
             ActivityItem::Investment(transaction) => {
                 let title = match transaction.transaction_type.as_str() {
                     "OPEN" => format!(
-                        "Opening Position · {} {}",
+                        "Opening Position: {} {}",
                         trim_number(transaction.shares),
                         transaction.code
                     ),
@@ -11059,20 +11061,20 @@ fn rebuild_transactions_list(
                     _ => format!("Buy {} {}", trim_number(transaction.shares), transaction.code),
                 };
                 let mut subtitle = format!(
-                    "{} · {}/share",
+                    "{}, {} per share",
                     transaction.account_name,
                     format_currency(transaction.price, &transaction.currency)
                 );
                 if transaction.fees > 0.005 {
                     subtitle.push_str(&format!(
-                        " · {} fee",
+                        ", {} fee",
                         format_currency(transaction.fees, &transaction.fees_currency)
                     ));
                 }
                 if matches!(transaction.transaction_type.as_str(), "TRANSFER_IN" | "TRANSFER_OUT") {
-                    subtitle.push_str(" · account transfer");
+                    subtitle.push_str(", account transfer");
                 } else if transaction.settle_cash {
-                    subtitle.push_str(" · cash");
+                    subtitle.push_str(", cash");
                 }
                 let row = ActionRow::builder().title(&title).subtitle(&subtitle).build();
 
@@ -12256,8 +12258,8 @@ fn present_edit_transaction_dialog(
     };
 
     let security = ActionRow::builder()
-        .title(&format!("{} · {}", transaction.code, transaction.account_name))
-        .subtitle(&transaction.name)
+        .title(&format!("{} in {}", transaction.code, transaction.account_name))
+        .subtitle(display_transaction_name(&transaction.name))
         .build();
     let security_group = PreferencesGroup::new();
     security_group.add(&security);
@@ -12559,23 +12561,33 @@ fn rebuild_search_results(list: &ListBox, results: &[SearchResult]) {
                 .css_classes(["dim-label"])
                 .build(),
         );
-        let mut details = format!(
-            "{} · {} · {}",
-            friendly_exchange(&result.exchange),
-            result.currency,
-            friendly_asset_type(&result.asset_type)
-        );
-        if let Some(change) = result.change_percent {
-            details.push_str(&format!(" · {change:+.2}% today"));
-        }
-        content.append(
+        let details = GtkBox::builder()
+            .orientation(Orientation::Horizontal)
+            .spacing(12)
+            .build();
+        details.append(
             &Label::builder()
-                .label(&details)
+                .label(&format!(
+                    "{}, {}, {}",
+                    friendly_asset_type(&result.asset_type),
+                    friendly_exchange(&result.exchange),
+                    result.currency
+                ))
                 .halign(Align::Start)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["dim-label", "caption"])
                 .build(),
         );
+        if let Some(change) = result.change_percent {
+            let change_label = Label::builder()
+                .label(format!("{change:+.2}% today"))
+                .halign(Align::Start)
+                .css_classes(["caption"])
+                .build();
+            set_gain_class(&change_label, change);
+            details.append(&change_label);
+        }
+        content.append(&details);
 
         row.set_child(Some(&content));
         list.append(&row);
@@ -14626,13 +14638,13 @@ fn refresh_market_async(
             let message = if !result.quote_attempted && result.fx_attempted && fx_failed {
                 Some("Could not refresh exchange rates")
             } else if result.quotes.is_empty() && result.quote_failures > 0 && result.quote_network_failures == result.quote_failures {
-                Some("Network unavailable · using cached prices")
+                Some("Network unavailable, using cached prices")
             } else if result.quotes.is_empty() && result.quote_failures > 0 {
-                Some("Quotes unavailable · using cached prices")
+                Some("Quotes unavailable, using cached prices")
             } else if result.quote_failures > 0 && fx_failed {
                 Some("Some prices and exchange rates could not be updated")
             } else if result.quote_failures > 0 {
-                Some("Some prices could not be updated · stale values may remain")
+                Some("Some prices could not be updated, stale values may remain")
             } else if fx_failed {
                 Some("Some exchange rates could not be updated")
             } else {
@@ -14829,10 +14841,10 @@ fn market_status_text(state: &AppState, positions: &[Position], base: &str, fx_r
     if quote_times.len() == positions.len() {
         if let Some(oldest) = quote_times.iter().min() {
             let state_label = market_data::quote_state_label(None, *oldest, current_unix_timestamp());
-            parts.push(format!("{} · oldest {}", state_label, relative_time(*oldest)));
+            parts.push(format!("{} (oldest {})", state_label, relative_time(*oldest)));
         }
     } else if let Some(oldest) = quote_times.iter().min() {
-        parts.push(format!("Some quotes unavailable · cached {}", relative_time(*oldest)));
+        parts.push(format!("Some quotes unavailable (cached {})", relative_time(*oldest)));
     } else {
         parts.push("Quotes unavailable".into());
     }
@@ -14850,7 +14862,7 @@ fn market_status_text(state: &AppState, positions: &[Position], base: &str, fx_r
             parts.push(format!("waiting for {missing} exchange rate{}", if missing == 1 { "" } else { "s" }));
         }
     }
-    parts.join(" · ")
+    parts.join(", ")
 }
 
 #[derive(Clone)]
@@ -15169,7 +15181,13 @@ fn account_model(accounts: &[Account]) -> StringList {
 }
 
 fn account_choice_label(account: &Account) -> String {
-    format!("{} · {}", account.name, account.currency)
+    format!("{} ({})", account.name, account.currency)
+}
+
+/// Holding names are derived from the latest transaction, which may carry a
+/// transfer note in positions saved before transfer names were separated.
+fn holding_name(name: &str) -> String {
+    security_name("TRANSFER_IN", name)
 }
 
 fn supported_currency_model() -> StringList {

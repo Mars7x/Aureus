@@ -81,6 +81,8 @@ Established UI behavior:
 - Narrow layouts reflow/reparent content rather than using a separate app surface.
 - Account rows open account detail.
 - Bottom action/dialog forms were standardized and tuned for narrow windows.
+- Never join UI text with middle-dot separators (" · "). Split primary and secondary information into separate labels or title/subtitle rows, and word the rest plainly: commas for lists of facts, parentheses for qualifiers such as "(estimated)" or "TFSA (CAD)", and "in"/"on" where they read naturally.
+- Holding transfers store their counterpart in the transaction name as `Name (transfer to X)`. Older releases wrote `Name · Transfer to X`; `model::display_transaction_name` shows those in the current wording and `model::security_name` strips the note for derived position and report names. Stored transactions are never rewritten.
 
 Theme behavior:
 

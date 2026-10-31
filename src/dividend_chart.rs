@@ -247,9 +247,9 @@ fn draw_chart(
     let bar_height = (*value / scale_max) * (plot_bottom - plot_top);
     let y = plot_bottom - bar_height;
     let text = if *estimated {
-        format!("{} · {} · estimated", label, format_currency(*value, &state.currency))
+        format!("{}: {} (estimated)", label, format_currency(*value, &state.currency))
     } else {
-        format!("{} · {}", label, format_currency(*value, &state.currency))
+        format!("{}: {}", label, format_currency(*value, &state.currency))
     };
     let popup_width = (text.chars().count() as f64 * 7.0 + 20.0).clamp(110.0, 210.0);
     let popup_height = 32.0;
