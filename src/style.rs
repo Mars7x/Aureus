@@ -125,6 +125,10 @@ pub fn install() {
         return;
     };
 
+    // Custom symbolic icons come from the compiled-in GResource, so they do
+    // not depend on an installed icon theme.
+    gtk::IconTheme::for_display(&display).add_resource_path("/io/github/Mars7x/Aureus/icons");
+
     let layout_provider = gtk::CssProvider::new();
     layout_provider.load_from_string(LAYOUT_CSS);
     gtk::style_context_add_provider_for_display(

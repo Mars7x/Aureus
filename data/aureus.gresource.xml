@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <!-- Custom symbolic icons are compiled into the binary so they are found
+       without an installed icon theme (development runs, Windows). -->
+  <gresource prefix="/io/github/Mars7x/Aureus/icons/scalable/actions">
+    <file preprocess="xml-stripblanks" alias="aureus-credit-card-symbolic.svg">icons/hicolor/scalable/actions/aureus-credit-card-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="aureus-trend-symbolic.svg">icons/hicolor/scalable/actions/aureus-trend-symbolic.svg</file>
+  </gresource>
+</gresources>

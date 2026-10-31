@@ -167,6 +167,7 @@ Yahoo-specific implementation for:
 - `stock_image.rs` — fetched brand logos, with decode/size safety limits
 - `storage.rs` — app data/cache paths and durable file operations
 - `style.rs` / `aureus-theme.css` — theme installation and layout CSS
+- `build.rs` / `data/aureus.gresource.xml` — compiles the custom symbolic icons (`aureus-trend-symbolic`, `aureus-credit-card-symbolic`) into the binary; `style::install` adds the resource path to the icon theme, so they never depend on an installed icon theme. Only the app icon is installed to `share/icons`.
 
 ## 5. Currency support
 

@@ -27,6 +27,9 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn main() -> adw::glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
 
+    gio::resources_register_include!("aureus.gresource")
+        .expect("Aureus resources are compiled into the binary");
+
     app.connect_startup(|app| {
         style::install();
 

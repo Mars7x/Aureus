@@ -120,6 +120,7 @@ Aureus supports exactly these 25 selectable account/Portfolio Currency codes:
 - `src/stock_image.rs` — brand-logo fetching, caching and image safety limits.
 - `src/storage.rs` — application data/cache paths and durable file handling.
 - `src/style.rs` / `src/aureus-theme.css` — Aureus theme and minimal layout styling.
+- `build.rs` / `data/aureus.gresource.xml` — custom symbolic icons compiled into the binary as a GResource.
 - `flatpak/io.github.Mars7x.Aureus.yml` — Flatpak build manifest.
 - `scripts/package-windows.sh` — bundles an MSYS2 release build into the Windows zip.
 - `.github/workflows/release.yml` — builds Flatpak and Windows release assets when a release is published.

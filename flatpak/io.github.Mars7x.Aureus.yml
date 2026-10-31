@@ -32,8 +32,6 @@ modules:
       - install -Dm644 data/io.github.Mars7x.Aureus.desktop /app/share/applications/io.github.Mars7x.Aureus.desktop
       - install -Dm644 data/io.github.Mars7x.Aureus.metainfo.xml /app/share/metainfo/io.github.Mars7x.Aureus.metainfo.xml
       - install -Dm644 data/icons/hicolor/scalable/apps/io.github.Mars7x.Aureus.svg /app/share/icons/hicolor/scalable/apps/io.github.Mars7x.Aureus.svg
-      - install -Dm644 data/icons/hicolor/scalable/actions/aureus-trend-symbolic.svg /app/share/icons/hicolor/scalable/actions/aureus-trend-symbolic.svg
-      - install -Dm644 data/icons/hicolor/scalable/actions/aureus-credit-card-symbolic.svg /app/share/icons/hicolor/scalable/actions/aureus-credit-card-symbolic.svg
     sources:
       - type: dir
         path: ..

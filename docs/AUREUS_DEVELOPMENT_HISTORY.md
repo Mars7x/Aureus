@@ -467,3 +467,9 @@ The same pass fixed a brand-logo bug: after the preference was toggled, open ava
 Choosing a custom stock picture was removed at the developer's request; brand logos are now the only stock pictures. This also removed the Glycin dependency, whose sandboxed loaders (libseccomp, memfd, nix) only build on Linux and were the main obstacle to a Windows build. Brand logos already decoded with the `image` crate.
 
 Windows builds were added as an experimental target: MSYS2 UCRT64 builds the release binary and `scripts/package-windows.sh` bundles it with its DLLs, GdkPixbuf loaders, schemas and icons. The release workflow was renamed from `flatpak-release.yml` to `release.yml`, gained the Windows job, and can be run manually without uploading to test a branch. The Windows build had not yet been run in CI or tested on Windows when this was written.
+
+## 25. Custom icons compiled in
+
+The Accounts icon (`aureus-credit-card-symbolic`) was reported missing. Both custom symbolic icons were only installed into `share/icons/hicolor`, so any run without that install (development runs, and the new Windows bundle unless packaged exactly) fell back to GTK's missing-icon placeholder. The SVGs themselves render correctly. They are now compiled into the binary as a GResource by `build.rs` and added to the icon theme at startup; the Flatpak manifest and Windows packaging install only the app icon.
+
+The README screenshots were recreated from a demo portfolio (RY, XEQT, ENB, SHOP in a CAD TFSA) and are stored in `docs/screenshots/`.

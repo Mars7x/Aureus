@@ -35,7 +35,8 @@ cp "${prefix}/share/glib-2.0/schemas/gschemas.compiled" "${dist}/share/glib-2.0/
 
 cp -r "${prefix}/share/icons/Adwaita" "${dist}/share/icons/"
 cp "${prefix}/share/icons/hicolor/index.theme" "${dist}/share/icons/hicolor/"
-cp -r data/icons/hicolor/scalable "${dist}/share/icons/hicolor/"
+mkdir -p "${dist}/share/icons/hicolor/scalable"
+cp -r data/icons/hicolor/scalable/apps "${dist}/share/icons/hicolor/scalable/"
 gtk4-update-icon-cache --quiet --ignore-theme-index --force "${dist}/share/icons/hicolor"
 
 cp LICENSE "${dist}/LICENSE.txt"
