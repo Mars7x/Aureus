@@ -24,3 +24,18 @@ pub fn database_path() -> PathBuf {
 pub fn stock_pictures_dir() -> PathBuf {
     data_root().join("stock-pictures")
 }
+
+/// Root for rebuildable Aureus caches. Like `data_root`, Flatpak already
+/// namespaces the XDG cache directory per application.
+pub fn cache_root() -> PathBuf {
+    let base = gtk::glib::user_cache_dir();
+    if std::env::var_os("FLATPAK_ID").is_some() {
+        base
+    } else {
+        base.join(APP_ID)
+    }
+}
+
+pub fn brand_logos_dir() -> PathBuf {
+    cache_root().join("brand-logos")
+}

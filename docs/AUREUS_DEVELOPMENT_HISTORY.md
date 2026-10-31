@@ -425,3 +425,15 @@ slightly lifted sidebar, card, popover, and dialog surfaces. The source theme's 
 accent was deliberately not carried over; Aureus follows the system accent colour.
 The source theme's Planify-specific named colours and close-button styling were also
 left out to keep custom CSS minimal.
+
+## 21. Brand logos
+
+Brand logos were the remaining roadmap item after 1.3.0. Sources evaluated:
+
+- Yahoo Finance: the v7 quote response only carries `logoUrl` for crypto. Stocks and ETFs have none, and `quoteSummary` only gives the company website (no website for ETFs).
+- Financial Modeling Prep `image-stock`: no key, but uneven quality (32 px icons for some symbols, non-square wordmarks such as Vodafone) and missing symbols such as `NTOA.MU`. Its terms for third-party apps were unclear.
+- Brandfetch: free without attribution, but needs a client ID registered to the developer and shipped in the app.
+- Logo.dev: needs a token.
+- Elbstream (Parqet's logo API, which moved from `assets.parqet.com` to `api.elbstream.com`): no key, square avatar-ready tiles, accepts Yahoo provider symbols with exchange suffixes (RY.TO, NTOA.MU as Nintendo, XEQT.TO as iShares, BRK-B), and returns a clean 404 for unknown symbols. The free tier requires a visible link to Elbstream wherever logos appear.
+
+The user chose Elbstream, with a `Show Brand Logos` preference that is on by default. Fetching sends held and watched symbols to Elbstream, which is why it is a preference. Custom stock pictures always take priority, logos are rebuildable cache data, and each page that shows logos carries the attribution. See section 16 of the project context for the current rules.

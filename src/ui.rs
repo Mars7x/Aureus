@@ -35,6 +35,8 @@ use crate::model::{
 const BASE_CURRENCY_KEY: &str = "base-currency";
 const LAST_ACCOUNT_ID_KEY: &str = "last-account-id";
 const AUREUS_THEME_KEY: &str = "use-aureus-theme";
+const BRAND_LOGOS_KEY: &str = "fetch-brand-logos";
+const BRAND_LOGO_ATTRIBUTION_NAME: &str = "aureus-brand-logo-attribution";
 const PORTFOLIO_HISTORY_RANGE_KEY: &str = "portfolio-history-range";
 const MARKET_DATA_CACHE_PROVIDER_KEY: &str = "market-data-cache-provider";
 const MARKET_DATA_CACHE_PROVIDER_VALUE: &str = "yfinance-v20-yahoo-quote-range-bar";
@@ -149,11 +151,12 @@ fn stock_avatar(provider_symbol: &str, fallback_text: &str, size: i32) -> Avatar
         crate::stock_image::picture_key(provider_symbol)
     ));
     apply_saved_stock_image(&avatar, provider_symbol);
+    request_brand_logo(&avatar, provider_symbol);
     avatar
 }
 
 fn apply_saved_stock_image(avatar: &Avatar, provider_symbol: &str) {
-    let Ok(Some(data)) = crate::stock_image::load_stock_image(provider_symbol) else {
+    let Some(data) = crate::stock_image::load_display_image(provider_symbol) else {
         avatar.set_custom_image(None::<&gtk::gdk::Paintable>);
         return;
     };
@@ -166,11 +169,102 @@ fn apply_saved_stock_image(avatar: &Avatar, provider_symbol: &str) {
 }
 
 fn stock_image_colors(provider_symbol: &str) -> Vec<(f64, f64, f64)> {
-    crate::stock_image::load_stock_image(provider_symbol)
-        .ok()
-        .flatten()
+    crate::stock_image::load_display_image(provider_symbol)
         .map(|image| image.colors)
         .unwrap_or_default()
+}
+
+/// Downloads a missing or stale brand logo in the background, then updates
+/// every avatar for that symbol still in the window. Custom pictures always
+/// win, so no request is made for stocks that have one.
+fn request_brand_logo(avatar: &Avatar, provider_symbol: &str) {
+    if !crate::stock_image::brand_logo_needs_fetch(provider_symbol)
+        || !crate::stock_image::begin_brand_logo_request(provider_symbol)
+    {
+        return;
+    }
+    let symbol = provider_symbol.to_string();
+    let (sender, receiver) = mpsc::channel::<bool>();
+    std::thread::spawn(move || {
+        let fetched = crate::stock_image::fetch_brand_logo(&symbol).unwrap_or(false);
+        crate::stock_image::finish_brand_logo_request(&symbol);
+        let _ = sender.send(fetched);
+    });
+
+    let avatar_weak = avatar.downgrade();
+    let symbol = provider_symbol.to_string();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let fetched = match receiver.try_recv() {
+            Ok(fetched) => fetched,
+            Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+        };
+        if fetched {
+            if let Some(avatar) = avatar_weak.upgrade() {
+                match avatar.root() {
+                    Some(root) => refresh_stock_picture_widgets(root.upcast_ref(), &symbol),
+                    None => apply_saved_stock_image(&avatar, &symbol),
+                }
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Elbstream's free tier requires a visible link wherever its logos appear.
+fn brand_logo_attribution() -> Label {
+    let label = Label::builder()
+        .label(format!(
+            "Logos by <a href=\"{}\">Elbstream</a>",
+            crate::stock_image::BRAND_LOGO_ATTRIBUTION_URL
+        ))
+        .use_markup(true)
+        .halign(Align::Center)
+        .margin_top(6)
+        .css_classes(["dim-label"])
+        .visible(crate::stock_image::brand_logos_enabled())
+        .build();
+    label.set_widget_name(BRAND_LOGO_ATTRIBUTION_NAME);
+    label
+}
+
+fn brand_logos_preference(state: &AppState) -> bool {
+    !matches!(
+        state
+            .database
+            .setting(BRAND_LOGOS_KEY)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("0")
+    )
+}
+
+/// Re-applies stock pictures and attribution visibility after the brand-logo
+/// preference changes, without rebuilding pages that are already open.
+fn refresh_brand_logo_widgets(root: &gtk::Widget) {
+    let enabled = crate::stock_image::brand_logos_enabled();
+    let prefix = "aureus-stock-picture-";
+    let mut widgets = vec![root.clone()];
+    while let Some(widget) = widgets.pop() {
+        let name = widget.widget_name();
+        if name == BRAND_LOGO_ATTRIBUTION_NAME {
+            widget.set_visible(enabled);
+        } else if let (Some(key), Ok(avatar)) = (
+            name.strip_prefix(prefix),
+            widget.clone().downcast::<Avatar>(),
+        ) {
+            apply_saved_stock_image(&avatar, key);
+            if enabled {
+                request_brand_logo(&avatar, key);
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            widgets.push(current);
+        }
+    }
 }
 
 fn refresh_stock_picture_widgets(root: &gtk::Widget, provider_symbol: &str) {
@@ -1068,6 +1162,7 @@ pub fn build_window(app: &Application) -> Result<ApplicationWindow, String> {
         database: Rc::new(database),
     };
     apply_appearance(&state);
+    crate::stock_image::set_brand_logos_enabled(brand_logos_preference(&state));
     let navigation = NavigationView::new();
     navigation.set_animate_transitions(true);
 
@@ -2310,6 +2405,7 @@ fn build_overview_page(refs: &UiRefs) -> gtk::Widget {
         .build();
     holdings_column.append(&section_heading("Holdings"));
     holdings_column.append(&refs.overview_list);
+    holdings_column.append(&brand_logo_attribution());
 
     let allocation_column = GtkBox::builder()
         .orientation(Orientation::Vertical)
@@ -2797,6 +2893,7 @@ fn build_search_page(refs: &UiRefs) -> gtk::Widget {
     content.set_margin_top(8);
     content.append(&feedback);
     content.append(&result_list);
+    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     scroller.set_vexpand(true);
@@ -2991,6 +3088,7 @@ fn set_search_keyboard_highlight(list: &ListBox, selected: Option<usize>) {
 fn build_watchlist_page(refs: &UiRefs) -> gtk::Widget {
     let content = page_content_box();
     content.append(&refs.watchlist_list);
+    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     refs.page_scroll_adjustments
@@ -5157,6 +5255,7 @@ fn install_window_actions(
                 &[
                     "Market data and current exchange rates: Yahoo Finance",
                     "Historical/reference exchange rates: Bank of Canada",
+                    "Brand logos: Elbstream",
                 ],
             );
             dialog.present(Some(&window));
@@ -6839,8 +6938,18 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
     theme_row.set_title("Use Aureus Theme");
     theme_row.set_subtitle("Turn off to follow the system appearance");
     theme_row.set_active(aureus_theme_enabled(&refs.state));
+    let brand_logos_row = SwitchRow::new();
+    brand_logos_row.set_title("Show Brand Logos");
+    brand_logos_row.set_subtitle(&format!(
+        "Download stock logos from <a href=\"{}\">Elbstream</a>. Custom stock pictures always take priority",
+        crate::stock_image::BRAND_LOGO_ATTRIBUTION_URL
+    ));
+    brand_logos_row.set_subtitle_selectable(false);
+    brand_logos_row.set_use_markup(true);
+    brand_logos_row.set_active(crate::stock_image::brand_logos_enabled());
     let appearance_group = PreferencesGroup::builder().title("Appearance").build();
     appearance_group.add(&theme_row);
+    appearance_group.add(&brand_logos_row);
 
     let export_row = ActionRow::builder()
         .title("Export Backup")
@@ -6907,6 +7016,25 @@ fn present_preferences_dialog(parent: &ApplicationWindow, refs: UiRefs) {
             let value = if row.is_active() { "1" } else { "0" };
             if refs.state.database.set_setting(AUREUS_THEME_KEY, value).is_ok() {
                 apply_appearance(&refs.state);
+            }
+        });
+    }
+
+    {
+        let parent_weak = parent.downgrade();
+        let refs = refs.clone();
+        brand_logos_row.connect_active_notify(move |row| {
+            let value = if row.is_active() { "1" } else { "0" };
+            if let Err(error) = refs.state.database.set_setting(BRAND_LOGOS_KEY, value) {
+                refs.toast_overlay.add_toast(Toast::new(&format!(
+                    "Could not change brand logos: {error}"
+                )));
+                return;
+            }
+            crate::stock_image::set_brand_logos_enabled(row.is_active());
+            refs.refresh();
+            if let Some(parent) = parent_weak.upgrade() {
+                refresh_brand_logo_widgets(parent.upcast_ref());
             }
         });
     }
@@ -7570,6 +7698,7 @@ fn present_security_detail(asset: SearchResult, refs: UiRefs, refresh_quote_on_o
     content.append(&range_box);
     content.append(&section_heading("Security"));
     content.append(&details);
+    content.append(&brand_logo_attribution());
     let scroller = page_scroller(&content, 900);
     let pull_refresh = build_detail_pull_refresh(&scroller);
 
@@ -8571,6 +8700,7 @@ fn present_account_detail(account_id: i64, refs: UiRefs) {
     } else {
         content.append(&Label::builder().label("No account activity yet").halign(Align::Start).css_classes(["dim-label"]).build());
     }
+    content.append(&brand_logo_attribution());
 
     let scroller = page_scroller(&content, 900);
     let header = HeaderBar::new();
@@ -8925,6 +9055,7 @@ fn present_position_detail(position_id: i64, refs: UiRefs) {
     content.append(&dividend_metrics);
     content.append(&dividend_status);
     content.append(&dividend_list);
+    content.append(&brand_logo_attribution());
     let scroller = page_scroller(&content, 900);
     let pull_refresh = build_detail_pull_refresh(&scroller);
 
@@ -11433,6 +11564,7 @@ fn present_add_activity_dialog_with_context(
     search_body.append(&search);
     search_body.append(&search_feedback);
     search_body.append(&result_list);
+    search_body.append(&brand_logo_attribution());
     let search_scroller = dialog_scroller(&search_body, 560);
 
     let account = ComboRow::new();

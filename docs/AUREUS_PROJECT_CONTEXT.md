@@ -52,6 +52,7 @@ Core capabilities:
 - Portfolio allocation
 - Portfolio history/performance from 1D through All
 - Stock search and watchlist
+- Brand logos for stocks, with optional custom stock pictures
 - Security-detail history from 1D through All
 - PDF reports
 - Portable backups
@@ -59,7 +60,6 @@ Core capabilities:
 
 Roadmap items that have been discussed but are not current behavior:
 
-- Fetch brand logos
 - Windows support
 - Android support
 
@@ -107,6 +107,7 @@ Important persistent settings include:
 - `base-currency`
 - `last-account-id`
 - `use-aureus-theme`
+- `fetch-brand-logos`
 - `portfolio-history-range`
 
 ### `src/database.rs`
@@ -162,7 +163,7 @@ Yahoo-specific implementation for:
 - `dividend_chart.rs` — dividend chart
 - `sparkline.rs` — compact watchlist/history visuals
 - `report.rs` — Cairo PDF reports
-- `stock_image.rs` — stock image loading/processing with decode/size safety limits
+- `stock_image.rs` — custom stock pictures and fetched brand logos, with decode/size safety limits
 - `storage.rs` — app data/cache paths and durable file operations
 - `style.rs` / `aureus-theme.css` — theme installation and layout CSS
 
@@ -486,7 +487,27 @@ Report totals and cross-account values must follow Portfolio Currency and use hi
 
 Do not silently invent a historical conversion when required rate data cannot be established reliably.
 
-## 16. Packaging and distribution
+## 16. Stock pictures and brand logos
+
+Each stock avatar shows, in order of precedence:
+
+1. the user's custom stock picture (stored in the data directory, `stock-pictures/`)
+2. a cached brand logo, when the `Show Brand Logos` preference is on
+3. the libadwaita initials fallback
+
+Brand logos:
+
+- Source: Elbstream (formerly Parqet's logo API), `https://api.elbstream.com/logos/symbol/<provider symbol>?format=png&size=256`. It accepts Yahoo provider symbols, including exchange suffixes such as `RY.TO` and `NTOA.MU`. No API key is used.
+- Elbstream's free tier requires a visible link to Elbstream on any page that shows a logo. `brand_logo_attribution()` adds a "Logos by Elbstream" link under every page or dialog that shows stock avatars (Overview holdings, Watchlist, Search, the add-activity search, security detail, account detail, position detail) and the About dialog credits it. Any new page that shows stock avatars must include the attribution.
+- Preference key: `fetch-brand-logos`, on by default. When it is off, nothing is requested, cached logos are hidden and the attribution disappears. Custom pictures are unaffected.
+- No request is made for stocks that have a custom picture.
+- Logos are rebuildable cache data in the XDG cache directory (`brand-logos/`), not portable financial records, and are not in backups.
+- Cached logos refresh after 30 days. A 404 is Elbstream's authoritative "no logo" answer: it is remembered with a `.missing` marker for 7 days. Transient failures are not remembered and retry on the next display.
+- Downloads are limited to 2 MB, decoded under the same limits as custom pictures and re-encoded as a bounded PNG before caching.
+- Requests run on a background thread with one in-flight request per symbol. When a logo arrives, every avatar for that symbol in the window updates.
+- Allocation colors use the displayed picture, so they follow the brand logo when no custom picture exists.
+
+## 17. Packaging and distribution
 
 Primary packaging is Flatpak with:
 
@@ -509,7 +530,7 @@ Therefore:
 - Do not add large feature descriptions, duplicated README content, extensive release history, keywords, screenshots, or Flathub-specific presentation metadata unless actually wanted.
 - The `.desktop` file and installed icon remain important for normal desktop integration.
 
-## 17. Release-note preferences
+## 18. Release-note preferences
 
 Release notes should be concise.
 
@@ -519,7 +540,7 @@ For the v1.2.0-style currency bullet, the preferred concise presentation explici
 
 Implementation-level details such as GBp/ZAc normalization normally belong in engineering documentation rather than minimal public release notes unless specifically requested.
 
-## 18. Build-warning policy
+## 19. Build-warning policy
 
 The repository should stay warning-clean.
 
@@ -527,7 +548,7 @@ When a warning identifies genuinely unused code, remove the obsolete path rather
 
 Recent cleanup removed obsolete quote-refresh helper methods and unused position calculation helpers. Do not re-add equivalent dead helpers unless they are actively used.
 
-## 19. High-risk regression checklist
+## 20. High-risk regression checklist
 
 Before accepting a change in these areas, explicitly verify the relevant items.
 
@@ -578,8 +599,10 @@ Before accepting a change in these areas, explicitly verify the relevant items.
 - Pull-to-refresh and Ctrl+R continue to work.
 - Portfolio range persistence remains intact.
 - No unrelated CSS/color regressions.
+- Pages that show stock avatars still show the Elbstream attribution while brand logos are on.
+- Custom stock pictures still take priority over brand logos.
 
-## 20. Working style for future changes
+## 21. Working style for future changes
 
 The most important development lesson from Aureus is to prefer evidence over plausible formulas.
 
