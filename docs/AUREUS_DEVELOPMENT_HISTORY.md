@@ -477,3 +477,7 @@ The README screenshots were recreated from a demo portfolio (RY, XEQT, ENB, SHOP
 ## 26. macOS builds
 
 macOS was added as an experimental target. No code changes were needed. The release workflow builds with Homebrew on Apple Silicon and Intel runners, and `scripts/package-macos.sh` turns the build into an ad-hoc signed `Aureus.app` with its dylibs, pixbuf loaders, schemas and icons, plus a launcher script that points GTK at them. The bundle is not notarized. It had not been run on a Mac when this was written.
+
+## 27. 2.0.0 release line
+
+Aureus 2.0.0 collects the work after 1.3.0: brand logos from Elbstream, the developer's own theme palette with the system accent colour, removal of custom stock pictures, the stock picture cache, compiled-in custom icons, and experimental Windows and macOS builds attached to releases by the release workflow. The public release notes stay concise, in the style of earlier releases.

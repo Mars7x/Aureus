@@ -20,7 +20,7 @@ If the current source and these documents ever disagree, the current source is a
 - Binary/package name: `aureus`
 - Author/developer: Mars7x
 - License: GPL-3.0-or-later
-- Current release line: `1.3.0`
+- Current release line: `2.0.0`
 - Native Rust application using GTK4 and libadwaita.
 - Flatpak is the primary packaging target. Windows and macOS builds are produced in CI as experimental targets.
 - Current development environment is Fedora Silverblue with GNOME Builder.
